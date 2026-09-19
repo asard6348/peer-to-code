@@ -33,14 +33,39 @@ def make_root():
     return tk.Tk()
 
 
-def register_drop(widget, callback):
-    """Makes `widget` accept dropped files/folders, calling
-    callback(list_of_paths) with at least one path when something is
-    dropped on it. No-ops quietly if drag-and-drop isn't available here."""
+def register_drop(widget, callback, debug=False):
     if not AVAILABLE:
         return
+
+    def log(*a):
+        if debug:
+            import sys, time
+            print(f"[dnd {time.monotonic():.3f}]", *a, file=sys.stderr, flush=True)
+
+    def on_enter(event):
+        log("enter", event.widget, event.action)
+        return event.action
+
+    def on_position(event):
+        log("pos", event.x_root, event.y_root, event.action)
+        return event.action
+
+    def on_leave(event):
+        log("leave")
+        return event.action
+
+    def on_drop(event):
+        log("drop", event.widget, repr(event.data), event.action)
+        paths = list(widget.tk.splitlist(event.data or ""))
+        if paths:
+            widget.after_idle(callback, paths)
+        return event.action
+
     try:
         widget.drop_target_register(DND_FILES)
-        widget.dnd_bind("<<Drop>>", lambda event: callback(widget.tk.splitlist(event.data)))
+        widget.dnd_bind("<<DropEnter>>", on_enter)
+        widget.dnd_bind("<<DropPosition>>", on_position)
+        widget.dnd_bind("<<Drop>>", on_drop)
+        widget.dnd_bind("<<DropLeave>>", on_leave)
     except Exception:
         pass

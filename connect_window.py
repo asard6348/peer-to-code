@@ -80,7 +80,7 @@ class ConnectWindow(ttk.Frame):
         self._action_buttons = []
         self._build_style()
         self._build_ui()
-        dnd_support.register_drop(self, self._on_window_drop)
+        dnd_support.register_drop(self, self._on_window_drop, debug=False)
         dnd_support.register_drop(self.page_container, self._on_window_drop)
         if initial_path:
             self._select_tab("Open")
@@ -99,6 +99,7 @@ class ConnectWindow(ttk.Frame):
         var = {"Open": self.open_dir_var, "Connect": self.udp_dir_var,
                "Peer to Peer": self.p2p_dir_var}.get(self._active_tab, self.udp_dir_var)
         var.set(path)
+        self.update_idletasks()
         hint = getattr(var, "_path_hint", None)
         if hint is not None:
             self._flash_hint(hint, "Path filled from drag and drop.")
