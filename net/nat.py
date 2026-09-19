@@ -121,8 +121,16 @@ def discover_public_addr(sock: socket.socket, servers=None, timeout=1.0, attempt
                     data, from_addr = sock.recvfrom(2048)
                 except (socket.timeout, OSError):
                     continue
-                if from_addr[0] != server_addr[0]:
-                    continue
+                # Deliberately not checking from_addr against server_addr
+                # here: Google's STUN cluster (stun.l.google.com and
+                # friends) is anycast/load-balanced, so a legitimate reply
+                # can arrive from a different front-end IP than the one
+                # the request was sent to. The random 12-byte transaction
+                # ID matched in _parse_binding_response already proves
+                # this reply answers *our* request, so an extra source-IP
+                # check only rejects genuine responses - silently turning
+                # a working STUN lookup into a fallback to a private LAN
+                # address that no one outside the network can reach.
                 result = _parse_binding_response(data, txn_id)
                 if result:
                     return result

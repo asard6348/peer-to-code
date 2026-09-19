@@ -66,6 +66,8 @@ class SettingsWindow(tk.Toplevel):
                                      .get("custom_syntax_colors", {}).items()}
         self._orig_terminal_messages = dict(cfg.setdefault("editor", {}).setdefault(
             "terminal_messages", dict(config.DEFAULTS["editor"]["terminal_messages"])))
+        self._orig_word_wrap = cfg.setdefault("editor", {}).get(
+            "word_wrap", config.DEFAULTS["editor"]["word_wrap"])
         ui_cfg_init = cfg.setdefault("ui", {})
         self._orig_explorer_font_family = ui_cfg_init.get(
             "explorer_font_family", getattr(app, "_explorer_font_family", "sans-serif"))
@@ -235,6 +237,15 @@ class SettingsWindow(tk.Toplevel):
             row=row, column=1, sticky="ne", padx=(0, 4), pady=(0, 4))
         row += 1
 
+        self.word_wrap_var = tk.BooleanVar(value=self._orig_word_wrap)
+        tk.Checkbutton(
+            rows, text="Wrap long lines onto more rows instead of scrolling sideways",
+            variable=self.word_wrap_var, bg=t["panel_bg"], fg=t["fg"],
+            selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
+            highlightthickness=0, anchor="w", command=self._on_word_wrap_toggled,
+        ).grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(0, 4))
+        row += 1
+
         ui_cfg = self.cfg.setdefault("ui", {})
         self._orig_save_window_position = ui_cfg.get("save_window_position", True)
         self._orig_save_window_size = ui_cfg.get("save_window_size", True)
@@ -316,6 +327,10 @@ class SettingsWindow(tk.Toplevel):
             return
         self.cfg.setdefault("ui", {})["console_font_family"] = family
         self._preview({"ui"})
+
+    def _on_word_wrap_toggled(self):
+        self.cfg.setdefault("editor", {})["word_wrap"] = self.word_wrap_var.get()
+        self._preview({"editor"})
 
     def _on_terminal_message_toggled(self, key):
         term_cfg = self.cfg.setdefault("editor", {}).setdefault("terminal_messages", {})
@@ -638,6 +653,7 @@ class SettingsWindow(tk.Toplevel):
             "syntax_theme": config.DEFAULTS["editor"]["syntax_theme"],
             "custom_syntax_colors": dict(config.DEFAULTS["editor"]["custom_syntax_colors"]),
             "terminal_messages": dict(config.DEFAULTS["editor"]["terminal_messages"]),
+            "word_wrap": config.DEFAULTS["editor"]["word_wrap"],
         }
         self.shortcuts_working = dict(self.cfg["shortcuts"])
         self.output_shortcuts_working = dict(self.cfg["output_shortcuts"])
@@ -649,6 +665,7 @@ class SettingsWindow(tk.Toplevel):
         self._orig_syntax_theme = self.cfg["editor"]["syntax_theme"]
         self._orig_custom_colors = dict(self.cfg["editor"]["custom_syntax_colors"])
         self._orig_terminal_messages = dict(self.cfg["editor"]["terminal_messages"])
+        self._orig_word_wrap = self.cfg["editor"]["word_wrap"]
         self._orig_save_window_position = self.cfg["ui"]["save_window_position"]
         self._orig_save_window_size = self.cfg["ui"]["save_window_size"]
         self.save_window_position_var.set(self._orig_save_window_position)
@@ -706,6 +723,7 @@ class SettingsWindow(tk.Toplevel):
         term_cfg = self.cfg.get("editor", {}).get("terminal_messages", {})
         for key, var in self.terminal_message_vars.items():
             var.set(term_cfg.get(key, True))
+        self.word_wrap_var.set(self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]))
 
     def _reset_defaults(self):
         import syntax
@@ -738,6 +756,7 @@ class SettingsWindow(tk.Toplevel):
             editor_cfg["syntax_theme"] = config.DEFAULTS["editor"]["syntax_theme"]
             editor_cfg["custom_syntax_colors"] = dict(config.DEFAULTS["editor"]["custom_syntax_colors"])
             editor_cfg["terminal_messages"] = dict(config.DEFAULTS["editor"]["terminal_messages"])
+            editor_cfg["word_wrap"] = config.DEFAULTS["editor"]["word_wrap"]
             syntax.set_custom_colors(editor_cfg["custom_syntax_colors"])
             syntax.set_color_theme(editor_cfg["syntax_theme"])
             self._refresh_general_ui()
@@ -764,6 +783,8 @@ class SettingsWindow(tk.Toplevel):
         if self.cfg.get("editor", {}).get("custom_syntax_colors", {}) != self._orig_custom_colors:
             changed.add("editor")
         if self.cfg.get("editor", {}).get("terminal_messages", {}) != self._orig_terminal_messages:
+            changed.add("editor")
+        if self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]) != self._orig_word_wrap:
             changed.add("editor")
         if self.save_window_position_var.get() != self._orig_save_window_position:
             changed.add("ui")
@@ -819,6 +840,9 @@ class SettingsWindow(tk.Toplevel):
             reverted.add("editor")
         if self.cfg.get("editor", {}).get("terminal_messages", {}) != self._orig_terminal_messages:
             self.cfg.setdefault("editor", {})["terminal_messages"] = dict(self._orig_terminal_messages)
+            reverted.add("editor")
+        if self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]) != self._orig_word_wrap:
+            self.cfg.setdefault("editor", {})["word_wrap"] = self._orig_word_wrap
             reverted.add("editor")
         ui_cfg = self.cfg.setdefault("ui", {})
         if (ui_cfg.get("save_window_position", True) != self._orig_save_window_position

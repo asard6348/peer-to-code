@@ -794,8 +794,11 @@ class ConnectWindow(ttk.Frame):
         self._set_busy(True, f"Starting mesh on port {adv_port}...")
         self._cancel_requested = threading.Event()
 
+        def on_log(msg):
+            self.after(0, lambda: self._set_busy(True, msg))
+
         try:
-            identity = nat.AdvertiseSocket(adv_port)
+            identity = nat.AdvertiseSocket(adv_port, on_log=on_log)
         except OSError as e:
             self._set_busy(False, f"Could not start: {e}")
             return
@@ -806,9 +809,12 @@ class ConnectWindow(ttk.Frame):
             if identity.is_closed:
                 self.after(0, lambda: self._cancelled(None))
                 return
+            stun_failed = identity.public_addr is None
             pub_host, pub_port = identity.public_addr or (adv_host, adv_port)
             self.after(0, lambda: self._set_p2p_addr_display(f"{pub_host}:{pub_port}"))
             self._persist_p2p(name, addr_typed, wdir)
+            if stun_failed:
+                self.after(0, lambda: self._warn_stun_failed(pub_host, pub_port))
 
             server = Server(adv_port, sock=identity.detach())
             try:
@@ -895,6 +901,9 @@ class ConnectWindow(ttk.Frame):
         cancel_requested = threading.Event()
         self._cancel_requested = cancel_requested
 
+        def on_log(msg):
+            self.after(0, lambda: self._set_busy(True, msg))
+
         def worker():
             try:
                 probe_ip = nat.quick_public_ip()
@@ -915,7 +924,7 @@ class ConnectWindow(ttk.Frame):
                     return
 
             try:
-                identity = nat.AdvertiseSocket(adv_port)
+                identity = nat.AdvertiseSocket(adv_port, on_log=on_log)
             except OSError as e:
                 self.after(0, lambda msg=str(e): self._set_busy(False, f"Could not start: {msg}"))
                 return
@@ -932,6 +941,7 @@ class ConnectWindow(ttk.Frame):
             pub_host, pub_port = identity.public_addr or (adv_host, adv_port)
             self.after(0, lambda: self._set_p2p_addr_display(f"{pub_host}:{pub_port}"))
             self._persist_p2p(name, addr_typed, wdir, join_address=join_addr)
+            self.after(0, lambda: self._set_busy(True, f"Connecting to {join_host}:{join_port}..."))
 
             client = Client()
             self._current_client = client
@@ -944,13 +954,32 @@ class ConnectWindow(ttk.Frame):
                 return
             except ConnectError as e:
                 identity.close()
-                self.after(0, lambda msg=str(e): self._fail(msg, None))
+                msg = str(e)
+                if "timed out" in msg:
+                    msg += ("\n\nThis usually means the host's router is not letting your "
+                            "connection through - common on carrier-grade NAT (mobile, "
+                            "satellite/Starlink-style connections) or a strict firewall. "
+                            "Double-check the address, or have the host try port-forwarding "
+                            "instead of relying on automatic NAT traversal.")
+                self.after(0, lambda msg=msg: self._fail(msg, None))
                 return
             self.after(0, lambda: self._ready("p2p", client, None, wdir, name,
                                                {"p2p_advertise": (pub_host, pub_port),
                                                 "p2p_advertise_socket": identity}))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _warn_stun_failed(self, host, port):
+        messagebox.showwarning(
+            "Could Not Detect a Public Address",
+            f"No STUN server answered, so the address being shared "
+            f"({host}:{port}) is this machine's local network address, not "
+            f"a public one. Anyone outside this network who tries to Join "
+            f"at that address will get no response.\n\n"
+            f"This usually means outbound UDP is blocked (a firewall, VPN, "
+            f"or a network that blocks STUN) rather than anything wrong "
+            f"with the mesh itself. Check your network/firewall, or share "
+            f"a manually port-forwarded address instead.")
 
     def _set_busy(self, busy, text=""):
         self._busy = busy

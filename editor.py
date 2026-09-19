@@ -110,6 +110,7 @@ class EditorApp(ttk.Frame):
         self._default_new_file_language = editor_cfg.get("default_new_file_language", "python")
         syntax.set_custom_colors(editor_cfg.get("custom_syntax_colors", {}))
         syntax.set_color_theme(editor_cfg.get("syntax_theme", syntax.DEFAULT_COLOR_THEME))
+        self._word_wrap = bool(editor_cfg.get("word_wrap", False))
         self._run_commands = editor_cfg.setdefault("run_commands", {})
         self._suppress_run_cmd_trace = False
 
@@ -264,6 +265,8 @@ class EditorApp(ttk.Frame):
             syntax.set_custom_colors(editor_cfg.get("custom_syntax_colors", {}))
             syntax.set_color_theme(editor_cfg.get("syntax_theme", syntax.DEFAULT_COLOR_THEME))
             syntax.configure_tags(self.text)
+            self._word_wrap = bool(editor_cfg.get("word_wrap", False))
+            self.text.configure(wrap=("word" if self._word_wrap else "none"))
             self._update_language_status()
             self._do_highlight()
 
@@ -389,7 +392,7 @@ class EditorApp(ttk.Frame):
         xscroll = tk.Scrollbar(text_frame, orient="horizontal", command=self._on_xscroll)
         xscroll.pack(side="bottom", fill="x")
 
-        self.text = tk.Text(text_frame, wrap="none", undo=True, autoseparators=True, maxundo=-1,
+        self.text = tk.Text(text_frame, wrap=("word" if self._word_wrap else "none"), undo=True, autoseparators=True, maxundo=-1,
                              bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"], selectbackground=t["sel_bg"],
                              font=(font_family, self._font_size), padx=8, pady=6, relief="flat",
                              yscrollcommand=self._on_text_yview_changed, xscrollcommand=xscroll.set, tabs=("1c",))
@@ -807,14 +810,15 @@ class EditorApp(ttk.Frame):
         self.after(0, lambda: self._apply_remote_op(op))
 
     def _apply_remote_op(self, op):
-        # A peer's edit shouldn't make *this* window's buffer look
-        # unsaved - only what the local person typed should. But the
-        # inserts/deletes below still run through the real Text widget,
-        # which flips its own "modified" flag on any change regardless
-        # of who it came from. Snapshot it first and restore it after,
-        # so a remote edit can't mark us dirty (or, arriving in an
-        # already-dirty window, accidentally clear that flag).
-        was_modified = self.text.edit_modified()
+        # A peer's edit changes what's on screen just as much as a local
+        # keystroke does, so the buffer is just as "unsaved" either way -
+        # the file on disk no longer matches what's displayed. The
+        # inserts/deletes below run through the real Text widget, which
+        # already flips its own "modified" flag on any change regardless
+        # of who it came from, so we simply let that flag (and the
+        # <<Modified>> handler that mirrors it into self.dirty) stand
+        # rather than snapshotting/restoring it back to whatever it was
+        # before this remote change arrived.
         self._suppress_capture = True
         try:
             idx = 0
@@ -829,7 +833,6 @@ class EditorApp(ttk.Frame):
                     self.text.delete(f"1.0+{idx}c", f"1.0+{idx + n}c")
         finally:
             self._suppress_capture = False
-        self.text.edit_modified(was_modified)
         self.doc = op.apply(self.doc)
         self._redraw_linenumbers()
         self._schedule_highlight()

@@ -29,8 +29,9 @@ DEFAULTS = {
     "editor": {
         "default_new_file_language": "python",
         "run_commands": {},
-        "syntax_theme": "idle",
+        "syntax_theme": "vivid",
         "custom_syntax_colors": {},
+        "word_wrap": False,
         "terminal_messages": {
             "finished": True,
             "stopped": True,

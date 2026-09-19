@@ -6,7 +6,7 @@ import tokenize
 
 COLOR_THEMES = {
     "idle": {
-        "label": "Classic",
+        "label": "Light",
         "description": "Bright, high-contrast colors.",
         "colors": {
             "keyword": {"foreground": "#ff7700"},
