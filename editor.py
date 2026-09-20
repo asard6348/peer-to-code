@@ -1,3 +1,4 @@
+import contextlib
 import os
 import queue
 import re
@@ -14,6 +15,7 @@ import config
 import theme
 import ansi
 import dnd_support
+import undo_history
 from text_proxy import install_proxy, install_delete_guard, char_offset
 from file_explorer import FileExplorer
 from peer_cursors import PeerCursorLayer
@@ -37,6 +39,7 @@ SHORTCUT_SPECS = [
     ("move_line_down", "Move Line Down", "<Alt-Down>", None),
     ("indent", "Indent", "<Control-bracketright>", "action_indent"),
     ("dedent", "Dedent", "<Control-bracketleft>", "action_dedent"),
+    ("undo_peer", "Undo Others' Last Change", "<Alt-z>", "action_undo_peer"),
     ("toggle_explorer", "Toggle Explorer", "<Control-b>", "toggle_explorer"),
     ("toggle_output", "Toggle Terminal", "<Control-grave>", "toggle_console"),
 ]
@@ -53,6 +56,14 @@ OUTPUT_SHORTCUT_SPECS = [
 _MOD_DISPLAY = {"Control": "Ctrl", "Shift": "Shift", "Alt": "Alt", "Command": "Cmd"}
 _KEY_DISPLAY = {"slash": "/", "bracketright": "]", "bracketleft": "[",
                 "Up": "Up", "Down": "Down", "Left": "Left", "Right": "Right"}
+
+EDITOR_SCOPED_ACTIONS = frozenset({
+    "select_all", "toggle_comment", "duplicate_line", "delete_line",
+    "move_line_up", "move_line_down", "indent", "dedent",
+})
+TEXT_INPUT_CLASSES = frozenset({
+    "Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox", "Text",
+})
 
 MIN_FONT_SIZE = 6
 MAX_FONT_SIZE = 40
@@ -86,6 +97,9 @@ class EditorApp(ttk.Frame):
         self._opened_single_file = bool(initial_file)
 
         self.doc = ""
+        self.history = undo_history.UndoHistory()
+        self._saved_doc = ""
+        self._author_names = {}
         self.current_file = None
         self.active_filename_hint = None
         self._loaded_mtime = None
@@ -153,18 +167,10 @@ class EditorApp(ttk.Frame):
         base = "Peer to Code"
         self.winfo_toplevel().title(f"*{base}*" if self._dirty else base)
 
-    def _on_text_modified(self, _event=None):
-        """Tk's Text widget ties its "modified" flag to the undo stack
-        itself (as of Tk 8.4): undoing back past the point where
-        edit_modified(False) was last set - a save, a file load, a fresh
-        buffer - clears the flag automatically, and redoing back past
-        that point sets it again, each time firing this <<Modified>>
-        event. Mirroring that flag into self.dirty (instead of setting
-        self.dirty = True by hand on every keystroke, which had no way
-        to notice Ctrl+Z undoing back to a clean state) is what makes
-        the title's asterisk and the "unsaved changes" prompts agree
-        with what Undo/Redo actually did."""
-        self.dirty = self.text.edit_modified()
+    def _refresh_dirty(self):
+        dirty = self.doc != self._saved_doc
+        if dirty != self._dirty:
+            self.dirty = dirty
 
     def _bind_client(self, client):
         """Wire up all of a Client's callbacks. Used at startup, and again
@@ -200,8 +206,12 @@ class EditorApp(ttk.Frame):
         menubar.add_cascade(label="File", menu=m_file)
 
         m_edit = tk.Menu(menubar, tearoff=0)
-        m_edit.add_command(label="Undo", accelerator="Ctrl+Z", command=lambda: self.text.event_generate("<<Undo>>"))
-        m_edit.add_command(label="Redo", accelerator="Ctrl+Y", command=lambda: self.text.event_generate("<<Redo>>"))
+        m_edit.add_command(label="Undo", accelerator="Ctrl+Z", command=self.action_undo)
+        m_edit.add_command(label="Redo", accelerator="Ctrl+Y", command=self.action_redo)
+        if self.mode != "solo":
+            m_edit.add_command(label="Undo Others' Last Change", accelerator=a("undo_peer"), command=self.action_undo_peer)
+            self._peer_undo_menu = tk.Menu(m_edit, tearoff=0, postcommand=self._fill_peer_undo_menu)
+            m_edit.add_cascade(label="Undo Change By", menu=self._peer_undo_menu)
         m_edit.add_separator()
         m_edit.add_command(label="Cut", accelerator="Ctrl+X", command=lambda: self.text.event_generate("<<Cut>>"))
         m_edit.add_command(label="Copy", accelerator="Ctrl+C", command=lambda: self.text.event_generate("<<Copy>>"))
@@ -214,6 +224,8 @@ class EditorApp(ttk.Frame):
         m_edit.add_command(label="Toggle Comment", accelerator=a("toggle_comment"), command=self.action_toggle_comment)
         m_edit.add_command(label="Duplicate Line", accelerator=a("duplicate_line"), command=self.action_duplicate_line)
         m_edit.add_command(label="Delete Line", accelerator=a("delete_line"), command=self.action_delete_line)
+        m_edit.configure(postcommand=self._refresh_edit_menu)
+        self._edit_menu = m_edit
         menubar.add_cascade(label="Edit", menu=m_edit)
 
         m_run = tk.Menu(menubar, tearoff=0)
@@ -227,6 +239,27 @@ class EditorApp(ttk.Frame):
         menubar.add_cascade(label="View", menu=m_view)
 
         self.menubar = menubar
+
+    def _author_display(self, author):
+        return self._author_names.get(author) or "another user"
+
+    def _refresh_edit_menu(self):
+        menu = self._edit_menu
+        menu.entryconfigure(0, state="normal" if self.history.can_undo() else "disabled")
+        menu.entryconfigure(1, state="normal" if self.history.can_redo() else "disabled")
+        if self.mode != "solo":
+            author = self.history.latest_peer()
+            if author is None:
+                menu.entryconfigure(2, label="Undo Others' Last Change", state="disabled")
+            else:
+                menu.entryconfigure(2, label=f"Undo {self._author_display(author)}'s Last Change", state="normal")
+            menu.entryconfigure(3, state="normal" if self.history.peer_authors() else "disabled")
+
+    def _fill_peer_undo_menu(self):
+        menu = self._peer_undo_menu
+        menu.delete(0, "end")
+        for author in self.history.peer_authors():
+            menu.add_command(label=self._author_display(author), command=lambda who=author: self.action_undo_peer(who))
 
     def _accel(self, action_id):
         return accel_display(self.shortcuts.get(action_id, ""))
@@ -392,7 +425,7 @@ class EditorApp(ttk.Frame):
         xscroll = tk.Scrollbar(text_frame, orient="horizontal", command=self._on_xscroll)
         xscroll.pack(side="bottom", fill="x")
 
-        self.text = tk.Text(text_frame, wrap=("word" if self._word_wrap else "none"), undo=True, autoseparators=True, maxundo=-1,
+        self.text = tk.Text(text_frame, wrap=("word" if self._word_wrap else "none"), undo=False,
                              bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"], selectbackground=t["sel_bg"],
                              font=(font_family, self._font_size), padx=8, pady=6, relief="flat",
                              yscrollcommand=self._on_text_yview_changed, xscrollcommand=xscroll.set, tabs=("1c",))
@@ -468,7 +501,10 @@ class EditorApp(ttk.Frame):
 
         self.text.bind("<KeyRelease>", self._on_key_release)
         self.text.bind("<ButtonRelease-1>", self._update_cursor_status)
-        self.text.bind("<<Modified>>", self._on_text_modified)
+        self.text.bind("<<Undo>>", self.action_undo)
+        self.text.bind("<<Redo>>", self.action_redo)
+        self.text.bind("<Control-y>", self.action_redo)
+        self.text.bind("<<Paste>>", self._on_text_paste)
         self._bind_zoom_gestures()
 
     def _on_yscroll(self, *args):
@@ -758,10 +794,10 @@ class EditorApp(ttk.Frame):
         op.retain(offset)
         op.insert(text)
         op.retain(len(self.doc) - offset)
-        self.doc = op.apply(self.doc)
-        # self.dirty follows the Text widget's own undo-aware "modified"
-        # flag now (see _on_text_modified) rather than being forced True
-        # here on every keystroke.
+        before = self.doc
+        self.doc = op.apply(before)
+        self.history.record(undo_history.LOCAL, op, before)
+        self._refresh_dirty()
         self._update_cursor_status()
         self.client.local_edit(op)
 
@@ -773,14 +809,20 @@ class EditorApp(ttk.Frame):
         op.retain(off_start)
         op.delete(off_end - off_start)
         op.retain(len(self.doc) - off_end)
-        self.doc = op.apply(self.doc)
-        # See _on_local_insert - dirty tracking now follows the Text
-        # widget's own modified flag instead of being set here.
+        before = self.doc
+        self.doc = op.apply(before)
+        self.history.record(undo_history.LOCAL, op, before)
+        self._refresh_dirty()
         self._update_cursor_status()
         self.client.local_edit(op)
 
     def _on_full_sync(self, text):
         self.after(0, lambda: self._apply_full_sync(text))
+
+    def _reset_history(self):
+        self.history.reset()
+        self._saved_doc = self.doc
+        self._refresh_dirty()
 
     def _apply_full_sync(self, text):
         self._suppress_capture = True
@@ -790,12 +832,7 @@ class EditorApp(ttk.Frame):
         finally:
             self._suppress_capture = False
         self.doc = text
-        # Marks this exact point as "clean" in the Text widget's own
-        # undo-linked modified flag, so undoing back to it (even across
-        # a later save - see _write_to) clears the dirty indicator
-        # automatically instead of only a manual save doing so.
-        self.text.edit_modified(False)
-        self.dirty = False
+        self._reset_history()
         self._redraw_linenumbers()
         self._do_highlight()
         if self.mode != "solo":
@@ -806,19 +843,10 @@ class EditorApp(ttk.Frame):
         else:
             self._update_file_path_label()
 
-    def _on_remote_op(self, op):
-        self.after(0, lambda: self._apply_remote_op(op))
+    def _on_remote_op(self, op, author=None):
+        self.after(0, lambda: self._apply_remote_op(op, author))
 
-    def _apply_remote_op(self, op):
-        # A peer's edit changes what's on screen just as much as a local
-        # keystroke does, so the buffer is just as "unsaved" either way -
-        # the file on disk no longer matches what's displayed. The
-        # inserts/deletes below run through the real Text widget, which
-        # already flips its own "modified" flag on any change regardless
-        # of who it came from, so we simply let that flag (and the
-        # <<Modified>> handler that mirrors it into self.dirty) stand
-        # rather than snapshotting/restoring it back to whatever it was
-        # before this remote change arrived.
+    def _apply_op_to_widget(self, op):
         self._suppress_capture = True
         try:
             idx = 0
@@ -833,9 +861,66 @@ class EditorApp(ttk.Frame):
                     self.text.delete(f"1.0+{idx}c", f"1.0+{idx + n}c")
         finally:
             self._suppress_capture = False
-        self.doc = op.apply(self.doc)
+
+    def _apply_remote_op(self, op, author=None):
+        before = self.doc
+        self._apply_op_to_widget(op)
+        self.doc = op.apply(before)
+        self.history.record("remote" if author is None else author, op, before)
+        self._refresh_dirty()
         self._redraw_linenumbers()
         self._schedule_highlight()
+
+    def _apply_history_op(self, op):
+        before = self.doc
+        self._apply_op_to_widget(op)
+        self.doc = op.apply(before)
+        self.client.local_edit(op)
+        self._place_caret_after(op)
+        self._refresh_dirty()
+        self._redraw_linenumbers()
+        self._schedule_highlight()
+        self._update_cursor_status()
+
+    def _place_caret_after(self, op):
+        new = 0
+        last = None
+        for c in op.ops:
+            if isinstance(c, str):
+                new += len(c)
+                last = new
+            elif c > 0:
+                new += c
+            else:
+                last = new
+        self.text.tag_remove("sel", "1.0", "end")
+        if last is not None:
+            self.text.mark_set("insert", f"1.0+{last}c")
+            self.text.see("insert")
+
+    def action_undo(self, _event=None):
+        op = self.history.undo(self.doc)
+        if op is not None:
+            self._apply_history_op(op)
+        return "break"
+
+    def action_redo(self, _event=None):
+        op = self.history.redo(self.doc)
+        if op is not None:
+            self._apply_history_op(op)
+        return "break"
+
+    def action_undo_peer(self, author=None):
+        if author is None:
+            author = self.history.latest_peer()
+        if author is None:
+            self._set_status("No changes by other users to undo")
+            return "break"
+        op = self.history.undo_peer(author, self.doc)
+        if op is not None:
+            self._apply_history_op(op)
+            self._set_status(f"Undid {self._author_display(author)}'s last change")
+        return "break"
 
     def _on_peers(self, peers):
         self.after(0, lambda: self._render_peers(peers))
@@ -850,6 +935,7 @@ class EditorApp(ttk.Frame):
             if pid not in current:
                 self._console_write(f"{name} disconnected\n", "info")
         self._known_peer_names = current
+        self._author_names.update(current)
         names = ", ".join(current.values())
         self.peers_label.configure(text=f"{len(others)} connected: {names}" if others else "")
         self.cursor_layer.set_roster(peers)
@@ -1015,9 +1101,7 @@ class EditorApp(ttk.Frame):
             self._suppress_capture = False
         op = ot.diff_to_op(self.doc, text)
         self.doc = text
-        # New clean checkpoint - see _apply_full_sync.
-        self.text.edit_modified(False)
-        self.dirty = False
+        self._reset_history()
         if not op.is_noop():
             self.client.local_edit(op)
         self.active_filename_hint = filename_hint
@@ -1142,19 +1226,15 @@ class EditorApp(ttk.Frame):
         return True
 
     def _write_to(self, path):
+        content = self.text.get("1.0", "end-1c")
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self.text.get("1.0", "end-1c"))
+                f.write(content)
         except OSError as e:
             messagebox.showerror("Save", str(e))
             return
-        # New clean checkpoint - see _apply_full_sync. Undoing back to
-        # exactly this point in the buffer's history - whether that's
-        # further edits made after this save, or edits from *before* it
-        # that a later Ctrl+Z walks back through - will clear the dirty
-        # indicator again on its own.
-        self.text.edit_modified(False)
-        self.dirty = False
+        self._saved_doc = content
+        self._refresh_dirty()
         self._loaded_mtime = self._safe_mtime(path)
         self._update_cursor_status()
 
@@ -1597,6 +1677,29 @@ class EditorApp(ttk.Frame):
             self._console_history.append(command)
         self._run_terminal_command(command)
 
+    @contextlib.contextmanager
+    def _single_undo_step(self):
+        with self.history.batch():
+            yield
+
+    def _on_text_paste(self, _event=None):
+        text = self.text
+        try:
+            clip = text.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if not clip:
+            return "break"
+        with self._single_undo_step():
+            if text.tag_ranges("sel"):
+                start = text.index("sel.first")
+                text.delete("sel.first", "sel.last")
+                text.mark_set("insert", start)
+            text.insert("insert", clip)
+        text.see("insert")
+        self._schedule_highlight()
+        return "break"
+
     def action_select_all(self):
         self.text.tag_add("sel", "1.0", "end-1c")
         return "break"
@@ -1615,20 +1718,21 @@ class EditorApp(ttk.Frame):
             start = end = int(self.text.index("insert").split(".")[0])
         lines = [self.text.get(f"{n}.0", f"{n}.end") for n in range(start, end + 1)]
         should_comment = any(l.strip() and not l.lstrip().startswith("#") for l in lines)
-        for n in range(start, end + 1):
-            line = self.text.get(f"{n}.0", f"{n}.end")
-            if should_comment:
-                if line.strip():
-                    indent = len(line) - len(line.lstrip(" "))
-                    self.text.insert(f"{n}.{indent}", "# ")
-            else:
-                stripped = line.lstrip(" ")
-                if stripped.startswith("# "):
-                    idx = line.index("# ")
-                    self.text.delete(f"{n}.{idx}", f"{n}.{idx + 2}")
-                elif stripped.startswith("#"):
-                    idx = line.index("#")
-                    self.text.delete(f"{n}.{idx}", f"{n}.{idx + 1}")
+        with self._single_undo_step():
+            for n in range(start, end + 1):
+                line = self.text.get(f"{n}.0", f"{n}.end")
+                if should_comment:
+                    if line.strip():
+                        indent = len(line) - len(line.lstrip(" "))
+                        self.text.insert(f"{n}.{indent}", "# ")
+                else:
+                    stripped = line.lstrip(" ")
+                    if stripped.startswith("# "):
+                        idx = line.index("# ")
+                        self.text.delete(f"{n}.{idx}", f"{n}.{idx + 2}")
+                    elif stripped.startswith("#"):
+                        idx = line.index("#")
+                        self.text.delete(f"{n}.{idx}", f"{n}.{idx + 1}")
         return "break"
 
     def action_duplicate_line(self):
@@ -1656,9 +1760,10 @@ class EditorApp(ttk.Frame):
         a = self.text.get(f"{line_no}.0", f"{line_no}.end")
         b = self.text.get(f"{target}.0", f"{target}.end")
         lo, hi = min(line_no, target), max(line_no, target)
-        self.text.delete(f"{lo}.0", f"{hi}.end")
-        new_pair = (b, a) if direction < 0 else (a, b)
-        self.text.insert(f"{lo}.0", new_pair[0] + "\n" + new_pair[1])
+        new_pair = (a, b) if direction < 0 else (b, a)
+        with self._single_undo_step():
+            self.text.delete(f"{lo}.0", f"{hi}.end")
+            self.text.insert(f"{lo}.0", new_pair[0] + "\n" + new_pair[1])
         self.text.mark_set("insert", f"{target}.{col}")
         self.text.see("insert")
         return "break"
@@ -1686,9 +1791,10 @@ class EditorApp(ttk.Frame):
             self.text.insert("insert", "    ")
             return "break"
         start, end = sel
-        for n in range(start, end + 1):
-            if self.text.get(f"{n}.0", f"{n}.end").strip():
-                self.text.insert(f"{n}.0", "    ")
+        with self._single_undo_step():
+            for n in range(start, end + 1):
+                if self.text.get(f"{n}.0", f"{n}.end").strip():
+                    self.text.insert(f"{n}.0", "    ")
         return "break"
 
     def action_dedent(self, event=None):
@@ -1697,12 +1803,13 @@ class EditorApp(ttk.Frame):
             start = end = int(self.text.index("insert").split(".")[0])
         else:
             start, end = sel
-        for n in range(start, end + 1):
-            line = self.text.get(f"{n}.0", f"{n}.end")
-            cut = len(line) - len(line.lstrip(" "))
-            cut = min(cut, 4)
-            if cut:
-                self.text.delete(f"{n}.0", f"{n}.{cut}")
+        with self._single_undo_step():
+            for n in range(start, end + 1):
+                line = self.text.get(f"{n}.0", f"{n}.end")
+                cut = len(line) - len(line.lstrip(" "))
+                cut = min(cut, 4)
+                if cut:
+                    self.text.delete(f"{n}.0", f"{n}.{cut}")
         return "break"
 
     def _cancel_pending_jobs(self):
@@ -1741,6 +1848,36 @@ class EditorApp(ttk.Frame):
                 pass
         self._bound_accels = []
 
+    def _is_foreign_text_input(self, widget):
+        if widget is self.text:
+            return False
+        try:
+            return widget.winfo_class() in TEXT_INPUT_CLASSES
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _select_all_in(self, widget):
+        try:
+            if widget.winfo_class() == "Text":
+                widget.tag_add("sel", "1.0", "end-1c")
+                widget.mark_set("insert", "end-1c")
+            else:
+                widget.selection_range(0, "end")
+                widget.icursor("end")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _scoped_shortcut(self, action_id, fn):
+        def handler(event):
+            widget = getattr(event, "widget", None)
+            if self._is_foreign_text_input(widget):
+                if action_id == "select_all":
+                    return self._select_all_in(widget)
+                return None
+            return fn(event)
+        return handler
+
     def _apply_shortcuts(self):
         root = self.winfo_toplevel()
         self._unbind_shortcuts()
@@ -1756,9 +1893,10 @@ class EditorApp(ttk.Frame):
             else:
                 method = getattr(self, method_name)
                 fn = (lambda e, m=method: (m(), "break")[1])
+            global_fn = self._scoped_shortcut(action_id, fn) if action_id in EDITOR_SCOPED_ACTIONS else fn
             try:
                 self.text.bind(accel, fn)
-                root.bind_all(accel, fn)
+                root.bind_all(accel, global_fn)
                 self._bound_accels.append(accel)
             except tk.TclError:
                 pass
@@ -2001,8 +2139,9 @@ class FindDialog(tk.Toplevel):
         try:
             if text.tag_ranges("sel"):
                 a, b = text.tag_ranges("sel")[:2]
-                text.delete(a, b)
-                text.insert(a, self.replace_var.get())
+                with self.app._single_undo_step():
+                    text.delete(a, b)
+                    text.insert(a, self.replace_var.get())
                 text.mark_set("insert", a)
         finally:
             self.find_next()
@@ -2015,14 +2154,15 @@ class FindDialog(tk.Toplevel):
             return
         pos = "1.0"
         count = 0
-        while True:
-            pos, length = self._do_search(needle, pos, "end", backwards=False)
-            if pos is None:
-                break
-            end = f"{pos}+{length}c"
-            text.delete(pos, end)
-            text.insert(pos, repl)
-            pos = f"{pos}+{len(repl)}c"
-            count += 1
+        with self.app._single_undo_step():
+            while True:
+                pos, length = self._do_search(needle, pos, "end", backwards=False)
+                if pos is None:
+                    break
+                end = f"{pos}+{length}c"
+                text.delete(pos, end)
+                text.insert(pos, repl)
+                pos = f"{pos}+{len(repl)}c"
+                count += 1
         self.status_var.set(f"Replaced {count} occurrence(s).")
         messagebox.showinfo("Replace All", f"Replaced {count} occurrence(s).")

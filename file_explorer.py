@@ -75,7 +75,7 @@ class FileExplorer(ttk.Frame):
         self.menu.add_command(label="Delete", command=self._delete)
 
         self._node_paths = {}
-        self.collapse_all()
+        self._show_initial_view()
 
     def _tree_font(self):
         name = ttk.Style(self.tree).lookup("Treeview", "font") or "TkDefaultFont"
@@ -151,7 +151,7 @@ class FileExplorer(ttk.Frame):
     def set_working_dir(self, path):
         self.working_dir = path
         self._whole_computer = False
-        self.refresh()
+        self._show_initial_view()
 
     def show_whole_computer(self):
         """Used when no specific folder was opened (a single-file Open):
@@ -173,14 +173,13 @@ class FileExplorer(ttk.Frame):
             return [(r, r) for r in _filesystem_roots()]
         return [(self.working_dir, os.path.basename(self.working_dir) or self.working_dir)]
 
-    def refresh(self):
-        """Reloads the tree's contents in place, without collapsing
-        whatever the person already had expanded - creating a file deep in
-        an expanded subfolder, or a peer's change showing up, shouldn't
-        reset your whole tree back to the top level. Use collapse_all()
-        to actually collapse everything back down."""
-        expanded_paths = self._collect_expanded_paths()
+    def _show_initial_view(self):
         self._rebuild(open_roots=not self._whole_computer)
+        self._update_tree_width()
+
+    def refresh(self):
+        expanded_paths = self._collect_expanded_paths()
+        self._rebuild(open_roots=False)
         for root_node in self.tree.get_children(""):
             path = self._node_paths.get(root_node)
             if path:
@@ -188,13 +187,17 @@ class FileExplorer(ttk.Frame):
         self._update_tree_width()
 
     def collapse_all(self):
-        """Rebuilds the tree fresh, collapsed back down to just the top
-        level - what Refresh itself used to do before it started
-        preserving expansion state. In whole-computer mode even the root
-        entries themselves start collapsed (see show_whole_computer);
-        otherwise the single project root stays open, matching how a
-        normal Explorer view starts."""
-        self._rebuild(open_roots=not self._whole_computer)
+        def close(node):
+            self.tree.item(node, open=False)
+            for child in self.tree.get_children(node):
+                close(child)
+
+        for root_node in self.tree.get_children(""):
+            close(root_node)
+        self.tree.selection_set(())
+        self.tree.focus("")
+        self.tree.yview_moveto(0)
+        self.tree.xview_moveto(0)
         self._update_tree_width()
 
     def _rebuild(self, open_roots):
@@ -209,29 +212,33 @@ class FileExplorer(ttk.Frame):
         expanded = set()
 
         def walk(node):
-            if self.tree.item(node, "open"):
-                path = self._node_paths.get(node)
-                if path:
-                    expanded.add(path)
-                for child in self.tree.get_children(node):
-                    walk(child)
+            path = self._node_paths.get(node)
+            if path and self.tree.item(node, "open"):
+                expanded.add(path)
+            for child in self.tree.get_children(node):
+                walk(child)
 
         for node in self.tree.get_children(""):
             walk(node)
         return expanded
 
     def _reexpand(self, node, path, expanded_paths):
-        if path not in expanded_paths:
+        prefix = path.rstrip(os.sep) + os.sep
+        if not any(p == path or p.startswith(prefix) for p in expanded_paths):
             return
-        self.tree.item(node, open=True)
-        children = self.tree.get_children(node)
-        if len(children) == 1 and self.tree.item(children[0], "text") == "":
-            self.tree.delete(children[0])
-            self._populate(node, path)
+        if path in expanded_paths:
+            self.tree.item(node, open=True)
+        self._load_children(node, path)
         for child in self.tree.get_children(node):
             child_path = self._node_paths.get(child)
             if child_path:
                 self._reexpand(child, child_path, expanded_paths)
+
+    def _load_children(self, node, path):
+        children = self.tree.get_children(node)
+        if len(children) == 1 and self.tree.item(children[0], "text") == "":
+            self.tree.delete(children[0])
+            self._populate(node, path)
 
     def _populate(self, node, path):
         try:
@@ -252,10 +259,7 @@ class FileExplorer(ttk.Frame):
         path = self._node_paths.get(node)
         if not path or not os.path.isdir(path):
             return
-        children = self.tree.get_children(node)
-        if len(children) == 1 and self.tree.item(children[0], "text") == "":
-            self.tree.delete(children[0])
-            self._populate(node, path)
+        self._load_children(node, path)
         self._update_tree_width()
 
     def _on_double_click(self, _event):

@@ -285,7 +285,7 @@ class Client:
                 to_apply = self._transform_incoming(op)
             self.expected_rev += 1
             if to_apply is not None and not to_apply.is_noop():
-                self._fire("remote_op", to_apply)
+                self._fire("remote_op", to_apply, payload.get("from"))
 
     def _on_own_ack(self):
         if self.state == "awaiting":
@@ -301,10 +301,10 @@ class Client:
         if self.state == "synced":
             return op
         if self.state == "awaiting":
-            op2, self.outstanding = ot.transform(op, self.outstanding)
+            self.outstanding, op2 = ot.transform(self.outstanding, op)
             return op2
-        op2, self.outstanding = ot.transform(op, self.outstanding)
-        op3, self.buffer = ot.transform(op2, self.buffer)
+        self.outstanding, op2 = ot.transform(self.outstanding, op)
+        self.buffer, op3 = ot.transform(self.buffer, op2)
         return op3
 
     def _on_timeout(self, addr):

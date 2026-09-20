@@ -6,6 +6,7 @@ from tkinter import messagebox
 import config
 import theme
 import dnd_support
+import entry_paste
 from connect_window import ConnectWindow
 from editor import EditorApp
 
@@ -17,6 +18,7 @@ class App:
         self.cfg = config.load_config()
 
         self.root = dnd_support.make_root()
+        entry_paste.install(self.root)
         self.root.title("Peer to Code")
         self._apply_saved_geometry()
         self.root.configure(bg=self.cfg["theme"]["bg"])

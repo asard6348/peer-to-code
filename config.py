@@ -55,6 +55,7 @@ DEFAULTS = {
         "move_line_down": "<Alt-Down>",
         "indent": "<Control-bracketright>",
         "dedent": "<Control-bracketleft>",
+        "undo_peer": "<Alt-z>",
     },
     "output_shortcuts": {
         "console_interrupt": "<Control-c>",
