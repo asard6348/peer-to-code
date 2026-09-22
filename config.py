@@ -37,7 +37,7 @@ DEFAULTS = {
         "run_commands": {},
         "syntax_theme": "auto",
         "custom_syntax_colors": {},
-        "word_wrap": False,
+        "word_wrap": True,
         "terminal_messages": {
             "finished": True,
             "stopped": True,

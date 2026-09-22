@@ -61,7 +61,7 @@ class SettingsWindow(tk.Toplevel):
         self._orig_output_shortcuts = dict(cfg["output_shortcuts"])
         self._orig_theme = dict(cfg["theme"])
         self._orig_default_language = cfg.setdefault("editor", {}).get("default_new_file_language", "python")
-        self._orig_syntax_theme = cfg.setdefault("editor", {}).get("syntax_theme", "idle")
+        self._orig_syntax_theme = cfg.setdefault("editor", {}).get("syntax_theme", "auto")
         self._orig_custom_colors = {k: dict(v) for k, v in cfg.setdefault("editor", {})
                                      .get("custom_syntax_colors", {}).items()}
         self._orig_terminal_messages = dict(cfg.setdefault("editor", {}).setdefault(

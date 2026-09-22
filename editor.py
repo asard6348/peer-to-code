@@ -22,6 +22,23 @@ from peer_cursors import PeerCursorLayer
 from settings_window import SettingsWindow
 from net.client import FailoverController
 
+# The Terminal console's stdout/stderr/prompt colors, tuned as two fixed
+# pairs rather than one - the "dark" set is bright, saturated color meant
+# to pop against a near-black console background, and reads as barely
+# more than a smudge against a light one (and vice versa for "light"'s
+# deeper, more saturated tones on a near-black background). Which pair
+# applies is decided at paint time from the *current* console background's
+# brightness (see _console_tag_colors below), the same test the "auto"
+# syntax palette uses - so it keeps working for a user's own saved
+# preset, not just the two built-in Dark/Light themes.
+CONSOLE_TAG_COLORS_DARK = {"stderr": "#e06c75", "info": "#61afef", "prompt": "#98c379"}
+CONSOLE_TAG_COLORS_LIGHT = {"stderr": "#cf222e", "info": "#0969da", "prompt": "#1a7f37"}
+
+
+def _console_tag_colors(console_bg):
+    return CONSOLE_TAG_COLORS_LIGHT if syntax.brightness(console_bg) >= 0.5 else CONSOLE_TAG_COLORS_DARK
+
+
 SHORTCUT_SPECS = [
     ("new_file", "New", "<Control-n>", "action_new"),
     ("open_file", "Open File", "<Control-o>", "action_open"),
@@ -125,7 +142,7 @@ class EditorApp(ttk.Frame):
         syntax.set_editor_background(self.theme.get("edit_bg"))
         syntax.set_custom_colors(editor_cfg.get("custom_syntax_colors", {}))
         syntax.set_color_theme(editor_cfg.get("syntax_theme", syntax.DEFAULT_COLOR_THEME))
-        self._word_wrap = bool(editor_cfg.get("word_wrap", False))
+        self._word_wrap = bool(editor_cfg.get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]))
         self._run_commands = editor_cfg.setdefault("run_commands", {})
         self._suppress_run_cmd_trace = False
 
@@ -299,7 +316,7 @@ class EditorApp(ttk.Frame):
             syntax.set_custom_colors(editor_cfg.get("custom_syntax_colors", {}))
             syntax.set_color_theme(editor_cfg.get("syntax_theme", syntax.DEFAULT_COLOR_THEME))
             syntax.configure_tags(self.text)
-            self._word_wrap = bool(editor_cfg.get("word_wrap", False))
+            self._word_wrap = bool(editor_cfg.get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]))
             self.text.configure(wrap=("word" if self._word_wrap else "none"))
             self._update_language_status()
             self._do_highlight()
@@ -316,10 +333,11 @@ class EditorApp(ttk.Frame):
         theme.apply_classic_widget_defaults(self.winfo_toplevel(), t)
 
         for frame in (self.toolbar, self.body, self.center, self.edit_area, self.text_frame,
-                      self.console_frame):
+                      self.console_frame, self.console_body):
             frame.configure(bg=t["bg"])
         self.interp_label.configure(bg=t["bg"], fg=t["fg"])
         self.peers_label.configure(bg=t["bg"], fg=t["fg"])
+        self.file_path_label.configure(bg=t["bg"], fg=t["muted_fg"])
         self.run_cmd_entry.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"])
         self.linenumbers.configure(bg=t["gutter_bg"])
         self.text.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"],
@@ -330,7 +348,12 @@ class EditorApp(ttk.Frame):
         # _set_console_font_size/_family) - a theme change updates
         # colors everywhere, including the console's background here,
         # but deliberately leaves both panels' own fonts alone.
-        self.console.configure(bg=t["console_bg"])
+        self.console.configure(bg=t["console_bg"], fg=t["fg"])
+        console_tag_colors = _console_tag_colors(t["console_bg"])
+        self.console.tag_configure("stderr", foreground=console_tag_colors["stderr"])
+        self.console.tag_configure("info", foreground=console_tag_colors["info"])
+        self.console.tag_configure("prompt", foreground=console_tag_colors["prompt"])
+        self.ansi_console.base_tag_colors = console_tag_colors
 
         self.cursor_layer.set_theme(t["edit_bg"])
         syntax.set_editor_background(t["edit_bg"])
@@ -452,20 +475,21 @@ class EditorApp(ttk.Frame):
 
         console_body = tk.Frame(console_frame, bg=t["bg"])
         console_body.pack(fill="both", expand=True, padx=2, pady=2)
+        self.console_body = console_body
 
         console_yscroll = tk.Scrollbar(console_body, orient="vertical")
         console_yscroll.pack(side="right", fill="y")
 
-        self.console = tk.Text(console_body, height=4, bg=t["console_bg"], fg="#c9d1d9", relief="flat",
+        self.console = tk.Text(console_body, height=4, bg=t["console_bg"], fg=t["fg"], relief="flat",
                                 font=(self._console_font_family, self._console_font_size),
                                 yscrollcommand=console_yscroll.set)
         self.console.pack(side="left", fill="both", expand=True)
         console_yscroll.config(command=self.console.yview)
-        self.console.tag_configure("stderr", foreground="#e06c75")
-        self.console.tag_configure("info", foreground="#61afef")
-        self.console.tag_configure("prompt", foreground="#98c379")
-        self.ansi_console = ansi.AnsiConsole(
-            self.console, base_tag_colors={"stderr": "#e06c75", "info": "#61afef", "prompt": "#98c379"})
+        console_tag_colors = _console_tag_colors(t["console_bg"])
+        self.console.tag_configure("stderr", foreground=console_tag_colors["stderr"])
+        self.console.tag_configure("info", foreground=console_tag_colors["info"])
+        self.console.tag_configure("prompt", foreground=console_tag_colors["prompt"])
+        self.ansi_console = ansi.AnsiConsole(self.console, base_tag_colors=console_tag_colors)
 
         # A run's prompt (e.g. input(">> ")) is shown right in this same
         # pane, and the person types their reply directly after it -

@@ -54,9 +54,9 @@ BUILTIN_THEME_PRESETS = {
             "panel_bg": "#eeeeee",
             "edit_bg": "#ffffff",
             "gutter_bg": "#f5f5f5",
-            "gutter_fg": "#9aa0a6",
+            "gutter_fg": "#6e7781",
             "fg": "#24292e",
-            "muted_fg": "#6a737d",
+            "muted_fg": "#57606a",
             "sel_bg": "#add6ff",
             "console_bg": "#f6f8fa",
             "accent": "#0969da",
@@ -238,6 +238,30 @@ def apply_base_style(style: ttk.Style, t: dict):
     style.map("Treeview", background=[("selected", t["sel_bg"])], foreground=[("selected", t["fg"])])
     style.configure("Treeview.Heading", background=t["panel_bg"], foreground=t["fg"])
 
+    # Settings' tab strip: unthemed, these otherwise keep "clam"'s fixed
+    # beige regardless of which palette is active, which reads as a stray
+    # mismatched patch against a light (or, for that matter, dark) panel.
+    style.configure("TNotebook", background=t["panel_bg"], borderwidth=0)
+    style.configure("TNotebook.Tab", background=t["bg"], foreground=t["muted_fg"], padding=(10, 4))
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", t["panel_bg"])],
+        foreground=[("selected", t["fg"])],
+    )
+
+    # Dropdowns (syntax palette, font family, the color theme preset
+    # picker): same story - "clam"'s default fieldbackground is a fixed
+    # mid-gray that was never wired up to the theme.
+    style.configure("TCombobox", fieldbackground=t["edit_bg"], background=t["panel_bg"],
+                     foreground=t["fg"], arrowcolor=t["fg"], selectbackground=t["edit_bg"],
+                     selectforeground=t["fg"])
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", t["edit_bg"]), ("disabled", t["panel_bg"])],
+        background=[("readonly", t["panel_bg"])],
+        foreground=[("disabled", t["muted_fg"])],
+    )
+
 
 def apply_classic_widget_defaults(root: tk.Tk, t: dict):
     """Sets sane, theme-matching defaults on the Tk option database for the
@@ -262,3 +286,12 @@ def apply_classic_widget_defaults(root: tk.Tk, t: dict):
     root.option_add("*Entry.foreground", t["fg"])
     root.option_add("*Text.background", t["edit_bg"])
     root.option_add("*Text.foreground", t["fg"])
+    # The combobox's popped-down list is a plain Tk Listbox underneath,
+    # not a ttk widget, so TCombobox's style.configure() above doesn't
+    # reach it - it has to go through the option database instead, or it
+    # keeps showing black-on-white (or white-on-black) no matter the
+    # theme.
+    root.option_add("*TCombobox*Listbox.background", t["edit_bg"])
+    root.option_add("*TCombobox*Listbox.foreground", t["fg"])
+    root.option_add("*TCombobox*Listbox.selectBackground", t["sel_bg"])
+    root.option_add("*TCombobox*Listbox.selectForeground", t["fg"])
