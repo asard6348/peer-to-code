@@ -25,11 +25,17 @@ DEFAULTS = {
         "window_position": "",
         "save_window_position": True,
         "save_window_size": True,
+        # Which color theme preset is active ("system", "dark", "light",
+        # or the name of a preset saved under "theme_presets" below).
+        # "system" means the ten colors under "theme" get refreshed from
+        # the OS's current light/dark setting on every launch - see
+        # theme.apply_active_preset().
+        "theme_preset": "system",
     },
     "editor": {
         "default_new_file_language": "python",
         "run_commands": {},
-        "syntax_theme": "vivid",
+        "syntax_theme": "auto",
         "custom_syntax_colors": {},
         "word_wrap": False,
         "terminal_messages": {
@@ -74,6 +80,11 @@ DEFAULTS = {
         "font_family": "Consolas",
         "font_size": 11,
     },
+    # User-saved color theme presets: {name: {the ten THEME_COLOR_KEYS
+    # colors}}. The two built-ins ("dark"/"light") and the auto-following
+    # "system" preset aren't stored here - only what the user creates via
+    # Settings > Theme > Save As.
+    "theme_presets": {},
 }
 
 _override_path = None

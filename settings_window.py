@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, colorchooser, messagebox, font as tkfont
+from tkinter import ttk, colorchooser, messagebox, simpledialog, font as tkfont
 
 import config
 import scrollutil
@@ -77,6 +77,8 @@ class SettingsWindow(tk.Toplevel):
             "console_font_family", getattr(app, "_console_font_family", "Consolas"))
         self._orig_console_font_size = int(ui_cfg_init.get(
             "console_font_size", getattr(app, "_console_font_size", 10)))
+        self._orig_theme_preset = ui_cfg_init.get("theme_preset", "system")
+        self._orig_theme_presets = {k: dict(v) for k, v in cfg.setdefault("theme_presets", {}).items()}
         self.color_vars = {}
         self._listening_action = None
         self._row_widgets = {}
@@ -163,6 +165,7 @@ class SettingsWindow(tk.Toplevel):
             except (tk.TclError, ValueError):
                 pass
             self.cfg["theme"] = dict(self.theme_working)
+            self._refresh_syntax_theme_description()
         if "ui" in sections:
             ui_cfg = self.cfg.setdefault("ui", {})
             ui_cfg["save_window_position"] = self.save_window_position_var.get()
@@ -182,6 +185,27 @@ class SettingsWindow(tk.Toplevel):
         lbl.grid(row=row, column=0, **grid_kwargs)
         lbl.bind("<Configure>", lambda e, l=lbl: l.configure(wraplength=max(60, e.width)))
         return lbl
+
+    def _syntax_theme_desc_text(self, key):
+        """COLOR_THEMES[key]'s description, with "auto" additionally
+        noting which built-in palette it currently resolves to - against
+        the Theme tab's own (possibly unsaved) editor-background color,
+        so this stays accurate while previewing an unsaved Theme change,
+        not just after Save."""
+        import syntax
+        desc = syntax.COLOR_THEMES[key]["description"]
+        if key == syntax.AUTO_COLOR_THEME:
+            edit_bg = self.theme_working.get("edit_bg", self._orig_theme.get("edit_bg"))
+            resolved = syntax.resolve_auto_theme(edit_bg)
+            desc += f" Right now: {syntax.COLOR_THEMES[resolved]['label']}."
+        return desc
+
+    def _refresh_syntax_theme_description(self):
+        if not hasattr(self, "syntax_theme_desc_label"):
+            return
+        import syntax
+        key = self.cfg.get("editor", {}).get("syntax_theme", syntax.DEFAULT_COLOR_THEME)
+        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(key))
 
     def _build_general_tab(self, parent):
         import syntax
@@ -227,7 +251,7 @@ class SettingsWindow(tk.Toplevel):
         row += 1
 
         self.syntax_theme_desc_label = tk.Label(
-            rows, text=syntax.COLOR_THEMES[self._orig_syntax_theme]["description"],
+            rows, text=self._syntax_theme_desc_text(self._orig_syntax_theme),
             bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left")
         self.syntax_theme_desc_label.grid(row=row, column=0, sticky="we", padx=(4, 8), pady=(0, 4))
         self.syntax_theme_desc_label.bind(
@@ -346,7 +370,7 @@ class SettingsWindow(tk.Toplevel):
         import syntax
         key = self._label_to_syntax_theme.get(self.syntax_theme_var.get(), syntax.DEFAULT_COLOR_THEME)
         self.cfg.setdefault("editor", {})["syntax_theme"] = key
-        self.syntax_theme_desc_label.configure(text=syntax.COLOR_THEMES[key]["description"])
+        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(key))
         self._preview({"editor"})
 
     def _open_advanced_syntax_colors(self):
@@ -385,7 +409,7 @@ class SettingsWindow(tk.Toplevel):
             self.cfg.setdefault("editor", {})["custom_syntax_colors"] = overrides
             self.cfg.setdefault("editor", {})["syntax_theme"] = "custom"
             self.syntax_theme_var.set(syntax.COLOR_THEMES["custom"]["label"])
-            self.syntax_theme_desc_label.configure(text=syntax.COLOR_THEMES["custom"]["description"])
+            self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text("custom"))
             self._preview({"editor"})
 
         for row, tag in enumerate(syntax.TAG_NAMES):
@@ -480,6 +504,170 @@ class SettingsWindow(tk.Toplevel):
                  font=("Segoe UI", 9, "bold")).grid(
             row=row, column=0, columnspan=columnspan, sticky="we", padx=4, pady=pady)
 
+    def _refresh_preset_choice_maps(self):
+        """Rebuilds the label<->key maps the preset combobox uses: the
+        three fixed entries first (so they always sort to the top, most
+        useful ones first), then the user's saved presets alphabetically.
+        A custom preset's key and its displayed label are the same
+        string - it's just whatever name the user gave it."""
+        self._preset_key_to_label = {"system": "System", "dark": "Dark", "light": "Light"}
+        for name in sorted(self.cfg.get("theme_presets", {}).keys(), key=str.lower):
+            self._preset_key_to_label[name] = name
+        self._preset_label_to_key = {label: key for key, label in self._preset_key_to_label.items()}
+
+    def _current_preset_key(self):
+        return self._preset_label_to_key.get(self.theme_preset_var.get(), "system")
+
+    def _update_preset_combo_values(self):
+        self.preset_combo.configure(values=list(self._preset_key_to_label.values()))
+
+    def _update_preset_buttons_state(self):
+        is_custom = self._current_preset_key() not in ("system", "dark", "light")
+        state = "normal" if is_custom else "disabled"
+        self.rename_preset_btn.configure(state=state)
+        self.remove_preset_btn.configure(state=state)
+
+    def _update_preset_desc_label(self):
+        import theme
+
+        key = self._current_preset_key()
+        if key == "system":
+            mode = "Dark" if theme.detect_system_dark_mode() else "Light"
+            text = f"Follows your system's light/dark setting. Right now: {mode}."
+        elif key == "dark":
+            text = "A fixed dark palette."
+        elif key == "light":
+            text = "A fixed light palette."
+        else:
+            text = "A saved preset of your own. Tweak any color below, then Save As to update it."
+        self.preset_desc_label.configure(text=text)
+
+    def _on_theme_preset_selected(self, _event=None):
+        import theme
+
+        key = self._current_preset_key()
+        self.theme_working.update(theme.resolve_preset_colors(key, self.cfg.get("theme_presets", {})))
+        self.cfg.setdefault("ui", {})["theme_preset"] = key
+        self._refresh_theme_ui()
+        self._update_preset_buttons_state()
+        self._update_preset_desc_label()
+        self._preview({"theme", "ui"})
+
+    def _save_theme_preset(self):
+        import theme
+
+        self.theme_working["font_family"] = self.font_family_var.get() or "Consolas"
+        name = simpledialog.askstring(
+            "Save Color Theme Preset", "Preset name:", parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name.lower() in theme.RESERVED_PRESET_NAMES:
+            messagebox.showerror(
+                "Save Color Theme Preset",
+                f'"{name}" is a reserved name. Choose a different name.', parent=self)
+            return
+        presets = self.cfg.setdefault("theme_presets", {})
+        presets[name] = {key: self.theme_working[key] for key in theme.THEME_COLOR_KEYS}
+        self.cfg.setdefault("ui", {})["theme_preset"] = name
+        self._refresh_preset_choice_maps()
+        self._update_preset_combo_values()
+        self.theme_preset_var.set(self._preset_key_to_label.get(name, name))
+        self._update_preset_buttons_state()
+        self._update_preset_desc_label()
+        self._preview({"ui"})
+
+    def _rename_theme_preset(self):
+        import theme
+
+        key = self._current_preset_key()
+        presets = self.cfg.setdefault("theme_presets", {})
+        if key not in presets:
+            return
+        new_name = simpledialog.askstring(
+            "Rename Color Theme Preset", "New name:", initialvalue=key, parent=self)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == key:
+            return
+        if new_name.lower() in theme.RESERVED_PRESET_NAMES:
+            messagebox.showerror(
+                "Rename Color Theme Preset",
+                f'"{new_name}" is a reserved name. Choose a different name.', parent=self)
+            return
+        if new_name in presets and not messagebox.askyesno(
+                "Rename Color Theme Preset",
+                f'A preset named "{new_name}" already exists. Overwrite it?', parent=self):
+            return
+        presets[new_name] = presets.pop(key)
+        self.cfg.setdefault("ui", {})["theme_preset"] = new_name
+        self._refresh_preset_choice_maps()
+        self._update_preset_combo_values()
+        self.theme_preset_var.set(self._preset_key_to_label.get(new_name, new_name))
+        self._update_preset_buttons_state()
+        self._update_preset_desc_label()
+        self._preview({"ui"})
+
+    def _remove_theme_preset(self):
+        key = self._current_preset_key()
+        presets = self.cfg.setdefault("theme_presets", {})
+        if key not in presets:
+            return
+        if not messagebox.askyesno(
+                "Remove Color Theme Preset",
+                f'Remove the "{key}" preset? This can\'t be undone.', parent=self):
+            return
+        del presets[key]
+        self.cfg.setdefault("ui", {})["theme_preset"] = "system"
+        self._refresh_preset_choice_maps()
+        self._update_preset_combo_values()
+        self.theme_preset_var.set("System")
+        self._update_preset_buttons_state()
+        self._update_preset_desc_label()
+        self._preview({"ui"})
+
+    def _build_theme_preset_row(self, rows, t):
+        """The "Color theme preset" picker at the top of the Theme tab:
+        pick System/Dark/Light/a saved preset to bulk-load its colors
+        into the swatches below, plus Save As/Rename/Remove to manage
+        your own. Returns the next free grid row."""
+        self._section_header(rows, 0, "Color Theme Preset", pady=(4, 4), columnspan=3)
+        row = 1
+
+        self._row_label(rows, row, "Preset")
+        self._refresh_preset_choice_maps()
+        self.theme_preset_var = tk.StringVar(
+            value=self._preset_key_to_label.get(self._orig_theme_preset, "System"))
+        self.preset_combo = ttk.Combobox(
+            rows, textvariable=self.theme_preset_var, state="readonly", width=16,
+            values=list(self._preset_key_to_label.values()))
+        self.preset_combo.grid(row=row, column=1, columnspan=2, sticky="e", padx=(0, 4), pady=4)
+        self.preset_combo.bind("<<ComboboxSelected>>", self._on_theme_preset_selected)
+        row += 1
+
+        preset_btns = tk.Frame(rows, bg=t["panel_bg"])
+        preset_btns.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(0, 2))
+        tk.Button(preset_btns, text="Save As...", command=self._save_theme_preset).pack(side="left")
+        self.rename_preset_btn = tk.Button(preset_btns, text="Rename...", command=self._rename_theme_preset)
+        self.rename_preset_btn.pack(side="left", padx=(6, 0))
+        self.remove_preset_btn = tk.Button(preset_btns, text="Remove", command=self._remove_theme_preset)
+        self.remove_preset_btn.pack(side="left", padx=(6, 0))
+        row += 1
+
+        self.preset_desc_label = tk.Label(
+            rows, text="", bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left")
+        self.preset_desc_label.grid(row=row, column=0, columnspan=3, sticky="we", padx=(4, 8), pady=(0, 4))
+        self.preset_desc_label.bind(
+            "<Configure>", lambda e: self.preset_desc_label.configure(wraplength=max(60, e.width)))
+        row += 1
+
+        self._update_preset_buttons_state()
+        self._update_preset_desc_label()
+        return row
+
     def _build_theme_tab(self, parent):
         from editor import MIN_FONT_SIZE, MAX_FONT_SIZE
 
@@ -488,18 +676,20 @@ class SettingsWindow(tk.Toplevel):
         _canvas, rows = self._make_scrollable_rows(parent, t)
         rows.columnconfigure(0, weight=1)
 
-        self._section_header(rows, 0, "Colors", pady=(4, 4), columnspan=3)
+        row = self._build_theme_preset_row(rows, t)
 
-        for offset, (key, label) in enumerate(THEME_FIELDS):
-            row = offset + 1
+        self._section_header(rows, row, "Colors", pady=(4, 4), columnspan=3)
+        row += 1
+
+        for key, label in THEME_FIELDS:
             self._row_label(rows, row, label)
             swatch = tk.Label(rows, text="  " * 6, bg=self.theme_working[key], relief="flat", bd=1)
             swatch.grid(row=row, column=1, sticky="w", pady=4)
             tk.Button(rows, text="Choose", command=lambda k=key, s=swatch: self._pick_color(k, s))\
                 .grid(row=row, column=2, padx=6, pady=4)
             self.color_vars[key] = swatch
+            row += 1
 
-        row = len(THEME_FIELDS) + 1
         self._section_header(rows, row, "Editor Font", columnspan=3)
         row += 1
 
@@ -647,6 +837,7 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["output_shortcuts"] = dict(config.DEFAULTS["output_shortcuts"])
         self.cfg["theme"] = dict(config.DEFAULTS["theme"])
         self.cfg["ui"] = dict(config.DEFAULTS["ui"])
+        self.cfg["theme_presets"] = dict(config.DEFAULTS["theme_presets"])
         self.cfg["editor"] = {
             "default_new_file_language": config.DEFAULTS["editor"]["default_new_file_language"],
             "run_commands": {},
@@ -655,12 +846,16 @@ class SettingsWindow(tk.Toplevel):
             "terminal_messages": dict(config.DEFAULTS["editor"]["terminal_messages"]),
             "word_wrap": config.DEFAULTS["editor"]["word_wrap"],
         }
+        import theme
+        theme.apply_active_preset(self.cfg)  # resolves "system" against the OS, same as a fresh launch
         self.shortcuts_working = dict(self.cfg["shortcuts"])
         self.output_shortcuts_working = dict(self.cfg["output_shortcuts"])
         self.theme_working = dict(self.cfg["theme"])
         self._orig_shortcuts = dict(self.cfg["shortcuts"])
         self._orig_output_shortcuts = dict(self.cfg["output_shortcuts"])
         self._orig_theme = dict(self.cfg["theme"])
+        self._orig_theme_preset = self.cfg["ui"]["theme_preset"]
+        self._orig_theme_presets = {k: dict(v) for k, v in self.cfg["theme_presets"].items()}
         self._orig_default_language = self.cfg["editor"]["default_new_file_language"]
         self._orig_syntax_theme = self.cfg["editor"]["syntax_theme"]
         self._orig_custom_colors = dict(self.cfg["editor"]["custom_syntax_colors"])
@@ -710,6 +905,12 @@ class SettingsWindow(tk.Toplevel):
         self.explorer_font_size_var.set(ui_cfg.get("explorer_font_size", self._orig_explorer_font_size))
         self.console_font_family_var.set(ui_cfg.get("console_font_family", self._orig_console_font_family))
         self.console_font_size_var.set(ui_cfg.get("console_font_size", self._orig_console_font_size))
+        if hasattr(self, "theme_preset_var"):
+            self._refresh_preset_choice_maps()
+            self._update_preset_combo_values()
+            self.theme_preset_var.set(self._preset_key_to_label.get(ui_cfg.get("theme_preset", "system"), "System"))
+            self._update_preset_buttons_state()
+            self._update_preset_desc_label()
         self._suspend_preview = False
 
     def _refresh_general_ui(self):
@@ -719,7 +920,7 @@ class SettingsWindow(tk.Toplevel):
         theme_key = self.cfg.get("editor", {}).get("syntax_theme", syntax.DEFAULT_COLOR_THEME)
         theme_spec = syntax.COLOR_THEMES.get(theme_key, syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME])
         self.syntax_theme_var.set(theme_spec["label"])
-        self.syntax_theme_desc_label.configure(text=theme_spec["description"])
+        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(theme_key))
         term_cfg = self.cfg.get("editor", {}).get("terminal_messages", {})
         for key, var in self.terminal_message_vars.items():
             var.set(term_cfg.get(key, True))
@@ -740,10 +941,14 @@ class SettingsWindow(tk.Toplevel):
             self._refresh_shortcuts_ui()
             self._preview({"shortcuts", "output_shortcuts"})
         elif tab == "Theme":
+            import theme
+
             self.theme_working = dict(config.DEFAULTS["theme"])
+            self.theme_working.update(theme.resolve_preset_colors(theme.SYSTEM_PRESET))
             base_font_size = int(self.theme_working.get("font_size", 11))
             base_font_family = self.theme_working.get("font_family", "Consolas")
             ui_cfg = self.cfg.setdefault("ui", {})
+            ui_cfg["theme_preset"] = "system"
             ui_cfg["explorer_font_size"] = 9
             ui_cfg["explorer_font_family"] = "sans-serif"
             ui_cfg["console_font_size"] = max(base_font_size - 1, 8)
@@ -802,6 +1007,10 @@ class SettingsWindow(tk.Toplevel):
         if self.cfg.get("ui", {}).get("console_font_family", self._orig_console_font_family) \
                 != self._orig_console_font_family:
             changed.add("ui")
+        if self.cfg.get("ui", {}).get("theme_preset", self._orig_theme_preset) != self._orig_theme_preset:
+            changed.add("ui")
+        if self.cfg.get("theme_presets", {}) != self._orig_theme_presets:
+            changed.add("theme")
 
         self.cfg["shortcuts"] = dict(self.shortcuts_working)
         self.cfg["output_shortcuts"] = dict(self.output_shortcuts_working)
@@ -861,6 +1070,12 @@ class SettingsWindow(tk.Toplevel):
             reverted.add("ui")
         if ui_cfg.get("console_font_family", self._orig_console_font_family) != self._orig_console_font_family:
             ui_cfg["console_font_family"] = self._orig_console_font_family
+            reverted.add("ui")
+        if self.cfg.get("theme_presets", {}) != self._orig_theme_presets:
+            self.cfg["theme_presets"] = {k: dict(v) for k, v in self._orig_theme_presets.items()}
+            reverted.add("theme")
+        if ui_cfg.get("theme_preset", self._orig_theme_preset) != self._orig_theme_preset:
+            ui_cfg["theme_preset"] = self._orig_theme_preset
             reverted.add("ui")
         self.destroy()
         if reverted and self.on_apply:

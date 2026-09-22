@@ -4,7 +4,19 @@ import keyword
 import re
 import tokenize
 
+AUTO_COLOR_THEME = "auto"
+
 COLOR_THEMES = {
+    "auto": {
+        "label": "Auto",
+        "description": "Follows the editor background: Light for bright backgrounds, Vivid for dark ones.",
+        # No colors of its own - resolve_auto_theme()/_resolve_active_theme()
+        # stand in "idle" or "vivid"'s colors for this at lookup time,
+        # based on the editor background last reported via
+        # set_editor_background(). Left empty (rather than a copy of
+        # either palette) so nothing ever reads stale colors from here.
+        "colors": {},
+    },
     "idle": {
         "label": "Light",
         "description": "Bright, high-contrast colors.",
@@ -45,7 +57,7 @@ COLOR_THEMES = {
         },
     },
 }
-DEFAULT_COLOR_THEME = "idle"
+DEFAULT_COLOR_THEME = AUTO_COLOR_THEME
 TAG_NAMES = ("keyword", "softkeyword", "builtin", "string", "comment", "definition", "error_tok")
 TAG_LABELS = {
     "keyword": "Keywords (if, def, import)",
@@ -59,6 +71,7 @@ TAG_LABELS = {
 TAG_COLOR_ATTR = {name: ("background" if name == "error_tok" else "foreground") for name in TAG_NAMES}
 
 _active_color_theme = DEFAULT_COLOR_THEME
+_editor_bg = "#1e1f22"  # placeholder until set_editor_background() is called with a real one
 
 
 def set_color_theme(name):
@@ -75,6 +88,39 @@ def get_color_theme():
     return _active_color_theme
 
 
+def set_editor_background(hex_color):
+    """Records the editor's current background color so the "auto" palette
+    can decide, next time colors are looked up, whether Light or Vivid
+    suits it better. Callers pass this in whenever the editor background
+    changes - at startup and on every live theme apply - so "auto" always
+    reflects the background that's actually on screen, not a stale one."""
+    global _editor_bg
+    if hex_color:
+        _editor_bg = hex_color
+
+
+def brightness(hex_color):
+    """Perceived brightness of a #rrggbb color, from 0 (black) to 1
+    (white), via the standard luma weighting (green reads brighter to the
+    eye than red, which in turn reads brighter than blue)."""
+    try:
+        r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255
+
+
+def resolve_auto_theme(edit_bg=None):
+    """Which built-in palette ("idle" a.k.a. Light, or "vivid") the "auto"
+    syntax theme currently resolves to: Light once the background is at
+    least half-bright, Vivid below that. Defaults to the last background
+    reported via set_editor_background(); callers previewing an
+    as-yet-unsaved background (Settings' Theme tab) can pass one in
+    directly instead."""
+    bg = edit_bg if edit_bg is not None else _editor_bg
+    return "idle" if brightness(bg) >= 0.5 else "vivid"
+
+
 def set_custom_colors(overrides):
     """Rebuilds the "custom" theme's colors from `overrides`
     ({tag_name: {"foreground": "#rrggbb"} and/or {"background": "#rrggbb"}}),
@@ -89,8 +135,17 @@ def set_custom_colors(overrides):
     }
 
 
+def _resolve_active_theme():
+    """The real COLOR_THEMES key backing whatever's active - "auto" isn't
+    a real palette itself, it stands in for whichever of "idle"/"vivid"
+    resolve_auto_theme() currently picks."""
+    if _active_color_theme != AUTO_COLOR_THEME:
+        return _active_color_theme
+    return resolve_auto_theme()
+
+
 def _palette():
-    return COLOR_THEMES[_active_color_theme]["colors"]
+    return COLOR_THEMES[_resolve_active_theme()]["colors"]
 
 
 KEYWORDS = set(keyword.kwlist)

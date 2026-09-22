@@ -11,8 +11,155 @@ apply_base_style() once, early, and layers its own screen-specific styles
 on top if it needs any.
 """
 
+import subprocess
+import sys
 import tkinter as tk
 from tkinter import ttk
+
+# The ten colors a preset (built-in or user-saved) controls. Font family/
+# size live in the same "theme" config dict but are deliberately outside
+# a preset's reach - switching Dark/Light/System shouldn't also reset
+# whatever font the person picked.
+THEME_COLOR_KEYS = (
+    "bg", "panel_bg", "edit_bg", "gutter_bg", "gutter_fg",
+    "fg", "muted_fg", "sel_bg", "console_bg", "accent",
+)
+
+SYSTEM_PRESET = "system"
+# Names a saved custom preset can never use, since they're either the
+# special auto-following preset or one of the two fixed built-ins.
+RESERVED_PRESET_NAMES = frozenset({"system", "dark", "light"})
+
+BUILTIN_THEME_PRESETS = {
+    "dark": {
+        "label": "Dark",
+        # This app's original, long-standing default look.
+        "colors": {
+            "bg": "#1e1f22",
+            "panel_bg": "#2b2d30",
+            "edit_bg": "#26282b",
+            "gutter_bg": "#26282b",
+            "gutter_fg": "#5c6370",
+            "fg": "#dcdfe4",
+            "muted_fg": "#8a8f98",
+            "sel_bg": "#3a4048",
+            "console_bg": "#18191b",
+            "accent": "#4a9eff",
+        },
+    },
+    "light": {
+        "label": "Light",
+        "colors": {
+            "bg": "#fafafa",
+            "panel_bg": "#eeeeee",
+            "edit_bg": "#ffffff",
+            "gutter_bg": "#f5f5f5",
+            "gutter_fg": "#9aa0a6",
+            "fg": "#24292e",
+            "muted_fg": "#6a737d",
+            "sel_bg": "#add6ff",
+            "console_bg": "#f6f8fa",
+            "accent": "#0969da",
+        },
+    },
+}
+
+
+def detect_system_dark_mode() -> bool:
+    """Best-effort read of the OS's current light/dark preference, used to
+    resolve the "System" theme preset. Falls back to dark - this app's
+    original default look - on any platform/desktop this can't read from,
+    rather than raising: a theme preset must never be allowed to crash
+    startup."""
+    try:
+        if sys.platform.startswith("win"):
+            return _detect_windows_dark_mode()
+        if sys.platform == "darwin":
+            return _detect_macos_dark_mode()
+        if sys.platform.startswith("linux"):
+            return _detect_linux_dark_mode()
+    except (OSError, ImportError, subprocess.SubprocessError, ValueError):
+        pass
+    return True
+
+
+def _detect_windows_dark_mode() -> bool:
+    import winreg
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+    try:
+        value, _kind = winreg.QueryValueEx(key, "AppsUseLightTheme")
+    finally:
+        winreg.CloseKey(key)
+    return value == 0
+
+
+def _detect_macos_dark_mode() -> bool:
+    # `defaults read` exits non-zero (with nothing on stdout) when the key
+    # is absent, which is exactly what happens in Light mode - macOS only
+    # writes AppleInterfaceStyle while Dark mode is active.
+    result = subprocess.run(
+        ["defaults", "read", "-g", "AppleInterfaceStyle"],
+        capture_output=True, text=True, timeout=2)
+    return result.returncode == 0 and "dark" in result.stdout.strip().lower()
+
+
+def _detect_linux_dark_mode() -> bool:
+    # The freedesktop color-scheme key is the modern, desktop-agnostic
+    # signal (supported by GNOME, KDE via a shim, etc.); fall back to
+    # sniffing the GTK theme name for desktops that only expose that.
+    result = subprocess.run(
+        ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+        capture_output=True, text=True, timeout=2)
+    if result.returncode == 0:
+        value = result.stdout.strip().strip("'\"").lower()
+        if "dark" in value:
+            return True
+        if "light" in value or "default" in value:
+            return False
+    result = subprocess.run(
+        ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+        capture_output=True, text=True, timeout=2)
+    if result.returncode == 0:
+        return "dark" in result.stdout.strip().lower()
+    return True
+
+
+def resolve_preset_colors(name, custom_presets=None):
+    """The THEME_COLOR_KEYS-keyed color dict for preset `name`: "system"
+    resolves to "dark" or "light" depending on the OS's current setting,
+    "dark"/"light" return their own fixed colors, and any other name is
+    looked up in `custom_presets` (the user's saved presets) - falling
+    back to "dark" if that name doesn't exist (for example it was removed
+    since being selected)."""
+    if name == SYSTEM_PRESET:
+        name = "dark" if detect_system_dark_mode() else "light"
+    if name in BUILTIN_THEME_PRESETS:
+        return dict(BUILTIN_THEME_PRESETS[name]["colors"])
+    if custom_presets and name in custom_presets:
+        return dict(custom_presets[name])
+    return dict(BUILTIN_THEME_PRESETS["dark"]["colors"])
+
+
+def apply_active_preset(cfg):
+    """Refreshes cfg["theme"]'s ten palette keys from whichever preset
+    cfg["ui"]["theme_preset"] names - called once, early, right after the
+    config loads (see app.py), before anything reads cfg["theme"].
+
+    Only "system" (the default) actually re-resolves anything here: it
+    re-reads the OS's current light/dark setting on every launch, so
+    switching your system theme gets picked up the next time the app
+    starts even if the saved config hasn't changed. A saved "dark"/
+    "light"/custom preset name is left alone - those are one-time "load
+    this preset's colors" actions (see SettingsWindow's preset picker),
+    and cfg["theme"] already holds their colors from whenever they were
+    selected. Font family/size and any other keys are never touched."""
+    ui_cfg = cfg.setdefault("ui", {})
+    if ui_cfg.get("theme_preset", SYSTEM_PRESET) != SYSTEM_PRESET:
+        return
+    theme_cfg = cfg.setdefault("theme", {})
+    theme_cfg.update(resolve_preset_colors(SYSTEM_PRESET))
 
 
 def lighten(hex_color: str, amount: float) -> str:

@@ -16,6 +16,10 @@ class App:
         if config_path:
             config.set_config_path(config_path)
         self.cfg = config.load_config()
+        # Resolves the "system" preset (the default) against the OS's
+        # current light/dark setting before anything - the connect screen
+        # included - reads cfg["theme"]. See theme.apply_active_preset().
+        theme.apply_active_preset(self.cfg)
 
         self.root = dnd_support.make_root()
         entry_paste.install(self.root)

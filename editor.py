@@ -122,6 +122,7 @@ class EditorApp(ttk.Frame):
 
         editor_cfg = self.cfg.setdefault("editor", {})
         self._default_new_file_language = editor_cfg.get("default_new_file_language", "python")
+        syntax.set_editor_background(self.theme.get("edit_bg"))
         syntax.set_custom_colors(editor_cfg.get("custom_syntax_colors", {}))
         syntax.set_color_theme(editor_cfg.get("syntax_theme", syntax.DEFAULT_COLOR_THEME))
         self._word_wrap = bool(editor_cfg.get("word_wrap", False))
@@ -332,6 +333,7 @@ class EditorApp(ttk.Frame):
         self.console.configure(bg=t["console_bg"])
 
         self.cursor_layer.set_theme(t["edit_bg"])
+        syntax.set_editor_background(t["edit_bg"])
         syntax.configure_tags(self.text)
         self._do_highlight()
         self._redraw_linenumbers()
