@@ -20,6 +20,11 @@ class App:
         # current light/dark setting before anything - the connect screen
         # included - reads cfg["theme"]. See theme.apply_active_preset().
         theme.apply_active_preset(self.cfg)
+        # Remembers what the OS was reporting just now, so
+        # _poll_system_theme can tell a real change from a no-op - see
+        # _start_system_theme_watch.
+        self._system_dark = theme.detect_system_dark_mode()
+        self._system_theme_job = None
 
         self.root = dnd_support.make_root()
         entry_paste.install(self.root)
@@ -38,6 +43,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._install_sigint_handler()
         self._show_connect_screen()
+        self._start_system_theme_watch()
 
     def _install_sigint_handler(self):
         """Ctrl+C in a terminal (or `kill -INT`, same thing Termux sends)
@@ -90,6 +96,7 @@ class App:
             editor._interrupt_run_proc()
             return
         self._cleanup(ask_to_save=False)
+        self._stop_system_theme_watch()
         try:
             self.root.destroy()
         except tk.TclError:
@@ -97,6 +104,49 @@ class App:
 
     def _pump_signals(self):
         self._signal_pump_job = self.root.after(200, self._pump_signals)
+
+    def _start_system_theme_watch(self):
+        """Polling is the only portable way to notice the OS's light/dark
+        setting changing while the app is already running - there's no
+        single cross-platform push notification for it, and
+        detect_system_dark_mode's own OS calls (a registry read, a
+        `defaults read`, a `gsettings get`) are cheap enough that a
+        couple-times-a-second check is unnoticeable. Without this, the
+        "System" preset only ever picked up a change on the next launch
+        (see theme.apply_active_preset's docstring) - flipping the OS
+        theme while Peer to Code was already open did nothing until you
+        restarted it."""
+        self._poll_system_theme()
+
+    def _poll_system_theme(self):
+        self._system_theme_job = self.root.after(1500, self._poll_system_theme)
+        ui_cfg = self.cfg.get("ui", {})
+        if ui_cfg.get("theme_preset", theme.SYSTEM_PRESET) != theme.SYSTEM_PRESET:
+            # A fixed Dark/Light/custom preset deliberately doesn't
+            # follow the OS - nothing to reconcile, and no need to keep
+            # re-reading self._system_dark while it wouldn't be used.
+            return
+        dark = theme.detect_system_dark_mode()
+        if dark == self._system_dark:
+            return
+        self._system_dark = dark
+        theme_cfg = self.cfg.setdefault("theme", {})
+        theme_cfg.update(theme.resolve_preset_colors(theme.SYSTEM_PRESET))
+        self._apply_theme_everywhere()
+
+    def _apply_theme_everywhere(self):
+        """Repaints whichever screen is currently showing with the latest
+        cfg["theme"] - used both by the system-theme watch above and
+        could be reused by anything else that mutates cfg["theme"]
+        out from under the currently-visible screen. The editor and the
+        connect screen each know how to repaint themselves live
+        (apply_theme_live); which one is live right now is exactly
+        whichever of self.editor/self.connect_frame is not None."""
+        t = self.cfg["theme"]
+        if self.editor:
+            self.editor.apply_theme_live(t)
+        elif self.connect_frame:
+            self.connect_frame.apply_theme_live(t)
 
     def _apply_saved_geometry(self):
         """Restores the window's last size and/or position - whichever of
@@ -181,9 +231,18 @@ class App:
                                  p2p_advertise_socket=extra.get("p2p_advertise_socket"),
                                  initial_file=extra.get("open_file"))
 
+    def _stop_system_theme_watch(self):
+        if self._system_theme_job is not None:
+            try:
+                self.root.after_cancel(self._system_theme_job)
+            except tk.TclError:
+                pass
+            self._system_theme_job = None
+
     def _on_close(self):
         if not self._cleanup(ask_to_save=True):
             return
+        self._stop_system_theme_watch()
         try:
             self.root.destroy()
         except tk.TclError:
@@ -257,6 +316,7 @@ class App:
             self.root.mainloop()
         except KeyboardInterrupt:
             self._cleanup(ask_to_save=False)
+            self._stop_system_theme_watch()
             try:
                 self.root.destroy()
             except tk.TclError:

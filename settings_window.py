@@ -84,8 +84,16 @@ class SettingsWindow(tk.Toplevel):
         self._row_widgets = {}
         self._action_scope = {}
         self._suspend_preview = False
+        # Every classic (non-ttk) widget in this window that was given an
+        # explicit theme color at construction time, so a live theme
+        # change (_apply_live_theme, called from _preview) can put the
+        # new colors on all of them - the same live update ttk widgets
+        # already get for free from restyling "TFrame"/"TLabel"/etc.
+        # Populated by _reg() as each widget is built; see _reg's
+        # docstring for the (widget, {option: theme_key}) shape.
+        self._theme_widgets = []
 
-        footer = tk.Frame(self, bg=t["panel_bg"])
+        footer = self._reg(tk.Frame(self, bg=t["panel_bg"]), bg="panel_bg")
         footer.pack(side="bottom", fill="x", padx=10, pady=10)
         tk.Button(footer, text="Save", command=self._save).pack(side="right", padx=4)
         tk.Button(footer, text="Cancel", command=self._cancel).pack(side="right")
@@ -96,10 +104,10 @@ class SettingsWindow(tk.Toplevel):
         nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
         self.nb = nb
 
-        general_tab = tk.Frame(nb, bg=t["panel_bg"])
-        shortcuts_tab = tk.Frame(nb, bg=t["panel_bg"])
-        theme_tab = tk.Frame(nb, bg=t["panel_bg"])
-        config_tab = tk.Frame(nb, bg=t["panel_bg"])
+        general_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
+        shortcuts_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
+        theme_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
+        config_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
         nb.add(general_tab, text="General")
         nb.add(shortcuts_tab, text="Shortcuts")
         nb.add(theme_tab, text="Theme")
@@ -130,9 +138,9 @@ class SettingsWindow(tk.Toplevel):
         rely on this: they configure column 0 to expand into whatever room
         this creates, and their labels rewrap to that column's new width
         rather than getting clipped or leaving dead space)."""
-        canvas = tk.Canvas(parent, bg=t["panel_bg"], highlightthickness=0)
+        canvas = self._reg(tk.Canvas(parent, bg=t["panel_bg"], highlightthickness=0), bg="panel_bg")
         scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        rows = tk.Frame(canvas, bg=t["panel_bg"])
+        rows = self._reg(tk.Frame(canvas, bg=t["panel_bg"]), bg="panel_bg")
         window_id = canvas.create_window((0, 0), window=rows, anchor="nw")
         rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
@@ -148,6 +156,38 @@ class SettingsWindow(tk.Toplevel):
     def _on_tab_changed(self, _event=None):
         state = "normal" if self._current_tab() != "Config File" else "disabled"
         self.reset_btn.configure(state=state)
+
+    def _reg(self, widget, **color_options):
+        """Registers a classic widget's theme-derived constructor options
+        (e.g. bg="panel_bg", fg="muted_fg") so _apply_live_theme can put
+        current colors on it later. `color_options` maps a tk config
+        option name to the THEME_COLOR_KEYS key that should supply its
+        value. Returns `widget` unchanged so calls can stay inline
+        (`self._reg(tk.Label(...), bg="panel_bg").grid(...)`).
+
+        Deliberately not used for widgets whose bg/fg IS the data being
+        shown rather than decoration - the color swatches in the Theme
+        tab and the Advanced Syntax Colors dialog - those already get
+        refreshed with the right (possibly custom) color by
+        _refresh_theme_ui / their own pick() callback."""
+        if color_options:
+            self._theme_widgets.append((widget, color_options))
+        return widget
+
+    def _apply_live_theme(self):
+        """Pushes self.theme_working's current colors onto every classic
+        widget _reg registered, plus this window's own background -
+        mirrors what ttk.Style reconfiguration already does for free for
+        every ttk-styled widget, so a theme preview (or a preset/system
+        switch) repaints the whole Settings window immediately instead
+        of just the parts ttk happens to own."""
+        t = self.theme_working
+        self.configure(bg=t["panel_bg"])
+        for widget, color_options in self._theme_widgets:
+            try:
+                widget.configure(**{opt: t[key] for opt, key in color_options.items()})
+            except tk.TclError:
+                pass
 
     def _preview(self, sections):
         """Apply working changes to the live app immediately (not to disk)
@@ -165,6 +205,7 @@ class SettingsWindow(tk.Toplevel):
             except (tk.TclError, ValueError):
                 pass
             self.cfg["theme"] = dict(self.theme_working)
+            self._apply_live_theme()
             self._refresh_syntax_theme_description()
         if "ui" in sections:
             ui_cfg = self.cfg.setdefault("ui", {})
@@ -177,8 +218,10 @@ class SettingsWindow(tk.Toplevel):
                 pass
 
     def _row_label(self, rows, row, text, **grid_kwargs):
-        lbl = tk.Label(rows, text=text, bg=self.app.theme["panel_bg"], fg=self.app.theme["fg"],
-                        anchor="w", justify="left")
+        lbl = self._reg(
+            tk.Label(rows, text=text, bg=self.app.theme["panel_bg"], fg=self.app.theme["fg"],
+                      anchor="w", justify="left"),
+            bg="panel_bg", fg="fg")
         grid_kwargs.setdefault("sticky", "we")
         grid_kwargs.setdefault("padx", (4, 8))
         grid_kwargs.setdefault("pady", 4)
@@ -215,9 +258,11 @@ class SettingsWindow(tk.Toplevel):
         rows.columnconfigure(0, weight=1)
 
         def section_header(row, text, pady=(16, 2)):
-            tk.Label(rows, text=text, bg=t["panel_bg"], fg=t["fg"], anchor="w",
-                     font=("Segoe UI", 9, "bold")).grid(
-                row=row, column=0, columnspan=2, sticky="we", padx=4, pady=pady)
+            self._reg(
+                tk.Label(rows, text=text, bg=t["panel_bg"], fg=t["fg"], anchor="w",
+                         font=("Segoe UI", 9, "bold")),
+                bg="panel_bg", fg="fg",
+            ).grid(row=row, column=0, columnspan=2, sticky="we", padx=4, pady=pady)
 
         row = 0
         section_header(row, "Editor", pady=(4, 2))
@@ -250,9 +295,10 @@ class SettingsWindow(tk.Toplevel):
         syntax_combo.bind("<<ComboboxSelected>>", self._on_syntax_theme_selected)
         row += 1
 
-        self.syntax_theme_desc_label = tk.Label(
+        self.syntax_theme_desc_label = self._reg(tk.Label(
             rows, text=self._syntax_theme_desc_text(self._orig_syntax_theme),
-            bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left")
+            bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left"),
+            bg="panel_bg", fg="muted_fg")
         self.syntax_theme_desc_label.grid(row=row, column=0, sticky="we", padx=(4, 8), pady=(0, 4))
         self.syntax_theme_desc_label.bind(
             "<Configure>", lambda e: self.syntax_theme_desc_label.configure(wraplength=max(60, e.width)))
@@ -262,12 +308,13 @@ class SettingsWindow(tk.Toplevel):
         row += 1
 
         self.word_wrap_var = tk.BooleanVar(value=self._orig_word_wrap)
-        tk.Checkbutton(
+        self._reg(tk.Checkbutton(
             rows, text="Wrap long lines onto more rows instead of scrolling sideways",
             variable=self.word_wrap_var, bg=t["panel_bg"], fg=t["fg"],
             selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
             highlightthickness=0, anchor="w", command=self._on_word_wrap_toggled,
-        ).grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(0, 4))
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(0, 4))
         row += 1
 
         ui_cfg = self.cfg.setdefault("ui", {})
@@ -278,24 +325,27 @@ class SettingsWindow(tk.Toplevel):
 
         section_header(row, "Window")
         row += 1
-        tk.Checkbutton(
+        self._reg(tk.Checkbutton(
             rows, text="Remember window position between launches",
             variable=self.save_window_position_var, bg=t["panel_bg"], fg=t["fg"],
             selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
             highlightthickness=0, anchor="w", command=lambda: self._preview({"ui"}),
-        ).grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
         row += 1
-        tk.Checkbutton(
+        self._reg(tk.Checkbutton(
             rows, text="Remember window size between launches",
             variable=self.save_window_size_var, bg=t["panel_bg"], fg=t["fg"],
             selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
             highlightthickness=0, anchor="w", command=lambda: self._preview({"ui"}),
-        ).grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(2, 4))
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(2, 4))
         row += 1
-        window_desc_label = tk.Label(
+        window_desc_label = self._reg(tk.Label(
             rows, text="Unchecking one deletes it from the config file on close, so next time "
                        "the window opens with that part placed/sized automatically.",
-            bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left")
+            bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left"),
+            bg="panel_bg", fg="muted_fg")
         window_desc_label.grid(row=row, column=0, columnspan=2, sticky="we", padx=4, pady=(0, 10))
         window_desc_label.bind(
             "<Configure>", lambda e: window_desc_label.configure(wraplength=max(60, e.width)))
@@ -313,13 +363,14 @@ class SettingsWindow(tk.Toplevel):
             "interrupted": "Show [interrupted] when Ctrl+C ends a run",
         }
         for key in ("finished", "stopped", "interrupted"):
-            tk.Checkbutton(
+            self._reg(tk.Checkbutton(
                 rows, text=terminal_message_labels[key],
                 variable=self.terminal_message_vars[key], bg=t["panel_bg"], fg=t["fg"],
                 selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
                 highlightthickness=0, anchor="w",
                 command=lambda k=key: self._on_terminal_message_toggled(k),
-            ).grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+            ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+               activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
             row += 1
 
     def _on_explorer_font_size_changed(self):
@@ -386,6 +437,7 @@ class SettingsWindow(tk.Toplevel):
         t = self.app.theme
         dlg = tk.Toplevel(self)
         dlg.title("Advanced: Syntax Colors")
+        self._reg(dlg, bg="panel_bg")
         dlg.configure(bg=t["panel_bg"])
         dlg.transient(self)
         dlg.geometry("440x380")
@@ -435,17 +487,19 @@ class SettingsWindow(tk.Toplevel):
         _canvas, rows = self._make_scrollable_rows(parent, t)
         rows.columnconfigure(0, weight=1)
 
-        tk.Label(rows, text="Editor", bg=t["panel_bg"], fg=t["fg"], anchor="w",
-                 font=("Segoe UI", 9, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(4, 4))
+        self._reg(tk.Label(rows, text="Editor", bg=t["panel_bg"], fg=t["fg"], anchor="w",
+                            font=("Segoe UI", 9, "bold")), bg="panel_bg", fg="fg").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(4, 4))
         row = self._add_shortcut_rows(rows, 1, SHORTCUT_SPECS, self.shortcuts_working, "shortcuts")
 
-        tk.Label(rows, text="Terminal", bg=t["panel_bg"], fg=t["fg"], anchor="w",
-                 font=("Segoe UI", 9, "bold")).grid(row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        self._reg(tk.Label(rows, text="Terminal", bg=t["panel_bg"], fg=t["fg"], anchor="w",
+                            font=("Segoe UI", 9, "bold")), bg="panel_bg", fg="fg").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(14, 4))
         row += 1
-        tk.Label(
+        self._reg(tk.Label(
             rows, text="Shortcuts that only apply while the Terminal panel has focus.",
             bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left",
-        ).grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
+        ), bg="panel_bg", fg="muted_fg").grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
         row += 1
         self._add_shortcut_rows(rows, row, OUTPUT_SHORTCUT_SPECS, self.output_shortcuts_working, "output_shortcuts")
 
@@ -454,9 +508,11 @@ class SettingsWindow(tk.Toplevel):
         for action_id, label, _default_accel, _method in specs:
             self._action_scope[action_id] = (working, scope)
             self._row_label(rows, row, label)
-            accel_label = tk.Label(rows, text=self._accel_display(working.get(action_id, "")),
-                                    bg=self.app.theme["edit_bg"], fg=self.app.theme["fg"], width=16,
-                                    anchor="w", padx=6)
+            accel_label = self._reg(
+                tk.Label(rows, text=self._accel_display(working.get(action_id, "")),
+                         bg=self.app.theme["edit_bg"], fg=self.app.theme["fg"], width=16,
+                         anchor="w", padx=6),
+                bg="edit_bg", fg="fg")
             accel_label.grid(row=row, column=1, sticky="w", pady=4)
             btn = tk.Button(rows, text="Change", command=lambda a=action_id: self._start_listen(a))
             btn.grid(row=row, column=2, padx=6, pady=4)
@@ -500,9 +556,11 @@ class SettingsWindow(tk.Toplevel):
 
     def _section_header(self, rows, row, text, pady=(16, 2), columnspan=2):
         t = self.app.theme
-        tk.Label(rows, text=text, bg=t["panel_bg"], fg=t["fg"], anchor="w",
-                 font=("Segoe UI", 9, "bold")).grid(
-            row=row, column=0, columnspan=columnspan, sticky="we", padx=4, pady=pady)
+        self._reg(
+            tk.Label(rows, text=text, bg=t["panel_bg"], fg=t["fg"], anchor="w",
+                     font=("Segoe UI", 9, "bold")),
+            bg="panel_bg", fg="fg",
+        ).grid(row=row, column=0, columnspan=columnspan, sticky="we", padx=4, pady=pady)
 
     def _refresh_preset_choice_maps(self):
         """Rebuilds the label<->key maps the preset combobox uses: the
@@ -648,7 +706,7 @@ class SettingsWindow(tk.Toplevel):
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_theme_preset_selected)
         row += 1
 
-        preset_btns = tk.Frame(rows, bg=t["panel_bg"])
+        preset_btns = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
         preset_btns.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(0, 2))
         tk.Button(preset_btns, text="Save As...", command=self._save_theme_preset).pack(side="left")
         self.rename_preset_btn = tk.Button(preset_btns, text="Rename...", command=self._rename_theme_preset)
@@ -657,8 +715,9 @@ class SettingsWindow(tk.Toplevel):
         self.remove_preset_btn.pack(side="left", padx=(6, 0))
         row += 1
 
-        self.preset_desc_label = tk.Label(
-            rows, text="", bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left")
+        self.preset_desc_label = self._reg(tk.Label(
+            rows, text="", bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left"),
+            bg="panel_bg", fg="muted_fg")
         self.preset_desc_label.grid(row=row, column=0, columnspan=3, sticky="we", padx=(4, 8), pady=(0, 4))
         self.preset_desc_label.bind(
             "<Configure>", lambda e: self.preset_desc_label.configure(wraplength=max(60, e.width)))
@@ -769,12 +828,15 @@ class SettingsWindow(tk.Toplevel):
 
 
 
-        tk.Label(parent, text="Config file location", bg=t["panel_bg"], fg=t["fg"], anchor="w",
-                 font=("Segoe UI", 9, "bold")).pack(fill="x", padx=8, pady=(4, 2))
+        self._reg(tk.Label(parent, text="Config file location", bg=t["panel_bg"], fg=t["fg"], anchor="w",
+                            font=("Segoe UI", 9, "bold")), bg="panel_bg", fg="fg").pack(
+            fill="x", padx=8, pady=(4, 2))
         path = config.get_config_path()
-        path_row = tk.Frame(parent, bg=t["panel_bg"])
+        path_row = self._reg(tk.Frame(parent, bg=t["panel_bg"]), bg="panel_bg")
         path_row.pack(fill="x", padx=8)
-        path_entry = tk.Entry(path_row, bg=t["edit_bg"], fg=t["fg"], relief="flat")
+        path_entry = self._reg(
+            tk.Entry(path_row, bg=t["edit_bg"], fg=t["fg"], relief="flat"),
+            bg="edit_bg", fg="fg", readonlybackground="edit_bg")
         path_entry.insert(0, str(path))
         path_entry.configure(state="readonly", readonlybackground=t["edit_bg"])
         path_entry.pack(side="left", fill="x", expand=True, ipady=3)
@@ -806,9 +868,10 @@ class SettingsWindow(tk.Toplevel):
             except OSError as e:
                 messagebox.showerror("Open Folder", str(e), parent=self)
 
-        tk.Label(parent, text="Actions", bg=t["panel_bg"], fg=t["fg"], anchor="w",
-                 font=("Segoe UI", 9, "bold")).pack(fill="x", padx=8, pady=(16, 2))
-        btn_row = tk.Frame(parent, bg=t["panel_bg"])
+        self._reg(tk.Label(parent, text="Actions", bg=t["panel_bg"], fg=t["fg"], anchor="w",
+                            font=("Segoe UI", 9, "bold")), bg="panel_bg", fg="fg").pack(
+            fill="x", padx=8, pady=(16, 2))
+        btn_row = self._reg(tk.Frame(parent, bg=t["panel_bg"]), bg="panel_bg")
         btn_row.pack(fill="x", padx=8, pady=(0, 10))
         tk.Button(btn_row, text="Open Containing Folder", command=open_folder).pack(side="left")
         tk.Button(btn_row, text="Delete Config File", command=self._delete_config_file,

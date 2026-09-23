@@ -78,6 +78,11 @@ class ConnectWindow(ttk.Frame):
         self._cancel_requested = threading.Event()
         self._busy = False
         self._action_buttons = []
+        # Every classic (non-ttk) widget built with an explicit theme
+        # color, so apply_theme_live can repaint all of them at once -
+        # see _reg's docstring. ttk-styled widgets don't need this: a
+        # restyled "TFrame"/"TLabel"/etc. repaints them for free.
+        self._theme_widgets = []
         self._build_style()
         self._build_ui()
         dnd_support.register_drop(self, self._on_window_drop, debug=False)
@@ -103,6 +108,45 @@ class ConnectWindow(ttk.Frame):
         hint = getattr(var, "_path_hint", None)
         if hint is not None:
             self._flash_hint(hint, "Path filled from drag and drop.")
+
+    def _reg(self, widget, **color_options):
+        """Registers a classic (non-ttk) widget's theme-derived options so
+        apply_theme_live can put current colors on it later - the same
+        idea as SettingsWindow._reg. `color_options` maps a tk config
+        option name to the THEME_COLOR_KEYS key that supplies its value.
+        Returns `widget` so calls can stay inline."""
+        if color_options:
+            self._theme_widgets.append((widget, color_options))
+        return widget
+
+    def apply_theme_live(self, new_theme):
+        """Repaints this whole screen with `new_theme` without rebuilding
+        it - called by App whenever the theme changes while the connect
+        screen (rather than the editor) happens to be showing: right now
+        that's only a live system dark/light switch (see
+        App._poll_system_theme), since Settings itself only opens from
+        the editor. Mirrors EditorApp.apply_theme_live: restyle the
+        shared ttk styles (instantly repaints every ttk-styled widget
+        here, which is most of the screen), then push the same colors
+        onto the handful of classic tk widgets ttk styling can't reach."""
+        self.theme = t = new_theme
+        self._build_style()
+        toplevel = self.winfo_toplevel()
+        toplevel.configure(bg=t["bg"])
+        theme.apply_classic_widget_defaults(toplevel, t)
+        for widget, color_options in self._theme_widgets:
+            try:
+                widget.configure(**{opt: t[key] for opt, key in color_options.items()})
+            except tk.TclError:
+                pass
+        # lbl/underline's colors depend on which tab is selected, so they
+        # aren't in the generic registry above - refresh them the same
+        # way _select_tab does, just without changing the active tab.
+        for name, (lbl, underline) in self._tab_widgets.items():
+            selected = (name == self._active_tab)
+            lbl.configure(bg=t["bg"], fg=t["fg"] if selected else t["muted_fg"])
+            underline.configure(bg=t["accent"] if selected else t["bg"])
+        self._refresh_recent_projects()
 
     def _build_style(self):
         t = self.theme
@@ -149,7 +193,7 @@ class ConnectWindow(ttk.Frame):
         area = ttk.Frame(parent, style="TFrame")
         area.pack(fill="both", expand=True)
 
-        column = tk.Frame(area, bg=t["bg"])
+        column = self._reg(tk.Frame(area, bg=t["bg"]), bg="bg")
         column.place(relx=0.5, rely=0, anchor="n", relheight=1.0)
         column.pack_propagate(False)
 
@@ -161,7 +205,7 @@ class ConnectWindow(ttk.Frame):
 
         area.bind("<Configure>", on_area_resize)
 
-        canvas = tk.Canvas(column, bg=t["bg"], highlightthickness=0)
+        canvas = self._reg(tk.Canvas(column, bg=t["bg"], highlightthickness=0), bg="bg")
         vscroll = ttk.Scrollbar(column, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
         canvas.pack(fill="both", expand=True)
@@ -203,11 +247,11 @@ class ConnectWindow(ttk.Frame):
 
     def _build_tab_bar(self, parent):
         t = self.theme
-        bar = tk.Frame(parent, bg=t["bg"])
+        bar = self._reg(tk.Frame(parent, bg=t["bg"]), bg="bg")
         bar.pack(pady=(0, 4))
         self._tab_widgets = {}
         for name in TABS:
-            col = tk.Frame(bar, bg=t["bg"], cursor="hand2")
+            col = self._reg(tk.Frame(bar, bg=t["bg"], cursor="hand2"), bg="bg")
             col.pack(side="left", padx=16)
             lbl = tk.Label(col, text=name, bg=t["bg"], cursor="hand2")
             lbl.pack()

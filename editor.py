@@ -330,7 +330,9 @@ class EditorApp(ttk.Frame):
         font_family = t.get("font_family", "Consolas")
         self._font_size = int(t.get("font_size", 11))
         self._apply_ttk_style(t)
-        theme.apply_classic_widget_defaults(self.winfo_toplevel(), t)
+        toplevel = self.winfo_toplevel()
+        toplevel.configure(bg=t["bg"])
+        theme.apply_classic_widget_defaults(toplevel, t)
 
         for frame in (self.toolbar, self.body, self.center, self.edit_area, self.text_frame,
                       self.console_frame, self.console_body):
