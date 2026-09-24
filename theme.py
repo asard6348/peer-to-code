@@ -26,13 +26,18 @@ THEME_COLOR_KEYS = (
 )
 
 SYSTEM_PRESET = "system"
+# Display label for the "system" preset. Kept as a constant (rather than
+# hardcoded wherever the preset picker is built) so it's defined in one
+# place alongside the two built-ins' own "label" fields below.
+SYSTEM_PRESET_LABEL = "Match System"
 # Names a saved custom preset can never use, since they're either the
 # special auto-following preset or one of the two fixed built-ins.
 RESERVED_PRESET_NAMES = frozenset({"system", "dark", "light"})
 
 BUILTIN_THEME_PRESETS = {
     "dark": {
-        "label": "Dark",
+        "label": "Midnight",
+        "description": "A fixed dark palette. Pairs naturally with the Midnight syntax palette.",
         # This app's original, long-standing default look.
         "colors": {
             "bg": "#1e1f22",
@@ -48,7 +53,8 @@ BUILTIN_THEME_PRESETS = {
         },
     },
     "light": {
-        "label": "Light",
+        "label": "Daybreak",
+        "description": "A fixed light palette. Pairs naturally with the Daybreak syntax palette.",
         "colors": {
             "bg": "#fafafa",
             "panel_bg": "#eeeeee",

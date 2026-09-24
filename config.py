@@ -85,6 +85,12 @@ DEFAULTS = {
     # "system" preset aren't stored here - only what the user creates via
     # Settings > Theme > Save As.
     "theme_presets": {},
+    # User-saved syntax palette presets: {name: {tag_name: {"foreground":
+    # "#rrggbb"} and/or {"background": "#rrggbb"}}}, one entry per
+    # syntax.TAG_NAMES. The built-ins ("auto"/"idle"/"vivid"/"custom")
+    # aren't stored here - only what the user creates via Settings >
+    # Theme > Save As for the syntax palette. See syntax.sync_saved_palettes().
+    "syntax_palette_presets": {},
 }
 
 _override_path = None

@@ -9,18 +9,45 @@ IGNORED_KEYSYMS = {
     "Caps_Lock", "Num_Lock", "Super_L", "Super_R", "Meta_L", "Meta_R",
 }
 
-THEME_FIELDS = [
-    ("bg", "App background"),
-    ("panel_bg", "Panel background"),
-    ("edit_bg", "Editor background"),
-    ("fg", "Editor text"),
-    ("gutter_bg", "Line number gutter"),
-    ("gutter_fg", "Line number text"),
-    ("sel_bg", "Selection highlight"),
-    ("console_bg", "Terminal console background"),
-    ("muted_fg", "Muted / secondary text"),
-    ("accent", "Accent"),
+# The ten color settings, grouped by what they actually affect and each
+# given a one-line description - rather than one flat, alphabetically-ish
+# list of names like "App background" / "Editor text" that read as
+# self-explanatory but aren't: "fg" colors nearly all text in the app
+# (buttons, dialogs, panels), not just the editor; "sel_bg" colors
+# button hover/focus and hovered list rows as much as it colors text
+# selection; "bg" is specifically the toolbar/connect-screen chrome, not
+# a catch-all "background of everything". Each (key, title, description)
+# tuple here replaces the old flat THEME_FIELDS list.
+THEME_FIELD_GROUPS = [
+    ("Text & Highlights", [
+        ("fg", "Primary text",
+         "Nearly all text in the app: buttons, labels, dialogs, and the code editor."),
+        ("muted_fg", "Secondary text",
+         "De-emphasized text: hints, status messages, and unselected tab labels."),
+        ("accent", "Accent",
+         "Pressed buttons, the active tab's underline, and other highlighted controls."),
+        ("sel_bg", "Highlight / hover",
+         "Selected text, hovered list rows, and hovered or focused buttons - "
+         "not just text selection, despite the name."),
+    ]),
+    ("Backgrounds", [
+        ("bg", "Window chrome",
+         "Behind the toolbar and the connect screen. Not the editor or side panels."),
+        ("panel_bg", "Panels & dialogs",
+         "This Settings window, other dialogs, and the tab strip."),
+        ("edit_bg", "Editor & input fields",
+         "The code editor itself, plus text entry fields."),
+        ("console_bg", "Terminal",
+         "The terminal/output panel only."),
+    ]),
+    ("Line Numbers", [
+        ("gutter_bg", "Gutter background", "Behind the line numbers, left of the editor."),
+        ("gutter_fg", "Gutter text", "The line number digits themselves."),
+    ]),
 ]
+# Flat (key, title) view of the same data, kept for code that just needs
+# every key/title pair without caring about grouping.
+THEME_FIELDS = [(key, title) for _group, fields in THEME_FIELD_GROUPS for key, title, _desc in fields]
 
 
 def _capture_accel(event):
@@ -79,7 +106,12 @@ class SettingsWindow(tk.Toplevel):
             "console_font_size", getattr(app, "_console_font_size", 10)))
         self._orig_theme_preset = ui_cfg_init.get("theme_preset", "system")
         self._orig_theme_presets = {k: dict(v) for k, v in cfg.setdefault("theme_presets", {}).items()}
+        self._orig_syntax_palette_presets = {
+            k: {tag: dict(colors) for tag, colors in v.items()}
+            for k, v in cfg.setdefault("syntax_palette_presets", {}).items()
+        }
         self.color_vars = {}
+        self._advanced_colors_visible = False
         self._listening_action = None
         self._row_widgets = {}
         self._action_scope = {}
@@ -281,32 +313,6 @@ class SettingsWindow(tk.Toplevel):
         combo.bind("<<ComboboxSelected>>", self._on_default_language_selected)
         row += 1
 
-        self._row_label(rows, row, "Syntax color palette")
-
-        self._syntax_theme_choices = [(key, spec["label"]) for key, spec in syntax.COLOR_THEMES.items()]
-        self._label_to_syntax_theme = {label: key for key, label in self._syntax_theme_choices}
-        current_syntax_label = syntax.COLOR_THEMES.get(
-            self._orig_syntax_theme, syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME])["label"]
-
-        self.syntax_theme_var = tk.StringVar(value=current_syntax_label)
-        syntax_combo = ttk.Combobox(rows, textvariable=self.syntax_theme_var, state="readonly", width=16,
-                                     values=[label for _key, label in self._syntax_theme_choices])
-        syntax_combo.grid(row=row, column=1, sticky="e", padx=(0, 4), pady=4)
-        syntax_combo.bind("<<ComboboxSelected>>", self._on_syntax_theme_selected)
-        row += 1
-
-        self.syntax_theme_desc_label = self._reg(tk.Label(
-            rows, text=self._syntax_theme_desc_text(self._orig_syntax_theme),
-            bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left"),
-            bg="panel_bg", fg="muted_fg")
-        self.syntax_theme_desc_label.grid(row=row, column=0, sticky="we", padx=(4, 8), pady=(0, 4))
-        self.syntax_theme_desc_label.bind(
-            "<Configure>", lambda e: self.syntax_theme_desc_label.configure(wraplength=max(60, e.width)))
-
-        tk.Button(rows, text="Advanced", command=self._open_advanced_syntax_colors).grid(
-            row=row, column=1, sticky="ne", padx=(0, 4), pady=(0, 4))
-        row += 1
-
         self.word_wrap_var = tk.BooleanVar(value=self._orig_word_wrap)
         self._reg(tk.Checkbutton(
             rows, text="Wrap long lines onto more rows instead of scrolling sideways",
@@ -462,6 +468,8 @@ class SettingsWindow(tk.Toplevel):
             self.cfg.setdefault("editor", {})["syntax_theme"] = "custom"
             self.syntax_theme_var.set(syntax.COLOR_THEMES["custom"]["label"])
             self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text("custom"))
+            self._update_syntax_preset_buttons_state()
+            self._refresh_preset_tiles()
             self._preview({"editor"})
 
         for row, tag in enumerate(syntax.TAG_NAMES):
@@ -567,20 +575,29 @@ class SettingsWindow(tk.Toplevel):
         three fixed entries first (so they always sort to the top, most
         useful ones first), then the user's saved presets alphabetically.
         A custom preset's key and its displayed label are the same
-        string - it's just whatever name the user gave it."""
-        self._preset_key_to_label = {"system": "System", "dark": "Dark", "light": "Light"}
+        string - it's just whatever name the user gave it. Labels come
+        from theme.py itself (BUILTIN_THEME_PRESETS' "label" fields and
+        SYSTEM_PRESET_LABEL) rather than being duplicated here, so
+        renaming a built-in preset only ever means editing theme.py."""
+        import theme
+
+        self._preset_key_to_label = {theme.SYSTEM_PRESET: theme.SYSTEM_PRESET_LABEL}
+        for key, spec in theme.BUILTIN_THEME_PRESETS.items():
+            self._preset_key_to_label[key] = spec["label"]
         for name in sorted(self.cfg.get("theme_presets", {}).keys(), key=str.lower):
             self._preset_key_to_label[name] = name
         self._preset_label_to_key = {label: key for key, label in self._preset_key_to_label.items()}
 
     def _current_preset_key(self):
-        return self._preset_label_to_key.get(self.theme_preset_var.get(), "system")
+        import theme
+        return self._preset_label_to_key.get(self.theme_preset_var.get(), theme.SYSTEM_PRESET)
 
     def _update_preset_combo_values(self):
         self.preset_combo.configure(values=list(self._preset_key_to_label.values()))
 
     def _update_preset_buttons_state(self):
-        is_custom = self._current_preset_key() not in ("system", "dark", "light")
+        import theme
+        is_custom = self._current_preset_key() not in theme.RESERVED_PRESET_NAMES
         state = "normal" if is_custom else "disabled"
         self.rename_preset_btn.configure(state=state)
         self.remove_preset_btn.configure(state=state)
@@ -589,13 +606,11 @@ class SettingsWindow(tk.Toplevel):
         import theme
 
         key = self._current_preset_key()
-        if key == "system":
-            mode = "Dark" if theme.detect_system_dark_mode() else "Light"
+        if key == theme.SYSTEM_PRESET:
+            mode = theme.BUILTIN_THEME_PRESETS["dark" if theme.detect_system_dark_mode() else "light"]["label"]
             text = f"Follows your system's light/dark setting. Right now: {mode}."
-        elif key == "dark":
-            text = "A fixed dark palette."
-        elif key == "light":
-            text = "A fixed light palette."
+        elif key in theme.BUILTIN_THEME_PRESETS:
+            text = theme.BUILTIN_THEME_PRESETS[key]["description"]
         else:
             text = "A saved preset of your own. Tweak any color below, then Save As to update it."
         self.preset_desc_label.configure(text=text)
@@ -635,6 +650,7 @@ class SettingsWindow(tk.Toplevel):
         self.theme_preset_var.set(self._preset_key_to_label.get(name, name))
         self._update_preset_buttons_state()
         self._update_preset_desc_label()
+        self._refresh_preset_tiles()
         self._preview({"ui"})
 
     def _rename_theme_preset(self):
@@ -667,9 +683,12 @@ class SettingsWindow(tk.Toplevel):
         self.theme_preset_var.set(self._preset_key_to_label.get(new_name, new_name))
         self._update_preset_buttons_state()
         self._update_preset_desc_label()
+        self._refresh_preset_tiles()
         self._preview({"ui"})
 
     def _remove_theme_preset(self):
+        import theme
+
         key = self._current_preset_key()
         presets = self.cfg.setdefault("theme_presets", {})
         if key not in presets:
@@ -679,26 +698,154 @@ class SettingsWindow(tk.Toplevel):
                 f'Remove the "{key}" preset? This can\'t be undone.', parent=self):
             return
         del presets[key]
-        self.cfg.setdefault("ui", {})["theme_preset"] = "system"
         self._refresh_preset_choice_maps()
         self._update_preset_combo_values()
-        self.theme_preset_var.set("System")
-        self._update_preset_buttons_state()
-        self._update_preset_desc_label()
-        self._preview({"ui"})
+        self.theme_preset_var.set(theme.SYSTEM_PRESET_LABEL)
+        # Route through the normal selection handler rather than just
+        # setting the combobox's text: a StringVar.set() doesn't fire
+        # <<ComboboxSelected>>, so the old code here never actually
+        # re-resolved and applied System's colors - the picker *showed*
+        # System while theme_working (and the live preview) silently kept
+        # whatever the just-removed preset last looked like, until the
+        # user clicked the System entry themselves. Calling the handler
+        # directly is what actually loads and previews System's colors.
+        self._on_theme_preset_selected()
 
-    def _build_theme_preset_row(self, rows, t):
-        """The "Color theme preset" picker at the top of the Theme tab:
-        pick System/Dark/Light/a saved preset to bulk-load its colors
-        into the swatches below, plus Save As/Rename/Remove to manage
-        your own. Returns the next free grid row."""
-        self._section_header(rows, 0, "Color Theme Preset", pady=(4, 4), columnspan=3)
+    def _refresh_syntax_choice_maps(self):
+        """Rebuilds the label<->key maps the syntax palette combobox
+        uses, straight from syntax.COLOR_THEMES - so it automatically
+        picks up whatever sync_saved_palettes() last put there. Mirrors
+        _refresh_preset_choice_maps()."""
+        import syntax
+        self._syntax_theme_choices = [(key, spec["label"]) for key, spec in syntax.COLOR_THEMES.items()]
+        self._label_to_syntax_theme = {label: key for key, label in self._syntax_theme_choices}
+
+    def _current_syntax_key(self):
+        import syntax
+        return self._label_to_syntax_theme.get(self.syntax_theme_var.get(), syntax.DEFAULT_COLOR_THEME)
+
+    def _update_syntax_preset_combo_values(self):
+        self.syntax_combo.configure(values=[label for _key, label in self._syntax_theme_choices])
+
+    def _update_syntax_preset_buttons_state(self):
+        import syntax
+        is_saved = self._current_syntax_key() not in syntax.RESERVED_PALETTE_NAMES
+        state = "normal" if is_saved else "disabled"
+        self.rename_syntax_preset_btn.configure(state=state)
+        self.remove_syntax_preset_btn.configure(state=state)
+
+    def _on_syntax_theme_selected(self, _event=None):
+        import syntax
+        key = self._current_syntax_key()
+        self.cfg.setdefault("editor", {})["syntax_theme"] = key
+        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(key))
+        self._update_syntax_preset_buttons_state()
+        self._refresh_preset_tiles()
+        self._preview({"editor"})
+
+    def _save_syntax_palette_preset(self):
+        import syntax
+
+        name = simpledialog.askstring(
+            "Save Syntax Palette Preset", "Preset name:", parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name.lower() in syntax.RESERVED_PALETTE_NAMES:
+            messagebox.showerror(
+                "Save Syntax Palette Preset",
+                f'"{name}" is a reserved name. Choose a different name.', parent=self)
+            return
+        presets = self.cfg.setdefault("syntax_palette_presets", {})
+        # Snapshots whatever palette is actually resolved and on screen
+        # right now (works whether that's Auto, a built-in, or another
+        # saved preset) rather than requiring "Custom" to be active first.
+        presets[name] = syntax.active_palette_colors()
+        syntax.sync_saved_palettes(presets)
+        self.cfg.setdefault("editor", {})["syntax_theme"] = name
+        self._refresh_syntax_choice_maps()
+        self._update_syntax_preset_combo_values()
+        self.syntax_theme_var.set(name)
+        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(name))
+        self._update_syntax_preset_buttons_state()
+        self._refresh_preset_tiles()
+        self._preview({"editor"})
+
+    def _rename_syntax_palette_preset(self):
+        import syntax
+
+        key = self._current_syntax_key()
+        presets = self.cfg.setdefault("syntax_palette_presets", {})
+        if key not in presets:
+            return
+        new_name = simpledialog.askstring(
+            "Rename Syntax Palette Preset", "New name:", initialvalue=key, parent=self)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == key:
+            return
+        if new_name.lower() in syntax.RESERVED_PALETTE_NAMES:
+            messagebox.showerror(
+                "Rename Syntax Palette Preset",
+                f'"{new_name}" is a reserved name. Choose a different name.', parent=self)
+            return
+        if new_name in presets and not messagebox.askyesno(
+                "Rename Syntax Palette Preset",
+                f'A preset named "{new_name}" already exists. Overwrite it?', parent=self):
+            return
+        presets[new_name] = presets.pop(key)
+        syntax.sync_saved_palettes(presets)
+        self.cfg.setdefault("editor", {})["syntax_theme"] = new_name
+        self._refresh_syntax_choice_maps()
+        self._update_syntax_preset_combo_values()
+        self.syntax_theme_var.set(new_name)
+        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(new_name))
+        self._update_syntax_preset_buttons_state()
+        self._refresh_preset_tiles()
+        self._preview({"editor"})
+
+    def _remove_syntax_palette_preset(self):
+        import syntax
+
+        key = self._current_syntax_key()
+        presets = self.cfg.setdefault("syntax_palette_presets", {})
+        if key not in presets:
+            return
+        if not messagebox.askyesno(
+                "Remove Syntax Palette Preset",
+                f'Remove the "{key}" preset? This can\'t be undone.', parent=self):
+            return
+        del presets[key]
+        syntax.sync_saved_palettes(presets)
+        self._refresh_syntax_choice_maps()
+        self._update_syntax_preset_combo_values()
+        self.syntax_theme_var.set(syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME]["label"])
+        # Same fix as _remove_theme_preset below: go through the real
+        # selection handler so Auto's colors are actually resolved and
+        # previewed, instead of just relabeling the combobox.
+        self._on_syntax_theme_selected()
+
+    def _build_presets_section(self, rows, t):
+        """The combined "Presets" area at the top of the Theme tab: a
+        Color Theme preset picker and a Syntax Palette preset picker,
+        side by side since together they decide the app's whole look -
+        each with its own Save As/Rename/Remove, plus a row of clickable
+        preview tiles below both (see _refresh_preset_tiles) so picking a
+        look doesn't require opening the Advanced section at all. Returns
+        the next free grid row."""
+        import syntax
+        import theme
+
+        self._section_header(rows, 0, "Presets", pady=(4, 4), columnspan=3)
         row = 1
 
-        self._row_label(rows, row, "Preset")
+        self._row_label(rows, row, "Color theme")
         self._refresh_preset_choice_maps()
         self.theme_preset_var = tk.StringVar(
-            value=self._preset_key_to_label.get(self._orig_theme_preset, "System"))
+            value=self._preset_key_to_label.get(self._orig_theme_preset, theme.SYSTEM_PRESET_LABEL))
         self.preset_combo = ttk.Combobox(
             rows, textvariable=self.theme_preset_var, state="readonly", width=16,
             values=list(self._preset_key_to_label.values()))
@@ -718,14 +865,180 @@ class SettingsWindow(tk.Toplevel):
         self.preset_desc_label = self._reg(tk.Label(
             rows, text="", bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left"),
             bg="panel_bg", fg="muted_fg")
-        self.preset_desc_label.grid(row=row, column=0, columnspan=3, sticky="we", padx=(4, 8), pady=(0, 4))
+        self.preset_desc_label.grid(row=row, column=0, columnspan=3, sticky="we", padx=(4, 8), pady=(0, 8))
         self.preset_desc_label.bind(
             "<Configure>", lambda e: self.preset_desc_label.configure(wraplength=max(60, e.width)))
         row += 1
 
+        self._row_label(rows, row, "Syntax palette")
+        self._refresh_syntax_choice_maps()
+        current_syntax_label = syntax.COLOR_THEMES.get(
+            self._orig_syntax_theme, syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME])["label"]
+        self.syntax_theme_var = tk.StringVar(value=current_syntax_label)
+        self.syntax_combo = ttk.Combobox(
+            rows, textvariable=self.syntax_theme_var, state="readonly", width=16,
+            values=[label for _key, label in self._syntax_theme_choices])
+        self.syntax_combo.grid(row=row, column=1, columnspan=2, sticky="e", padx=(0, 4), pady=4)
+        self.syntax_combo.bind("<<ComboboxSelected>>", self._on_syntax_theme_selected)
+        row += 1
+
+        syntax_preset_btns = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
+        syntax_preset_btns.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(0, 2))
+        tk.Button(syntax_preset_btns, text="Save As...", command=self._save_syntax_palette_preset).pack(side="left")
+        self.rename_syntax_preset_btn = tk.Button(
+            syntax_preset_btns, text="Rename...", command=self._rename_syntax_palette_preset)
+        self.rename_syntax_preset_btn.pack(side="left", padx=(6, 0))
+        self.remove_syntax_preset_btn = tk.Button(
+            syntax_preset_btns, text="Remove", command=self._remove_syntax_palette_preset)
+        self.remove_syntax_preset_btn.pack(side="left", padx=(6, 0))
+        tk.Button(syntax_preset_btns, text="Advanced...", command=self._open_advanced_syntax_colors)\
+            .pack(side="right")
+        row += 1
+
+        self.syntax_theme_desc_label = self._reg(tk.Label(
+            rows, text=self._syntax_theme_desc_text(self._orig_syntax_theme),
+            bg=t["panel_bg"], fg=t["muted_fg"], font=("Segoe UI", 9), anchor="w", justify="left"),
+            bg="panel_bg", fg="muted_fg")
+        self.syntax_theme_desc_label.grid(row=row, column=0, columnspan=3, sticky="we", padx=(4, 8), pady=(0, 4))
+        self.syntax_theme_desc_label.bind(
+            "<Configure>", lambda e: self.syntax_theme_desc_label.configure(wraplength=max(60, e.width)))
+        row += 1
+
         self._update_preset_buttons_state()
         self._update_preset_desc_label()
+        self._update_syntax_preset_buttons_state()
+
+        self.tiles_frame = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
+        self.tiles_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=2, pady=(4, 8))
+        row += 1
+        self._refresh_preset_tiles()
+
         return row
+
+    def _refresh_preset_tiles(self):
+        """Redraws the row of clickable preset preview tiles: one per
+        color theme preset (System/Midnight/Daybreak/anything saved),
+        each a small Windows-customization-style swatch of that preset's
+        own app colors plus a peek at the *currently selected* syntax
+        palette on top of it (resolving Auto against that tile's own
+        editor background, same as the live app would). Clicking a tile
+        picks that color theme preset, same as picking it from the combo
+        above it - rebuilt from scratch on every call since it's cheap
+        and only runs on an explicit preset change, never on every
+        keystroke/color-pick."""
+        import syntax
+        import theme
+
+        if not hasattr(self, "tiles_frame"):
+            return
+        for child in self.tiles_frame.winfo_children():
+            child.destroy()
+
+        t = self.app.theme
+        current_key = self._current_preset_key() if hasattr(self, "theme_preset_var") else theme.SYSTEM_PRESET
+        syntax_key = self._current_syntax_key() if hasattr(self, "syntax_theme_var") else syntax.DEFAULT_COLOR_THEME
+
+        for key, label in self._preset_key_to_label.items():
+            colors = theme.resolve_preset_colors(key, self.cfg.get("theme_presets", {}))
+            if syntax_key == syntax.AUTO_COLOR_THEME:
+                resolved_syntax_key = syntax.resolve_auto_theme(colors["edit_bg"])
+            elif syntax_key in syntax.COLOR_THEMES:
+                resolved_syntax_key = syntax_key
+            else:
+                resolved_syntax_key = "idle"
+            palette = syntax.COLOR_THEMES[resolved_syntax_key]["colors"]
+
+            selected = key == current_key
+            border = t["accent"] if selected else t["panel_bg"]
+            cell = tk.Frame(self.tiles_frame, bg=t["panel_bg"], highlightthickness=2,
+                             highlightbackground=border, highlightcolor=border, cursor="hand2")
+            cell.pack(side="left", padx=4, pady=2)
+
+            canvas = tk.Canvas(cell, width=88, height=56, highlightthickness=0, bg=colors["bg"], cursor="hand2")
+            canvas.pack(padx=3, pady=(3, 0))
+            canvas.create_rectangle(6, 6, 82, 50, fill=colors["panel_bg"], outline="")
+            canvas.create_rectangle(12, 14, 76, 44, fill=colors["edit_bg"], outline="")
+            kw = palette.get("keyword", {}).get("foreground") or colors["fg"]
+            st = palette.get("string", {}).get("foreground") or colors["fg"]
+            cm = palette.get("comment", {}).get("foreground") or colors["muted_fg"]
+            canvas.create_line(16, 20, 42, 20, fill=kw, width=3)
+            canvas.create_line(16, 28, 60, 28, fill=st, width=3)
+            canvas.create_line(16, 36, 34, 36, fill=cm, width=3)
+            canvas.create_rectangle(66, 34, 72, 40, fill=colors["accent"], outline="")
+
+            name_label = tk.Label(cell, text=label, bg=t["panel_bg"], fg=t["fg"], font=("Segoe UI", 8), cursor="hand2")
+            name_label.pack(pady=(2, 3))
+
+            for widget in (cell, canvas, name_label):
+                widget.bind("<Button-1>", lambda _e, k=key: self._select_preset_tile(k))
+
+    def _select_preset_tile(self, key):
+        self.theme_preset_var.set(self._preset_key_to_label.get(key, key))
+        self._on_theme_preset_selected()
+
+    def _toggle_advanced_colors(self):
+        self._advanced_colors_visible = not self._advanced_colors_visible
+        if self._advanced_colors_visible:
+            self._advanced_colors_frame.grid()
+            self.advanced_colors_btn.configure(text="\u25be Advanced color settings")
+        else:
+            self._advanced_colors_frame.grid_remove()
+            self.advanced_colors_btn.configure(text="\u25b8 Advanced color settings")
+
+    def _build_advanced_colors_section(self, rows, row, t):
+        """The ten individual color settings, collapsed behind a toggle
+        button by default: most people just want to pick a preset above,
+        and the raw list of ten colors (even grouped/labeled, see
+        THEME_FIELD_GROUPS) is exactly the kind of "technical" detail
+        that overwhelms someone who isn't after it. Returns the next
+        free grid row."""
+        self.advanced_colors_btn = self._reg(tk.Button(
+            rows, text="\u25b8 Advanced color settings", command=self._toggle_advanced_colors,
+            relief="flat", anchor="w", bg=t["panel_bg"], fg=t["accent"],
+            activebackground=t["panel_bg"], activeforeground=t["accent"],
+            bd=0, highlightthickness=0, cursor="hand2"),
+            bg="panel_bg", fg="accent", activebackground="panel_bg", activeforeground="accent")
+        self.advanced_colors_btn.grid(row=row, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 2))
+        row += 1
+
+        self._advanced_colors_frame = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
+        self._advanced_colors_frame.grid(row=row, column=0, columnspan=3, sticky="we", padx=0, pady=0)
+        self._advanced_colors_frame.columnconfigure(0, weight=1)
+        row += 1
+
+        inner_row = 0
+        for group_name, fields in THEME_FIELD_GROUPS:
+            self._section_header(self._advanced_colors_frame, inner_row, group_name, pady=(8, 2), columnspan=3)
+            inner_row += 1
+            for key, title, desc in fields:
+                self._build_advanced_color_row(self._advanced_colors_frame, inner_row, t, key, title, desc)
+                inner_row += 1
+
+        # Collapsed by default - grid_remove() keeps the frame (and its
+        # row/column slot) around for grid() to restore later, without
+        # leaving a blank gap while it's hidden.
+        self._advanced_colors_frame.grid_remove()
+        return row
+
+    def _build_advanced_color_row(self, rows, row, t, key, title, desc):
+        label_frame = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
+        label_frame.grid(row=row, column=0, sticky="we", padx=(4, 8), pady=4)
+        title_lbl = self._reg(
+            tk.Label(label_frame, text=title, bg=t["panel_bg"], fg=t["fg"], anchor="w", justify="left"),
+            bg="panel_bg", fg="fg")
+        title_lbl.pack(anchor="w", fill="x")
+        desc_lbl = self._reg(
+            tk.Label(label_frame, text=desc, bg=t["panel_bg"], fg=t["muted_fg"],
+                      font=("Segoe UI", 8), anchor="w", justify="left"),
+            bg="panel_bg", fg="muted_fg")
+        desc_lbl.pack(anchor="w", fill="x")
+        desc_lbl.bind("<Configure>", lambda e: desc_lbl.configure(wraplength=max(60, e.width)))
+
+        swatch = tk.Label(rows, text="  " * 6, bg=self.theme_working[key], relief="flat", bd=1)
+        swatch.grid(row=row, column=1, sticky="w", pady=4)
+        tk.Button(rows, text="Choose", command=lambda k=key, s=swatch: self._pick_color(k, s))\
+            .grid(row=row, column=2, padx=6, pady=4)
+        self.color_vars[key] = swatch
 
     def _build_theme_tab(self, parent):
         from editor import MIN_FONT_SIZE, MAX_FONT_SIZE
@@ -735,19 +1048,8 @@ class SettingsWindow(tk.Toplevel):
         _canvas, rows = self._make_scrollable_rows(parent, t)
         rows.columnconfigure(0, weight=1)
 
-        row = self._build_theme_preset_row(rows, t)
-
-        self._section_header(rows, row, "Colors", pady=(4, 4), columnspan=3)
-        row += 1
-
-        for key, label in THEME_FIELDS:
-            self._row_label(rows, row, label)
-            swatch = tk.Label(rows, text="  " * 6, bg=self.theme_working[key], relief="flat", bd=1)
-            swatch.grid(row=row, column=1, sticky="w", pady=4)
-            tk.Button(rows, text="Choose", command=lambda k=key, s=swatch: self._pick_color(k, s))\
-                .grid(row=row, column=2, padx=6, pady=4)
-            self.color_vars[key] = swatch
-            row += 1
+        row = self._build_presets_section(rows, t)
+        row = self._build_advanced_colors_section(rows, row, t)
 
         self._section_header(rows, row, "Editor Font", columnspan=3)
         row += 1
@@ -958,6 +1260,9 @@ class SettingsWindow(tk.Toplevel):
             label.configure(text=self._accel_display(working.get(action_id, "")))
 
     def _refresh_theme_ui(self):
+        import syntax
+        import theme
+
         for key, swatch in self.color_vars.items():
             swatch.configure(bg=self.theme_working[key])
         self._suspend_preview = True
@@ -971,19 +1276,26 @@ class SettingsWindow(tk.Toplevel):
         if hasattr(self, "theme_preset_var"):
             self._refresh_preset_choice_maps()
             self._update_preset_combo_values()
-            self.theme_preset_var.set(self._preset_key_to_label.get(ui_cfg.get("theme_preset", "system"), "System"))
+            self.theme_preset_var.set(self._preset_key_to_label.get(
+                ui_cfg.get("theme_preset", theme.SYSTEM_PRESET), theme.SYSTEM_PRESET_LABEL))
             self._update_preset_buttons_state()
             self._update_preset_desc_label()
+        if hasattr(self, "syntax_theme_var"):
+            self._refresh_syntax_choice_maps()
+            self._update_syntax_preset_combo_values()
+            editor_cfg = self.cfg.get("editor", {})
+            theme_key = editor_cfg.get("syntax_theme", syntax.DEFAULT_COLOR_THEME)
+            theme_spec = syntax.COLOR_THEMES.get(theme_key, syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME])
+            self.syntax_theme_var.set(theme_spec["label"])
+            self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(theme_key))
+            self._update_syntax_preset_buttons_state()
+        self._refresh_preset_tiles()
         self._suspend_preview = False
 
     def _refresh_general_ui(self):
         import syntax
         code = self.cfg.get("editor", {}).get("default_new_file_language", "python")
         self.default_language_var.set(syntax.LANGUAGE_LABELS.get(code, "Python"))
-        theme_key = self.cfg.get("editor", {}).get("syntax_theme", syntax.DEFAULT_COLOR_THEME)
-        theme_spec = syntax.COLOR_THEMES.get(theme_key, syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME])
-        self.syntax_theme_var.set(theme_spec["label"])
-        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(theme_key))
         term_cfg = self.cfg.get("editor", {}).get("terminal_messages", {})
         for key, var in self.terminal_message_vars.items():
             var.set(term_cfg.get(key, True))
@@ -1016,17 +1328,24 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg["explorer_font_family"] = "sans-serif"
             ui_cfg["console_font_size"] = max(base_font_size - 1, 8)
             ui_cfg["console_font_family"] = base_font_family
+            # The syntax palette lives on this tab now too (see the
+            # combined Presets section), so resetting Theme resets it
+            # right alongside the ten app colors it's shown next to -
+            # this intentionally does NOT touch either's saved presets
+            # (theme_presets / syntax_palette_presets), same as picking
+            # System from the dropdown never deletes your other presets.
+            editor_cfg = self.cfg.setdefault("editor", {})
+            editor_cfg["syntax_theme"] = config.DEFAULTS["editor"]["syntax_theme"]
+            editor_cfg["custom_syntax_colors"] = dict(config.DEFAULTS["editor"]["custom_syntax_colors"])
+            syntax.set_custom_colors(editor_cfg["custom_syntax_colors"])
+            syntax.set_color_theme(editor_cfg["syntax_theme"])
             self._refresh_theme_ui()
-            self._preview({"theme", "ui"})
+            self._preview({"theme", "ui", "editor"})
         elif tab == "General":
             editor_cfg = self.cfg.setdefault("editor", {})
             editor_cfg["default_new_file_language"] = config.DEFAULTS["editor"]["default_new_file_language"]
-            editor_cfg["syntax_theme"] = config.DEFAULTS["editor"]["syntax_theme"]
-            editor_cfg["custom_syntax_colors"] = dict(config.DEFAULTS["editor"]["custom_syntax_colors"])
             editor_cfg["terminal_messages"] = dict(config.DEFAULTS["editor"]["terminal_messages"])
             editor_cfg["word_wrap"] = config.DEFAULTS["editor"]["word_wrap"]
-            syntax.set_custom_colors(editor_cfg["custom_syntax_colors"])
-            syntax.set_color_theme(editor_cfg["syntax_theme"])
             self._refresh_general_ui()
             self._preview({"editor"})
 
@@ -1074,6 +1393,8 @@ class SettingsWindow(tk.Toplevel):
             changed.add("ui")
         if self.cfg.get("theme_presets", {}) != self._orig_theme_presets:
             changed.add("theme")
+        if self.cfg.get("syntax_palette_presets", {}) != self._orig_syntax_palette_presets:
+            changed.add("editor")
 
         self.cfg["shortcuts"] = dict(self.shortcuts_working)
         self.cfg["output_shortcuts"] = dict(self.output_shortcuts_working)
@@ -1140,6 +1461,13 @@ class SettingsWindow(tk.Toplevel):
         if ui_cfg.get("theme_preset", self._orig_theme_preset) != self._orig_theme_preset:
             ui_cfg["theme_preset"] = self._orig_theme_preset
             reverted.add("ui")
+        if self.cfg.get("syntax_palette_presets", {}) != self._orig_syntax_palette_presets:
+            import syntax
+            restored_presets = {k: {tag: dict(c) for tag, c in v.items()}
+                                 for k, v in self._orig_syntax_palette_presets.items()}
+            self.cfg["syntax_palette_presets"] = restored_presets
+            syntax.sync_saved_palettes(restored_presets)
+            reverted.add("editor")
         self.destroy()
         if reverted and self.on_apply:
             try:

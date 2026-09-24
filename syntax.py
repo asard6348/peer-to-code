@@ -9,7 +9,7 @@ AUTO_COLOR_THEME = "auto"
 COLOR_THEMES = {
     "auto": {
         "label": "Auto",
-        "description": "Follows the editor background: Light for bright backgrounds, Vivid for dark ones.",
+        "description": "Follows the editor background: Daybreak for bright backgrounds, Midnight for dark ones.",
         # No colors of its own - resolve_auto_theme()/_resolve_active_theme()
         # stand in "idle" or "vivid"'s colors for this at lookup time,
         # based on the editor background last reported via
@@ -18,8 +18,8 @@ COLOR_THEMES = {
         "colors": {},
     },
     "idle": {
-        "label": "Light",
-        "description": "Bright, high-contrast colors.",
+        "label": "Daybreak",
+        "description": "Bright, high-contrast colors. Pairs naturally with the Daybreak color theme.",
         "colors": {
             "keyword": {"foreground": "#ff7700"},
             "softkeyword": {"foreground": "#ff7700"},
@@ -31,8 +31,8 @@ COLOR_THEMES = {
         },
     },
     "vivid": {
-        "label": "Vivid",
-        "description": "A softer, saturated palette for dark backgrounds.",
+        "label": "Midnight",
+        "description": "A softer, saturated palette for dark backgrounds. Pairs naturally with the Midnight color theme.",
         "colors": {
             "keyword": {"foreground": "#c678dd"},
             "softkeyword": {"foreground": "#c678dd"},
@@ -58,6 +58,9 @@ COLOR_THEMES = {
     },
 }
 DEFAULT_COLOR_THEME = AUTO_COLOR_THEME
+# Names a saved syntax palette preset can never use, since they're the
+# built-in entries above (mirrors theme.RESERVED_PRESET_NAMES).
+RESERVED_PALETTE_NAMES = frozenset({"auto", "idle", "vivid", "custom"})
 TAG_NAMES = ("keyword", "softkeyword", "builtin", "string", "comment", "definition", "error_tok")
 TAG_LABELS = {
     "keyword": "Keywords (if, def, import)",
@@ -133,6 +136,34 @@ def set_custom_colors(overrides):
     COLOR_THEMES["custom"]["colors"] = {
         name: dict(overrides.get(name) or base.get(name, {})) for name in TAG_NAMES
     }
+
+
+def sync_saved_palettes(saved_presets):
+    """Rebuilds COLOR_THEMES' user-saved entries (any key not one of
+    RESERVED_PALETTE_NAMES) from `saved_presets`
+    ({name: {tag_name: {"foreground": ...} and/or {"background": ...}}}) -
+    called once at startup and again whenever Settings saves or cancels a
+    Save As/Rename/Remove, so a rename or removal takes effect right away
+    and no stale entry is left selectable. Mirrors set_custom_colors()'s
+    per-tag fallback so a saved preset is always fully colored even if it
+    predates a tag category being added."""
+    base = COLOR_THEMES["idle"]["colors"]
+    for key in [k for k in COLOR_THEMES if k not in RESERVED_PALETTE_NAMES]:
+        del COLOR_THEMES[key]
+    for name, colors in (saved_presets or {}).items():
+        COLOR_THEMES[name] = {
+            "label": name,
+            "description": "Your own saved syntax palette.",
+            "colors": {tag: dict((colors or {}).get(tag) or base.get(tag, {})) for tag in TAG_NAMES},
+        }
+
+
+def active_palette_colors():
+    """The TAG_NAMES-keyed color dict actually in effect right now -
+    resolving "auto" to whichever of "idle"/"vivid" it currently stands
+    in for. Used by Settings' Save As to snapshot "whatever's on screen
+    right now" into a new named preset, whatever theme/preset produced it."""
+    return dict(_palette())
 
 
 def _resolve_active_theme():
