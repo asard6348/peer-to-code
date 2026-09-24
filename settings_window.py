@@ -1151,6 +1151,7 @@ class SettingsWindow(tk.Toplevel):
         if hex_color:
             self.theme_working[key] = hex_color
             swatch.configure(bg=hex_color)
+            self._refresh_preset_tiles()
             self._preview({"theme"})
 
     def _build_config_tab(self, parent):
@@ -1296,7 +1297,18 @@ class SettingsWindow(tk.Toplevel):
         import theme
 
         for key, swatch in self.color_vars.items():
-            swatch.configure(bg=self.theme_working[key])
+            try:
+                swatch.configure(bg=self.theme_working[key])
+            except tk.TclError:
+                # The swatch belongs to the Advanced: Color Theme dialog,
+                # which may have been closed (destroyed) since color_vars
+                # was populated - color_vars itself is only overwritten
+                # the next time that dialog is reopened, so a stale entry
+                # here is expected, not a bug. Skipping it (same pattern
+                # as _apply_live_theme above) keeps the rest of this
+                # method - crucially _refresh_preset_tiles() below - from
+                # being aborted by it.
+                pass
         self._suspend_preview = True
         self.font_family_var.set(self.theme_working["font_family"])
         self.font_size_var.set(self.theme_working["font_size"])
