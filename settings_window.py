@@ -32,13 +32,20 @@ THEME_FIELD_GROUPS = [
     ]),
     ("Backgrounds", [
         ("bg", "Window chrome",
-         "Behind the toolbar and the connect screen. Not the editor or side panels."),
+         "Behind the toolbar, the File/Edit/Run/View menu bar, and the connect screen. "
+         "Not the editor or side panels."),
         ("panel_bg", "Panels & dialogs",
          "This Settings window, other dialogs, and the tab strip."),
         ("edit_bg", "Editor & input fields",
          "The code editor itself, plus text entry fields."),
         ("console_bg", "Terminal",
          "The terminal/output panel only."),
+    ]),
+    ("Status Bar", [
+        ("status_bg", "Status bar background",
+         "The strip along the bottom: notifications, language, and the open file's path."),
+        ("status_fg", "Status bar text",
+         "Text in that same strip."),
     ]),
     ("Line Numbers", [
         ("gutter_bg", "Gutter background", "Behind the line numbers, left of the editor."),
@@ -111,7 +118,6 @@ class SettingsWindow(tk.Toplevel):
             for k, v in cfg.setdefault("syntax_palette_presets", {}).items()
         }
         self.color_vars = {}
-        self._advanced_colors_visible = False
         self._listening_action = None
         self._row_widgets = {}
         self._action_scope = {}
@@ -169,7 +175,19 @@ class SettingsWindow(tk.Toplevel):
         can never actually track the window (see individual tabs, which
         rely on this: they configure column 0 to expand into whatever room
         this creates, and their labels rewrap to that column's new width
-        rather than getting clipped or leaving dead space)."""
+        rather than getting clipped or leaving dead space).
+
+        Deliberately does NOT wire up mousewheel scrolling itself -
+        scrollutil.bind_wheel() walks the widget tree that exists *right
+        now*, and at this point `rows` is still empty (the caller hasn't
+        built any of the tab's actual content into it yet). Binding here
+        would only ever catch the canvas and the empty rows frame, so
+        wheel/touchpad scrolling would work over the sliver of bare
+        canvas around the edges and go dead over every label, button and
+        combobox filling the rest of the tab - which is exactly the "it
+        moves a little and then stops" bug this avoids. Each caller must
+        call scrollutil.bind_wheel(canvas, rows) itself, once, after
+        every widget for that tab has actually been built."""
         canvas = self._reg(tk.Canvas(parent, bg=t["panel_bg"], highlightthickness=0), bg="panel_bg")
         scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         rows = self._reg(tk.Frame(canvas, bg=t["panel_bg"]), bg="panel_bg")
@@ -179,7 +197,6 @@ class SettingsWindow(tk.Toplevel):
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        scrollutil.bind_wheel(canvas, rows)
         return canvas, rows
 
     def _current_tab(self):
@@ -379,6 +396,13 @@ class SettingsWindow(tk.Toplevel):
                activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
             row += 1
 
+        # Content above is fully built by this point, so bind_wheel's
+        # recursive walk actually reaches every label/combobox/button in
+        # the tab, not just the (at that point still empty) canvas - see
+        # _make_scrollable_rows's docstring for why binding there instead
+        # would leave everything built afterward permanently unscrollable.
+        scrollutil.bind_wheel(_canvas, rows)
+
     def _on_explorer_font_size_changed(self):
         try:
             size = int(self.explorer_font_size_var.get())
@@ -421,13 +445,6 @@ class SettingsWindow(tk.Toplevel):
     def _on_default_language_selected(self, _event=None):
         code = self._label_to_language.get(self.default_language_var.get(), "python")
         self.cfg.setdefault("editor", {})["default_new_file_language"] = code
-        self._preview({"editor"})
-
-    def _on_syntax_theme_selected(self, _event=None):
-        import syntax
-        key = self._label_to_syntax_theme.get(self.syntax_theme_var.get(), syntax.DEFAULT_COLOR_THEME)
-        self.cfg.setdefault("editor", {})["syntax_theme"] = key
-        self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(key))
         self._preview({"editor"})
 
     def _open_advanced_syntax_colors(self):
@@ -485,6 +502,8 @@ class SettingsWindow(tk.Toplevel):
             tk.Button(rows, text="Choose", command=lambda tg=tag, at=attr, sw=swatch: pick(tg, at, sw))\
                 .grid(row=row, column=2, padx=6, pady=4)
 
+        scrollutil.bind_wheel(_canvas, rows)
+
     def _build_shortcuts_tab(self, parent):
         from editor import SHORTCUT_SPECS, OUTPUT_SHORTCUT_SPECS, accel_display
         self._SHORTCUT_SPECS = SHORTCUT_SPECS
@@ -510,6 +529,8 @@ class SettingsWindow(tk.Toplevel):
         ), bg="panel_bg", fg="muted_fg").grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
         row += 1
         self._add_shortcut_rows(rows, row, OUTPUT_SHORTCUT_SPECS, self.output_shortcuts_working, "output_shortcuts")
+
+        scrollutil.bind_wheel(_canvas, rows)
 
     def _add_shortcut_rows(self, rows, start_row, specs, working, scope):
         row = start_row
@@ -715,17 +736,27 @@ class SettingsWindow(tk.Toplevel):
         """Rebuilds the label<->key maps the syntax palette combobox
         uses, straight from syntax.COLOR_THEMES - so it automatically
         picks up whatever sync_saved_palettes() last put there. Mirrors
-        _refresh_preset_choice_maps()."""
+        _refresh_preset_choice_maps().
+
+        "custom" is kept in the full label<->key map (so button-state/
+        tile/lookup code that resolves "whatever's selected" still works
+        correctly while it's active) but left out of
+        _syntax_theme_selectable, the list the dropdown itself is built
+        from: it's an internal staging slot the Advanced dialog uses for
+        in-progress edits, not a real preset a person should be able to
+        pick from the list - Save As is what turns those edits into a
+        real, selectable, named preset."""
         import syntax
         self._syntax_theme_choices = [(key, spec["label"]) for key, spec in syntax.COLOR_THEMES.items()]
         self._label_to_syntax_theme = {label: key for key, label in self._syntax_theme_choices}
+        self._syntax_theme_selectable = [(k, l) for k, l in self._syntax_theme_choices if k != "custom"]
 
     def _current_syntax_key(self):
         import syntax
         return self._label_to_syntax_theme.get(self.syntax_theme_var.get(), syntax.DEFAULT_COLOR_THEME)
 
     def _update_syntax_preset_combo_values(self):
-        self.syntax_combo.configure(values=[label for _key, label in self._syntax_theme_choices])
+        self.syntax_combo.configure(values=[label for _key, label in self._syntax_theme_selectable])
 
     def _update_syntax_preset_buttons_state(self):
         import syntax
@@ -860,6 +891,7 @@ class SettingsWindow(tk.Toplevel):
         self.rename_preset_btn.pack(side="left", padx=(6, 0))
         self.remove_preset_btn = tk.Button(preset_btns, text="Remove", command=self._remove_theme_preset)
         self.remove_preset_btn.pack(side="left", padx=(6, 0))
+        tk.Button(preset_btns, text="Advanced...", command=self._open_advanced_theme_colors).pack(side="right")
         row += 1
 
         self.preset_desc_label = self._reg(tk.Label(
@@ -877,7 +909,7 @@ class SettingsWindow(tk.Toplevel):
         self.syntax_theme_var = tk.StringVar(value=current_syntax_label)
         self.syntax_combo = ttk.Combobox(
             rows, textvariable=self.syntax_theme_var, state="readonly", width=16,
-            values=[label for _key, label in self._syntax_theme_choices])
+            values=[label for _key, label in self._syntax_theme_selectable])
         self.syntax_combo.grid(row=row, column=1, columnspan=2, sticky="e", padx=(0, 4), pady=4)
         self.syntax_combo.bind("<<ComboboxSelected>>", self._on_syntax_theme_selected)
         row += 1
@@ -925,7 +957,14 @@ class SettingsWindow(tk.Toplevel):
         picks that color theme preset, same as picking it from the combo
         above it - rebuilt from scratch on every call since it's cheap
         and only runs on an explicit preset change, never on every
-        keystroke/color-pick."""
+        keystroke/color-pick. Chrome (the cell/border/name-label around
+        each swatch) is colored from self.theme_working rather than
+        self.app.theme: theme_working updates the instant any color
+        changes, in this same call stack, while self.app.theme only
+        catches up later via the _preview -> on_apply -> apply_theme_live
+        round trip - using it here made the tiles' own frame flash the
+        *previous* theme's colors for a moment on every switch, which is
+        exactly the mismatched, contrasty look this replaces."""
         import syntax
         import theme
 
@@ -934,7 +973,7 @@ class SettingsWindow(tk.Toplevel):
         for child in self.tiles_frame.winfo_children():
             child.destroy()
 
-        t = self.app.theme
+        t = self.theme_working
         current_key = self._current_preset_key() if hasattr(self, "theme_preset_var") else theme.SYSTEM_PRESET
         syntax_key = self._current_syntax_key() if hasattr(self, "syntax_theme_var") else syntax.DEFAULT_COLOR_THEME
 
@@ -976,49 +1015,41 @@ class SettingsWindow(tk.Toplevel):
         self.theme_preset_var.set(self._preset_key_to_label.get(key, key))
         self._on_theme_preset_selected()
 
-    def _toggle_advanced_colors(self):
-        self._advanced_colors_visible = not self._advanced_colors_visible
-        if self._advanced_colors_visible:
-            self._advanced_colors_frame.grid()
-            self.advanced_colors_btn.configure(text="\u25be Advanced color settings")
-        else:
-            self._advanced_colors_frame.grid_remove()
-            self.advanced_colors_btn.configure(text="\u25b8 Advanced color settings")
+    def _open_advanced_theme_colors(self):
+        """The ten-plus individual color settings, in a popup window -
+        same shape as _open_advanced_syntax_colors right next to it:
+        picking a color here previews live immediately (same as anywhere
+        else colors get edited), and there's deliberately no separate
+        Save/Cancel in this sub-window since the outer Settings window's
+        own Save/Cancel already covers whatever got changed in here too
+        (self.theme_working is the same working copy the color theme
+        preset picker itself edits)."""
+        t = self.app.theme
+        dlg = tk.Toplevel(self)
+        dlg.title("Advanced: Color Theme")
+        self._reg(dlg, bg="panel_bg")
+        dlg.configure(bg=t["panel_bg"])
+        dlg.transient(self)
+        dlg.geometry("460x480")
+        dlg.minsize(380, 300)
 
-    def _build_advanced_colors_section(self, rows, row, t):
-        """The ten individual color settings, collapsed behind a toggle
-        button by default: most people just want to pick a preset above,
-        and the raw list of ten colors (even grouped/labeled, see
-        THEME_FIELD_GROUPS) is exactly the kind of "technical" detail
-        that overwhelms someone who isn't after it. Returns the next
-        free grid row."""
-        self.advanced_colors_btn = self._reg(tk.Button(
-            rows, text="\u25b8 Advanced color settings", command=self._toggle_advanced_colors,
-            relief="flat", anchor="w", bg=t["panel_bg"], fg=t["accent"],
-            activebackground=t["panel_bg"], activeforeground=t["accent"],
-            bd=0, highlightthickness=0, cursor="hand2"),
-            bg="panel_bg", fg="accent", activebackground="panel_bg", activeforeground="accent")
-        self.advanced_colors_btn.grid(row=row, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 2))
-        row += 1
+        tk.Button(dlg, text="Close", command=dlg.destroy).pack(side="bottom", pady=10)
 
-        self._advanced_colors_frame = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
-        self._advanced_colors_frame.grid(row=row, column=0, columnspan=3, sticky="we", padx=0, pady=0)
-        self._advanced_colors_frame.columnconfigure(0, weight=1)
-        row += 1
+        canvas, rows = self._make_scrollable_rows(dlg, t)
+        rows.columnconfigure(0, weight=1)
 
-        inner_row = 0
+        row = 0
         for group_name, fields in THEME_FIELD_GROUPS:
-            self._section_header(self._advanced_colors_frame, inner_row, group_name, pady=(8, 2), columnspan=3)
-            inner_row += 1
+            self._section_header(rows, row, group_name, pady=(8, 2), columnspan=3)
+            row += 1
             for key, title, desc in fields:
-                self._build_advanced_color_row(self._advanced_colors_frame, inner_row, t, key, title, desc)
-                inner_row += 1
+                self._build_advanced_color_row(rows, row, t, key, title, desc)
+                row += 1
 
-        # Collapsed by default - grid_remove() keeps the frame (and its
-        # row/column slot) around for grid() to restore later, without
-        # leaving a blank gap while it's hidden.
-        self._advanced_colors_frame.grid_remove()
-        return row
+        # Content is fully built by this point, so every row/label/swatch
+        # just added gets the wheel binding too - see the matching note
+        # on _build_theme_tab's own call below.
+        scrollutil.bind_wheel(canvas, rows)
 
     def _build_advanced_color_row(self, rows, row, t, key, title, desc):
         label_frame = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
@@ -1045,11 +1076,10 @@ class SettingsWindow(tk.Toplevel):
 
         t = self.app.theme
 
-        _canvas, rows = self._make_scrollable_rows(parent, t)
+        canvas, rows = self._make_scrollable_rows(parent, t)
         rows.columnconfigure(0, weight=1)
 
         row = self._build_presets_section(rows, t)
-        row = self._build_advanced_colors_section(rows, row, t)
 
         self._section_header(rows, row, "Editor Font", columnspan=3)
         row += 1
@@ -1113,6 +1143,8 @@ class SettingsWindow(tk.Toplevel):
         console_spin.grid(row=row, column=1, sticky="w", pady=4)
         console_spin.bind("<FocusOut>", lambda e: self._on_console_font_size_changed())
         console_spin.bind("<Return>", lambda e: self._on_console_font_size_changed())
+
+        scrollutil.bind_wheel(canvas, rows)
 
     def _pick_color(self, key, swatch):
         _rgb, hex_color = colorchooser.askcolor(color=self.theme_working.get(key), parent=self)

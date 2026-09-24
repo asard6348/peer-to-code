@@ -203,9 +203,19 @@ class EditorApp(ttk.Frame):
 
     def _build_menu(self):
         root = self.winfo_toplevel()
+        t = self.theme
         menubar = tk.Menu(root)
         root.config(menu=menubar)
         a = self._accel
+        # Kept so a later live theme switch can repaint every menu
+        # without rebuilding them (see _theme_menus) - tk.Menu isn't a
+        # ttk widget, so it doesn't pick up style changes automatically,
+        # and unlike a combobox's popdown it also doesn't read the option
+        # database fresh each time it's posted, so it has to be told
+        # directly. On Windows/macOS the OS draws the menu bar itself
+        # and largely ignores these colors anyway - this mainly matters
+        # on Linux/X11, where Tk draws menus itself.
+        self._menus = [menubar]
 
         m_file = tk.Menu(menubar, tearoff=0)
         m_file.add_command(label="New", accelerator=a("new_file"), command=self.action_new)
@@ -223,6 +233,7 @@ class EditorApp(ttk.Frame):
         m_file.add_command(label=("Close" if self.mode == "solo" else "Disconnect"), command=self.action_disconnect)
         m_file.add_command(label="Exit", command=root.destroy)
         menubar.add_cascade(label="File", menu=m_file)
+        self._menus.append(m_file)
 
         m_edit = tk.Menu(menubar, tearoff=0)
         m_edit.add_command(label="Undo", accelerator="Ctrl+Z", command=self.action_undo)
@@ -231,6 +242,7 @@ class EditorApp(ttk.Frame):
             m_edit.add_command(label="Undo Others' Last Change", accelerator=a("undo_peer"), command=self.action_undo_peer)
             self._peer_undo_menu = tk.Menu(m_edit, tearoff=0, postcommand=self._fill_peer_undo_menu)
             m_edit.add_cascade(label="Undo Change By", menu=self._peer_undo_menu)
+            self._menus.append(self._peer_undo_menu)
         m_edit.add_separator()
         m_edit.add_command(label="Cut", accelerator="Ctrl+X", command=lambda: self.text.event_generate("<<Cut>>"))
         m_edit.add_command(label="Copy", accelerator="Ctrl+C", command=lambda: self.text.event_generate("<<Copy>>"))
@@ -246,18 +258,39 @@ class EditorApp(ttk.Frame):
         m_edit.configure(postcommand=self._refresh_edit_menu)
         self._edit_menu = m_edit
         menubar.add_cascade(label="Edit", menu=m_edit)
+        self._menus.append(m_edit)
 
         m_run = tk.Menu(menubar, tearoff=0)
         m_run.add_command(label="Run Script", accelerator=a("run"), command=self.action_run)
         m_run.add_command(label="Stop", accelerator=a("stop"), command=self.action_stop)
         menubar.add_cascade(label="Run", menu=m_run)
+        self._menus.append(m_run)
 
         m_view = tk.Menu(menubar, tearoff=0)
         m_view.add_command(label="Toggle Explorer", accelerator=a("toggle_explorer"), command=self.toggle_explorer)
         m_view.add_command(label="Toggle Terminal", accelerator=a("toggle_output"), command=self.toggle_console)
         menubar.add_cascade(label="View", menu=m_view)
+        self._menus.append(m_view)
 
         self.menubar = menubar
+        self._theme_menus(t)
+
+    def _theme_menus(self, t):
+        """Repaints every tk.Menu this app owns (the menu bar and each of
+        its dropdowns, including the dynamically-filled "Undo Change By"
+        submenu) to match `t`. tk.Menu is a plain Tk widget, not a ttk
+        one, so restyling "TMenubutton"/etc. never reaches it, and unlike
+        the option-database-driven widgets in theme.apply_classic_widget_
+        defaults, it doesn't reread anything on its own either - it has
+        to be told directly, every time. See _build_menu for why this is
+        mainly a Linux/X11 fix: Windows and macOS draw the actual menu
+        bar themselves and mostly ignore these colors."""
+        for menu in getattr(self, "_menus", ()):
+            try:
+                menu.configure(bg=t["bg"], fg=t["fg"], activebackground=t["sel_bg"],
+                                activeforeground=t["fg"], disabledforeground=t["muted_fg"])
+            except tk.TclError:
+                pass
 
     def _author_display(self, author):
         return self._author_names.get(author) or "another user"
@@ -347,6 +380,10 @@ class EditorApp(ttk.Frame):
         self.text.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"],
                              selectbackground=t["sel_bg"], font=(font_family, self._font_size))
         self.console_label.configure(bg=t["bg"], fg=t["muted_fg"])
+        self.status_frame.configure(bg=t["status_bg"])
+        self.status_right.configure(bg=t["status_bg"], fg=t["status_fg"])
+        self.status_left.configure(bg=t["status_bg"], fg=t["status_fg"])
+        self._theme_menus(t)
         # Explorer and Terminal now have fully independent font family
         # *and* size (see _set_explorer_font_size/_family and
         # _set_console_font_size/_family) - a theme change updates
@@ -403,12 +440,12 @@ class EditorApp(ttk.Frame):
         self.file_path_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["muted_fg"], anchor="w")
         self.file_path_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
 
-        status = tk.Frame(self, bg="#3a3d41", height=22)
+        status = tk.Frame(self, bg=t["status_bg"], height=22)
         status.pack(fill="x", side="bottom")
         self.status_frame = status
-        self.status_right = tk.Label(status, text="", bg="#3a3d41", fg="white", anchor="e")
+        self.status_right = tk.Label(status, text="", bg=t["status_bg"], fg=t["status_fg"], anchor="e")
         self.status_right.pack(side="right", padx=8)
-        self.status_left = tk.Label(status, text="", bg="#3a3d41", fg="white", anchor="w")
+        self.status_left = tk.Label(status, text="", bg=t["status_bg"], fg=t["status_fg"], anchor="w")
         self.status_left.pack(side="left", padx=8)
 
         body = tk.PanedWindow(self, orient="horizontal", bg=t["bg"], sashwidth=4, bd=0)

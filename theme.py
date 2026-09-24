@@ -16,13 +16,14 @@ import sys
 import tkinter as tk
 from tkinter import ttk
 
-# The ten colors a preset (built-in or user-saved) controls. Font family/
+# The colors a preset (built-in or user-saved) controls. Font family/
 # size live in the same "theme" config dict but are deliberately outside
 # a preset's reach - switching Dark/Light/System shouldn't also reset
 # whatever font the person picked.
 THEME_COLOR_KEYS = (
     "bg", "panel_bg", "edit_bg", "gutter_bg", "gutter_fg",
     "fg", "muted_fg", "sel_bg", "console_bg", "accent",
+    "status_bg", "status_fg",
 )
 
 SYSTEM_PRESET = "system"
@@ -50,6 +51,20 @@ BUILTIN_THEME_PRESETS = {
             "sel_bg": "#3a4048",
             "console_bg": "#18191b",
             "accent": "#4a9eff",
+            # A dedicated "floor" tone, deliberately darker than every
+            # other surface (bg/panel_bg/edit_bg/console_bg) rather than
+            # a value plucked from a different, unrelated gray family -
+            # that's what the old hardcoded status bar (#3a3d41, a
+            # medium-value blue-gray with no relation to this palette)
+            # got wrong: it sat awkwardly close in value to panel_bg
+            # without matching its hue, clashing rather than either
+            # blending in or reading as a deliberate accent. fg is
+            # softened off pure white for the same reason - full-white
+            # text over near-black chrome elsewhere in this preset was
+            # the highest-contrast pairing on the whole screen, standing
+            # out for no reason tied to meaning.
+            "status_bg": "#131416",
+            "status_fg": "#c9ccd1",
         },
     },
     "light": {
@@ -66,6 +81,11 @@ BUILTIN_THEME_PRESETS = {
             "sel_bg": "#add6ff",
             "console_bg": "#f6f8fa",
             "accent": "#0969da",
+            # A deliberately dark accent stripe against this light
+            # palette - a common, legible pattern (VS Code's light theme
+            # does the same) rather than a mismatch, so it's kept as-is.
+            "status_bg": "#3a3d41",
+            "status_fg": "#f5f5f5",
         },
     },
 }
@@ -292,6 +312,23 @@ def apply_classic_widget_defaults(root: tk.Tk, t: dict):
     root.option_add("*Entry.foreground", t["fg"])
     root.option_add("*Text.background", t["edit_bg"])
     root.option_add("*Text.foreground", t["fg"])
+    # tk.Menu (the File/Edit/Run/View menu bar and its dropdowns) is a
+    # plain Tk widget too, and previously had no theme-derived colors at
+    # all - it just fell back to Tk's own compiled-in default, an
+    # unrelated mid-gray that happened to read as reasonable next to a
+    # light theme and as a jarring, disconnected patch next to a dark
+    # one. This option-database entry covers any menu created fresh from
+    # here on; editor.py's EditorApp additionally repaints its own
+    # already-built menus directly on every live switch (see
+    # EditorApp._theme_menus) since, like Entry/Text, they don't reread
+    # the option database on their own once built. Windows and macOS draw
+    # the actual menu bar with native OS chrome and mostly ignore this -
+    # it's primarily a Linux/X11 fix, where Tk draws menus itself.
+    root.option_add("*Menu.background", t["bg"])
+    root.option_add("*Menu.foreground", t["fg"])
+    root.option_add("*Menu.activeBackground", t["sel_bg"])
+    root.option_add("*Menu.activeForeground", t["fg"])
+    root.option_add("*Menu.disabledForeground", t["muted_fg"])
     # The combobox's popped-down list is a plain Tk Listbox underneath,
     # not a ttk widget, so TCombobox's style.configure() above doesn't
     # reach it - it has to go through the option database instead, or it
@@ -301,3 +338,35 @@ def apply_classic_widget_defaults(root: tk.Tk, t: dict):
     root.option_add("*TCombobox*Listbox.foreground", t["fg"])
     root.option_add("*TCombobox*Listbox.selectBackground", t["sel_bg"])
     root.option_add("*TCombobox*Listbox.selectForeground", t["fg"])
+    _refresh_existing_combobox_popdowns(root, t)
+
+
+def _refresh_existing_combobox_popdowns(root: tk.Tk, t: dict):
+    """The option_add calls above only set *defaults* - Tk applies them to
+    a widget once, at that widget's creation, and never again. A
+    combobox's dropdown list (a plain Tk Listbox) is built lazily the
+    first time it's opened and then cached for reuse, so any combobox a
+    person already opened once before a live theme switch keeps showing
+    its dropdown in the old colors forever, no matter how many more times
+    *TCombobox*Listbox.background gets set above - the cached Listbox
+    just never rereads the option database. This walks the whole widget
+    tree looking for comboboxes with an already-created popdown (the
+    common case is none yet exist) and repaints those few directly."""
+    def walk(widget):
+        try:
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            if isinstance(child, ttk.Combobox):
+                popdown_listbox = f"{child}.popdown.f.l"
+                try:
+                    if root.tk.call("winfo", "exists", popdown_listbox):
+                        root.tk.call(
+                            popdown_listbox, "configure",
+                            "-background", t["edit_bg"], "-foreground", t["fg"],
+                            "-selectbackground", t["sel_bg"], "-selectforeground", t["fg"])
+                except tk.TclError:
+                    pass
+            walk(child)
+    walk(root)
