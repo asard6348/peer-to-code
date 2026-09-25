@@ -79,6 +79,7 @@ DEFAULTS = {
         "accent": "#4a9eff",
         "status_bg": "#131416",
         "status_fg": "#c9ccd1",
+        "border": "#3d4046",
         "font_family": "Consolas",
         "font_size": 11,
     },
@@ -86,7 +87,7 @@ DEFAULTS = {
     # colors}}. The two built-ins ("dark"/"light") and the auto-following
     # "system" preset aren't stored here - only what the user creates via
     # Settings > Theme > Save As. A preset saved before status_bg/
-    # status_fg existed simply won't have those two keys - theme_working
+    # status_fg/border existed simply won't have those keys - theme_working
     # is seeded from this DEFAULTS dict before a preset's colors are
     # layered on top, so an old preset missing them still resolves to a
     # sane value instead of a KeyError (see SettingsWindow.__init__ and

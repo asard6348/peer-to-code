@@ -388,6 +388,12 @@ class ConnectWindow(ttk.Frame):
             result["kind"] = kind
             dlg.destroy()
 
+        # Plain tk.Button, so it only picks up theme colors from the Tk
+        # option database at creation time (see theme.apply_classic_
+        # widget_defaults) - fine here since this dialog is rebuilt fresh
+        # every time it's opened, unlike the Settings window's buttons
+        # which also need a live _reg() registration to repaint while a
+        # theme preset is being switched with the dialog already open.
         tk.Button(btn_row, text="File", width=8, command=lambda: pick("file")).pack(side="left", padx=6)
         tk.Button(btn_row, text="Folder", width=8, command=lambda: pick("directory")).pack(side="left", padx=6)
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)

@@ -23,7 +23,7 @@ from tkinter import ttk
 THEME_COLOR_KEYS = (
     "bg", "panel_bg", "edit_bg", "gutter_bg", "gutter_fg",
     "fg", "muted_fg", "sel_bg", "console_bg", "accent",
-    "status_bg", "status_fg",
+    "status_bg", "status_fg", "border",
 )
 
 SYSTEM_PRESET = "system"
@@ -65,6 +65,19 @@ BUILTIN_THEME_PRESETS = {
             # out for no reason tied to meaning.
             "status_bg": "#131416",
             "status_fg": "#c9ccd1",
+            # Outlines: scrollbar thumbs, button/field/tab/panel edges,
+            # the line under the tab strip, and the divider between a
+            # dropdown's field and its arrow. Previously these were never
+            # themed at all - "clam" (the ttk theme this app builds on)
+            # falls back to its own built-in mid-gray borders whenever a
+            # style leaves bordercolor unset, and plain tk widgets like
+            # the Settings window's Save/Cancel buttons fall back to the
+            # platform's default button face for the same reason. Both
+            # read as a stray light-gray smear across a dark preset like
+            # this one. One step lighter than panel_bg - visible enough
+            # to read as a deliberate line, not so bright it competes
+            # with real content.
+            "border": "#3d4046",
         },
     },
     "light": {
@@ -86,6 +99,13 @@ BUILTIN_THEME_PRESETS = {
             # does the same) rather than a mismatch, so it's kept as-is.
             "status_bg": "#3a3d41",
             "status_fg": "#f5f5f5",
+            # See the "dark" preset's "border" comment for what this
+            # covers. A soft, slightly cool gray in the same family GitHub's
+            # own light theme uses for hairlines - reads as a clean, quiet
+            # division against this palette's white/off-white surfaces
+            # without the harsh contrast "clam"'s own default border gray
+            # has against edit_bg's near-white.
+            "border": "#d0d7de",
         },
     },
 }
@@ -221,6 +241,15 @@ def apply_base_style(style: ttk.Style, t: dict):
     except tk.TclError:
         pass
 
+    # "clam" draws every widget's outer edge - a button's border, an
+    # entry's frame, the line under a tab, a scrollbar's trough - with
+    # its own built-in mid-gray whenever a style leaves that color
+    # unset. bordercolor/lightcolor/darkcolor below replace that with
+    # t["border"] everywhere "clam" would otherwise use it, so outlines
+    # come from the active preset instead of a fixed gray that clashes
+    # with a dark preset and barely registers on a light one.
+    border = t["border"]
+
     style.configure("TFrame", background=t["bg"])
     style.configure("Panel.TFrame", background=t["panel_bg"])
     style.configure("TLabel", background=t["bg"], foreground=t["fg"], font=("Segoe UI", 10))
@@ -228,7 +257,8 @@ def apply_base_style(style: ttk.Style, t: dict):
     style.configure("Muted.TLabel", background=t["panel_bg"], foreground=t["muted_fg"], font=("Segoe UI", 9))
 
     style.configure("TButton", font=("Segoe UI", 10), padding=6,
-                     background=t["panel_bg"], foreground=t["fg"], focuscolor=t["panel_bg"])
+                     background=t["panel_bg"], foreground=t["fg"], focuscolor=t["panel_bg"],
+                     bordercolor=border, lightcolor=t["panel_bg"], darkcolor=t["panel_bg"])
     style.map(
         "TButton",
         background=[("pressed", t["accent"]), ("active", t["sel_bg"]), ("focus", t["sel_bg"])],
@@ -236,7 +266,8 @@ def apply_base_style(style: ttk.Style, t: dict):
     )
 
     style.configure("Toolbar.TButton", font=("Segoe UI", 9), padding=(4, 2),
-                     background=t["panel_bg"], foreground=t["fg"], focuscolor=t["panel_bg"])
+                     background=t["panel_bg"], foreground=t["fg"], focuscolor=t["panel_bg"],
+                     bordercolor=border, lightcolor=t["panel_bg"], darkcolor=t["panel_bg"])
     style.map(
         "Toolbar.TButton",
         background=[("pressed", t["accent"]), ("active", t["sel_bg"]), ("focus", t["sel_bg"])],
@@ -244,7 +275,8 @@ def apply_base_style(style: ttk.Style, t: dict):
     )
 
     style.configure("Toolbar.Thin.TButton", font=("Segoe UI", 9), padding=(1, 2),
-                     background=t["panel_bg"], foreground=t["fg"], focuscolor=t["panel_bg"])
+                     background=t["panel_bg"], foreground=t["fg"], focuscolor=t["panel_bg"],
+                     bordercolor=border, lightcolor=t["panel_bg"], darkcolor=t["panel_bg"])
     style.map(
         "Toolbar.Thin.TButton",
         background=[("pressed", t["accent"]), ("active", t["sel_bg"]), ("focus", t["sel_bg"])],
@@ -252,41 +284,68 @@ def apply_base_style(style: ttk.Style, t: dict):
     )
 
     style.configure("TEntry", padding=5, fieldbackground=t["edit_bg"], foreground=t["fg"],
-                     insertcolor=t["fg"], selectbackground=t["sel_bg"], selectforeground=t["fg"])
+                     insertcolor=t["fg"], selectbackground=t["sel_bg"], selectforeground=t["fg"],
+                     bordercolor=border, lightcolor=t["edit_bg"], darkcolor=t["edit_bg"])
     style.map(
         "TEntry",
         fieldbackground=[("disabled", t["panel_bg"]), ("readonly", t["panel_bg"]), ("focus", t["edit_bg"])],
         foreground=[("disabled", t["muted_fg"])],
+        bordercolor=[("focus", t["accent"])],
     )
 
     style.configure("Treeview", background=t["edit_bg"], foreground=t["fg"],
                      fieldbackground=t["edit_bg"], borderwidth=0)
     style.map("Treeview", background=[("selected", t["sel_bg"])], foreground=[("selected", t["fg"])])
-    style.configure("Treeview.Heading", background=t["panel_bg"], foreground=t["fg"])
+    style.configure("Treeview.Heading", background=t["panel_bg"], foreground=t["fg"],
+                     bordercolor=border, lightcolor=t["panel_bg"], darkcolor=t["panel_bg"])
 
     # Settings' tab strip: unthemed, these otherwise keep "clam"'s fixed
     # beige regardless of which palette is active, which reads as a stray
     # mismatched patch against a light (or, for that matter, dark) panel.
-    style.configure("TNotebook", background=t["panel_bg"], borderwidth=0)
-    style.configure("TNotebook.Tab", background=t["bg"], foreground=t["muted_fg"], padding=(10, 4))
+    style.configure("TNotebook", background=t["panel_bg"], borderwidth=0, bordercolor=border)
+    style.configure("TNotebook.Tab", background=t["bg"], foreground=t["muted_fg"], padding=(10, 4),
+                     bordercolor=border, lightcolor=t["bg"], darkcolor=t["bg"])
     style.map(
         "TNotebook.Tab",
         background=[("selected", t["panel_bg"])],
         foreground=[("selected", t["fg"])],
+        lightcolor=[("selected", t["panel_bg"])],
+        darkcolor=[("selected", t["panel_bg"])],
     )
 
     # Dropdowns (syntax palette, font family, the color theme preset
     # picker): same story - "clam"'s default fieldbackground is a fixed
-    # mid-gray that was never wired up to the theme.
+    # mid-gray that was never wired up to the theme. bordercolor here
+    # also covers the vertical divider "clam" draws between the text
+    # field and the arrow button.
     style.configure("TCombobox", fieldbackground=t["edit_bg"], background=t["panel_bg"],
                      foreground=t["fg"], arrowcolor=t["fg"], selectbackground=t["edit_bg"],
-                     selectforeground=t["fg"])
+                     selectforeground=t["fg"], bordercolor=border,
+                     lightcolor=t["edit_bg"], darkcolor=t["edit_bg"])
     style.map(
         "TCombobox",
         fieldbackground=[("readonly", t["edit_bg"]), ("disabled", t["panel_bg"])],
         background=[("readonly", t["panel_bg"])],
         foreground=[("disabled", t["muted_fg"])],
+        bordercolor=[("focus", t["accent"])],
     )
+
+    # Scrollbars: "clam"'s built-in trough/thumb grays were never touched
+    # by this app at all before, so every scrollbar - editor, explorer,
+    # terminal, the connect screen's page, Settings' scrollable tabs -
+    # showed the same fixed light-gray strip regardless of preset. The
+    # thumb brightens to the accent color on hover/drag, both for
+    # feedback and so it stays readable against either preset's trough.
+    for orient in ("Vertical", "Horizontal"):
+        style_name = f"{orient}.TScrollbar"
+        style.configure(style_name, background=border, troughcolor=t["panel_bg"],
+                         bordercolor=t["panel_bg"], lightcolor=t["panel_bg"], darkcolor=t["panel_bg"],
+                         arrowcolor=t["muted_fg"], relief="flat", arrowsize=13)
+        style.map(
+            style_name,
+            background=[("pressed", t["accent"]), ("active", t["accent"])],
+            arrowcolor=[("pressed", t["fg"]), ("active", t["fg"])],
+        )
 
 
 def apply_classic_widget_defaults(root: tk.Tk, t: dict):
@@ -312,6 +371,22 @@ def apply_classic_widget_defaults(root: tk.Tk, t: dict):
     root.option_add("*Entry.foreground", t["fg"])
     root.option_add("*Text.background", t["edit_bg"])
     root.option_add("*Text.foreground", t["fg"])
+    # Plain tk.Button (Settings' Save/Cancel/Reset/Advanced/Close/Choose/
+    # Change buttons, the connect screen's File/Folder picker, the
+    # editor's Find/Replace dialog, and any other one-off dialog built
+    # with a bare tk.Button rather than a ttk.Button) previously never
+    # had a background set at all, so it fell back to the platform's
+    # stock button face - light gray on Linux/X11 - no matter which
+    # preset was active. Tk derives a plain button's raised-bevel border
+    # from this same background color, so setting it also fixes the
+    # button outline; no separate border color is needed here the way
+    # the ttk styles above need bordercolor.
+    root.option_add("*Button.background", t["panel_bg"])
+    root.option_add("*Button.foreground", t["fg"])
+    root.option_add("*Button.activeBackground", t["sel_bg"])
+    root.option_add("*Button.activeForeground", t["fg"])
+    root.option_add("*Button.disabledForeground", t["muted_fg"])
+    root.option_add("*Button.highlightBackground", t["panel_bg"])
     # tk.Menu (the File/Edit/Run/View menu bar and its dropdowns) is a
     # plain Tk widget too, and previously had no theme-derived colors at
     # all - it just fell back to Tk's own compiled-in default, an

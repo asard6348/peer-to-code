@@ -41,6 +41,11 @@ THEME_FIELD_GROUPS = [
         ("console_bg", "Terminal",
          "The terminal/output panel only."),
     ]),
+    ("Outlines", [
+        ("border", "Outlines & scrollbars",
+         "Thin lines around buttons, fields, tabs, and panels; the line under the "
+         "Explorer/Terminal, and scrollbar handles."),
+    ]),
     ("Status Bar", [
         ("status_bg", "Status bar background",
          "The strip along the bottom: notifications, language, and the open file's path."),
@@ -133,9 +138,19 @@ class SettingsWindow(tk.Toplevel):
 
         footer = self._reg(tk.Frame(self, bg=t["panel_bg"]), bg="panel_bg")
         footer.pack(side="bottom", fill="x", padx=10, pady=10)
-        tk.Button(footer, text="Save", command=self._save).pack(side="right", padx=4)
-        tk.Button(footer, text="Cancel", command=self._cancel).pack(side="right")
-        self.reset_btn = tk.Button(footer, text="Reset to Defaults", command=self._reset_defaults)
+        # These are plain tk.Button, not ttk.Button, so restyling "TButton"
+        # doesn't reach them - each needs its own _reg() entry (see _reg's
+        # docstring) so a live theme switch repaints them along with
+        # everything else in this window, the same as apply_classic_
+        # widget_defaults' *Button.* option-database defaults cover a
+        # *freshly built* button.
+        self._reg(tk.Button(footer, text="Save", command=self._save),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(
+            side="right", padx=4)
+        self._reg(tk.Button(footer, text="Cancel", command=self._cancel),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(side="right")
+        self.reset_btn = self._reg(tk.Button(footer, text="Reset to Defaults", command=self._reset_defaults),
+                                    bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg")
         self.reset_btn.pack(side="left")
 
         nb = ttk.Notebook(self)
@@ -466,7 +481,9 @@ class SettingsWindow(tk.Toplevel):
         dlg.geometry("440x380")
         dlg.minsize(360, 280)
 
-        tk.Button(dlg, text="Close", command=dlg.destroy).pack(side="bottom", pady=10)
+        self._reg(tk.Button(dlg, text="Close", command=dlg.destroy),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(
+            side="bottom", pady=10)
 
         _canvas, rows = self._make_scrollable_rows(dlg, t)
         rows.columnconfigure(0, weight=1)
@@ -499,8 +516,9 @@ class SettingsWindow(tk.Toplevel):
             current = working[tag].get(attr) or fallback
             swatch = tk.Label(rows, text="  " * 6, bg=current, relief="flat", bd=1)
             swatch.grid(row=row, column=1, sticky="w", pady=4)
-            tk.Button(rows, text="Choose", command=lambda tg=tag, at=attr, sw=swatch: pick(tg, at, sw))\
-                .grid(row=row, column=2, padx=6, pady=4)
+            self._reg(tk.Button(rows, text="Choose", command=lambda tg=tag, at=attr, sw=swatch: pick(tg, at, sw)),
+                      bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").grid(
+                row=row, column=2, padx=6, pady=4)
 
         scrollutil.bind_wheel(_canvas, rows)
 
@@ -543,7 +561,8 @@ class SettingsWindow(tk.Toplevel):
                          anchor="w", padx=6),
                 bg="edit_bg", fg="fg")
             accel_label.grid(row=row, column=1, sticky="w", pady=4)
-            btn = tk.Button(rows, text="Change", command=lambda a=action_id: self._start_listen(a))
+            btn = self._reg(tk.Button(rows, text="Change", command=lambda a=action_id: self._start_listen(a)),
+                             bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg")
             btn.grid(row=row, column=2, padx=6, pady=4)
             self._row_widgets[action_id] = (accel_label, btn)
             row += 1
@@ -884,14 +903,19 @@ class SettingsWindow(tk.Toplevel):
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_theme_preset_selected)
         row += 1
 
+        btn_colors = dict(bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg")
         preset_btns = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
         preset_btns.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(0, 2))
-        tk.Button(preset_btns, text="Save As...", command=self._save_theme_preset).pack(side="left")
-        self.rename_preset_btn = tk.Button(preset_btns, text="Rename...", command=self._rename_theme_preset)
+        self._reg(tk.Button(preset_btns, text="Save As...", command=self._save_theme_preset),
+                  **btn_colors).pack(side="left")
+        self.rename_preset_btn = self._reg(
+            tk.Button(preset_btns, text="Rename...", command=self._rename_theme_preset), **btn_colors)
         self.rename_preset_btn.pack(side="left", padx=(6, 0))
-        self.remove_preset_btn = tk.Button(preset_btns, text="Remove", command=self._remove_theme_preset)
+        self.remove_preset_btn = self._reg(
+            tk.Button(preset_btns, text="Remove", command=self._remove_theme_preset), **btn_colors)
         self.remove_preset_btn.pack(side="left", padx=(6, 0))
-        tk.Button(preset_btns, text="Advanced...", command=self._open_advanced_theme_colors).pack(side="right")
+        self._reg(tk.Button(preset_btns, text="Advanced...", command=self._open_advanced_theme_colors),
+                  **btn_colors).pack(side="right")
         row += 1
 
         self.preset_desc_label = self._reg(tk.Label(
@@ -916,15 +940,16 @@ class SettingsWindow(tk.Toplevel):
 
         syntax_preset_btns = self._reg(tk.Frame(rows, bg=t["panel_bg"]), bg="panel_bg")
         syntax_preset_btns.grid(row=row, column=0, columnspan=3, sticky="we", padx=2, pady=(0, 2))
-        tk.Button(syntax_preset_btns, text="Save As...", command=self._save_syntax_palette_preset).pack(side="left")
-        self.rename_syntax_preset_btn = tk.Button(
-            syntax_preset_btns, text="Rename...", command=self._rename_syntax_palette_preset)
+        self._reg(tk.Button(syntax_preset_btns, text="Save As...", command=self._save_syntax_palette_preset),
+                  **btn_colors).pack(side="left")
+        self.rename_syntax_preset_btn = self._reg(tk.Button(
+            syntax_preset_btns, text="Rename...", command=self._rename_syntax_palette_preset), **btn_colors)
         self.rename_syntax_preset_btn.pack(side="left", padx=(6, 0))
-        self.remove_syntax_preset_btn = tk.Button(
-            syntax_preset_btns, text="Remove", command=self._remove_syntax_palette_preset)
+        self.remove_syntax_preset_btn = self._reg(tk.Button(
+            syntax_preset_btns, text="Remove", command=self._remove_syntax_palette_preset), **btn_colors)
         self.remove_syntax_preset_btn.pack(side="left", padx=(6, 0))
-        tk.Button(syntax_preset_btns, text="Advanced...", command=self._open_advanced_syntax_colors)\
-            .pack(side="right")
+        self._reg(tk.Button(syntax_preset_btns, text="Advanced...", command=self._open_advanced_syntax_colors),
+                  **btn_colors).pack(side="right")
         row += 1
 
         self.syntax_theme_desc_label = self._reg(tk.Label(
@@ -1033,7 +1058,9 @@ class SettingsWindow(tk.Toplevel):
         dlg.geometry("460x480")
         dlg.minsize(380, 300)
 
-        tk.Button(dlg, text="Close", command=dlg.destroy).pack(side="bottom", pady=10)
+        self._reg(tk.Button(dlg, text="Close", command=dlg.destroy),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(
+            side="bottom", pady=10)
 
         canvas, rows = self._make_scrollable_rows(dlg, t)
         rows.columnconfigure(0, weight=1)
@@ -1067,8 +1094,9 @@ class SettingsWindow(tk.Toplevel):
 
         swatch = tk.Label(rows, text="  " * 6, bg=self.theme_working[key], relief="flat", bd=1)
         swatch.grid(row=row, column=1, sticky="w", pady=4)
-        tk.Button(rows, text="Choose", command=lambda k=key, s=swatch: self._pick_color(k, s))\
-            .grid(row=row, column=2, padx=6, pady=4)
+        self._reg(tk.Button(rows, text="Choose", command=lambda k=key, s=swatch: self._pick_color(k, s)),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").grid(
+            row=row, column=2, padx=6, pady=4)
         self.color_vars[key] = swatch
 
     def _build_theme_tab(self, parent):
@@ -1208,7 +1236,11 @@ class SettingsWindow(tk.Toplevel):
             fill="x", padx=8, pady=(16, 2))
         btn_row = self._reg(tk.Frame(parent, bg=t["panel_bg"]), bg="panel_bg")
         btn_row.pack(fill="x", padx=8, pady=(0, 10))
-        tk.Button(btn_row, text="Open Containing Folder", command=open_folder).pack(side="left")
+        self._reg(tk.Button(btn_row, text="Open Containing Folder", command=open_folder),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(side="left")
+        # Deliberately not _reg()'d: a fixed warning red, like Run/Stop/
+        # Disconnect elsewhere, not a themed color that should shift with
+        # the preset.
         tk.Button(btn_row, text="Delete Config File", command=self._delete_config_file,
                   bg="#5a3030", fg="white", activebackground="#734040").pack(side="left", padx=8)
 
