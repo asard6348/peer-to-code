@@ -251,6 +251,11 @@ def apply_base_style(style: ttk.Style, t: dict):
     border = t["border"]
 
     style.configure("TFrame", background=t["bg"])
+    # A bordered variant for panels that should read as a distinct region
+    # rather than blending into whatever's next to them - currently just
+    # the file explorer, which otherwise has no visual edge at all
+    # separating it from the editor pane beside it.
+    style.configure("Explorer.TFrame", background=t["bg"], borderwidth=1, relief="solid", bordercolor=border)
     style.configure("Panel.TFrame", background=t["panel_bg"])
     style.configure("TLabel", background=t["bg"], foreground=t["fg"], font=("Segoe UI", 10))
     style.configure("Panel.TLabel", background=t["panel_bg"], foreground=t["fg"], font=("Segoe UI", 10))

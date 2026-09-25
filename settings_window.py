@@ -1,6 +1,7 @@
 import tkinter as tk
-from tkinter import ttk, colorchooser, messagebox, simpledialog, font as tkfont
+from tkinter import ttk, messagebox, simpledialog, font as tkfont
 
+import color_picker
 import config
 import scrollutil
 
@@ -89,6 +90,12 @@ class SettingsWindow(tk.Toplevel):
         t = app.theme
         self.title("Settings")
         self.configure(bg=t["panel_bg"])
+        # A visible frame around the whole window, in the theme's border
+        # color - Toplevels get none of the outlines apply_base_style
+        # gives ttk widgets, so without this the window edge (and the
+        # Advanced sub-dialogs, set up the same way below) just fades
+        # into whatever's behind them.
+        self.configure(highlightthickness=1, highlightbackground=t["border"], highlightcolor=t["border"])
         self.geometry("560x520")
         self.minsize(420, 320)
         self.transient(app.winfo_toplevel())
@@ -246,7 +253,7 @@ class SettingsWindow(tk.Toplevel):
         switch) repaints the whole Settings window immediately instead
         of just the parts ttk happens to own."""
         t = self.theme_working
-        self.configure(bg=t["panel_bg"])
+        self.configure(bg=t["panel_bg"], highlightbackground=t["border"], highlightcolor=t["border"])
         for widget, color_options in self._theme_widgets:
             try:
                 widget.configure(**{opt: t[key] for opt, key in color_options.items()})
@@ -475,8 +482,9 @@ class SettingsWindow(tk.Toplevel):
         t = self.app.theme
         dlg = tk.Toplevel(self)
         dlg.title("Advanced: Syntax Colors")
-        self._reg(dlg, bg="panel_bg")
-        dlg.configure(bg=t["panel_bg"])
+        self._reg(dlg, bg="panel_bg", highlightbackground="border", highlightcolor="border")
+        dlg.configure(bg=t["panel_bg"], highlightthickness=1,
+                      highlightbackground=t["border"], highlightcolor=t["border"])
         dlg.transient(self)
         dlg.geometry("440x380")
         dlg.minsize(360, 280)
@@ -491,8 +499,10 @@ class SettingsWindow(tk.Toplevel):
         working = {name: dict(syntax.COLOR_THEMES["custom"]["colors"].get(name, {})) for name in syntax.TAG_NAMES}
 
         def pick(tag, attr, swatch):
-            _rgb, hex_color = colorchooser.askcolor(color=swatch.cget("bg"), parent=dlg)
-            if not hex_color:
+            if not swatch.winfo_exists():
+                return
+            hex_color = color_picker.ask_color(dlg, initial=swatch.cget("bg"), t=t)
+            if not hex_color or not swatch.winfo_exists():
                 return
             working[tag][attr] = hex_color
             swatch.configure(bg=hex_color)
@@ -1052,8 +1062,9 @@ class SettingsWindow(tk.Toplevel):
         t = self.app.theme
         dlg = tk.Toplevel(self)
         dlg.title("Advanced: Color Theme")
-        self._reg(dlg, bg="panel_bg")
-        dlg.configure(bg=t["panel_bg"])
+        self._reg(dlg, bg="panel_bg", highlightbackground="border", highlightcolor="border")
+        dlg.configure(bg=t["panel_bg"], highlightthickness=1,
+                      highlightbackground=t["border"], highlightcolor=t["border"])
         dlg.transient(self)
         dlg.geometry("460x480")
         dlg.minsize(380, 300)
@@ -1175,12 +1186,15 @@ class SettingsWindow(tk.Toplevel):
         scrollutil.bind_wheel(canvas, rows)
 
     def _pick_color(self, key, swatch):
-        _rgb, hex_color = colorchooser.askcolor(color=self.theme_working.get(key), parent=self)
-        if hex_color:
-            self.theme_working[key] = hex_color
-            swatch.configure(bg=hex_color)
-            self._refresh_preset_tiles()
-            self._preview({"theme"})
+        if not swatch.winfo_exists():
+            return
+        hex_color = color_picker.ask_color(self, initial=self.theme_working.get(key), t=self.theme_working)
+        if not hex_color or not swatch.winfo_exists():
+            return
+        self.theme_working[key] = hex_color
+        swatch.configure(bg=hex_color)
+        self._refresh_preset_tiles()
+        self._preview({"theme"})
 
     def _build_config_tab(self, parent):
         import os

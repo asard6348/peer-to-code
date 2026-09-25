@@ -37,6 +37,11 @@ def _filesystem_roots():
 
 class FileExplorer(ttk.Frame):
     def __init__(self, master, working_dir, on_open_file, **kw):
+        # Gives the panel a visible themed edge (see theme.apply_base_
+        # style's "Explorer.TFrame") instead of blending straight into
+        # the editor pane beside it; callers can still override by
+        # passing their own style=.
+        kw.setdefault("style", "Explorer.TFrame")
         super().__init__(master, **kw)
         self.working_dir = working_dir
         self.on_open_file = on_open_file
