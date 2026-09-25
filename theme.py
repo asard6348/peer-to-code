@@ -348,6 +348,29 @@ def apply_base_style(style: ttk.Style, t: dict):
         )
 
 
+def classic_scrollbar_options(t: dict) -> dict:
+    """Color options for a plain tk.Scrollbar. The code editor and the
+    terminal panel use raw tk.Scrollbar rather than ttk.Scrollbar (a
+    ttk.Scrollbar can't be told to auto-hide the way editor.py's
+    _on_yscroll wants), so apply_base_style's Vertical.TScrollbar /
+    Horizontal.TScrollbar styling never reaches them - they need this
+    same set of colors applied to each instance directly, both when
+    it's built and again on every theme switch, or they're left
+    showing Tk's stock gray regardless of preset. Same roles as the
+    ttk scrollbars above (border for the thumb, panel_bg for the
+    trough, accent while being dragged) so every scrollbar in the app
+    reads as one consistent look."""
+    return dict(
+        background=t["border"],
+        troughcolor=t["panel_bg"],
+        activebackground=t["accent"],
+        highlightthickness=0,
+        relief="flat",
+        borderwidth=0,
+        elementborderwidth=0,
+    )
+
+
 def apply_classic_widget_defaults(root: tk.Tk, t: dict):
     """Sets sane, theme-matching defaults on the Tk option database for the
     plain (non-ttk) widgets scattered through the app: tk.Entry, tk.Text,

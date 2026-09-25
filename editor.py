@@ -379,6 +379,9 @@ class EditorApp(ttk.Frame):
         self.linenumbers.configure(bg=t["gutter_bg"])
         self.text.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"],
                              selectbackground=t["sel_bg"], font=(font_family, self._font_size))
+        self.yscroll.configure(**theme.classic_scrollbar_options(t))
+        self.xscroll.configure(**theme.classic_scrollbar_options(t))
+        self.console_yscroll.configure(**theme.classic_scrollbar_options(t))
         self.console_label.configure(bg=t["bg"], fg=t["muted_fg"])
         self.status_frame.configure(bg=t["status_bg"])
         self.status_right.configure(bg=t["status_bg"], fg=t["status_fg"])
@@ -484,12 +487,14 @@ class EditorApp(ttk.Frame):
         text_frame.pack(side="left", fill="both", expand=True)
         self.text_frame = text_frame
 
-        yscroll = tk.Scrollbar(text_frame, orient="vertical")
+        yscroll = tk.Scrollbar(text_frame, orient="vertical", **theme.classic_scrollbar_options(t))
         yscroll.pack(side="right", fill="y")
         self.yscroll = yscroll
 
-        xscroll = tk.Scrollbar(text_frame, orient="horizontal", command=self._on_xscroll)
+        xscroll = tk.Scrollbar(text_frame, orient="horizontal", command=self._on_xscroll,
+                                **theme.classic_scrollbar_options(t))
         xscroll.pack(side="bottom", fill="x")
+        self.xscroll = xscroll
 
         self.text = tk.Text(text_frame, wrap=("word" if self._word_wrap else "none"), undo=False,
                              bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"], selectbackground=t["sel_bg"],
@@ -518,8 +523,9 @@ class EditorApp(ttk.Frame):
         console_body.pack(fill="both", expand=True, padx=2, pady=2)
         self.console_body = console_body
 
-        console_yscroll = tk.Scrollbar(console_body, orient="vertical")
+        console_yscroll = tk.Scrollbar(console_body, orient="vertical", **theme.classic_scrollbar_options(t))
         console_yscroll.pack(side="right", fill="y")
+        self.console_yscroll = console_yscroll
 
         self.console = tk.Text(console_body, height=4, bg=t["console_bg"], fg=t["fg"], relief="flat",
                                 font=(self._console_font_family, self._console_font_size),
