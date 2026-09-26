@@ -299,7 +299,14 @@ def apply_base_style(style: ttk.Style, t: dict):
     )
 
     style.configure("Treeview", background=t["edit_bg"], foreground=t["fg"],
-                     fieldbackground=t["edit_bg"], borderwidth=0)
+                     fieldbackground=t["edit_bg"], borderwidth=0,
+                     # "clam" draws the Treeview's outer edge using
+                     # lightcolor/darkcolor for its bevel regardless of
+                     # borderwidth=0 above - left unset, that bevel falls
+                     # back to "clam"'s own near-white default, which is
+                     # exactly the bright white box that was showing
+                     # around the file explorer regardless of preset.
+                     lightcolor=t["edit_bg"], darkcolor=t["edit_bg"], bordercolor=border)
     style.map("Treeview", background=[("selected", t["sel_bg"])], foreground=[("selected", t["fg"])])
     style.configure("Treeview.Heading", background=t["panel_bg"], foreground=t["fg"],
                      bordercolor=border, lightcolor=t["panel_bg"], darkcolor=t["panel_bg"])
@@ -307,7 +314,12 @@ def apply_base_style(style: ttk.Style, t: dict):
     # Settings' tab strip: unthemed, these otherwise keep "clam"'s fixed
     # beige regardless of which palette is active, which reads as a stray
     # mismatched patch against a light (or, for that matter, dark) panel.
-    style.configure("TNotebook", background=t["panel_bg"], borderwidth=0, bordercolor=border)
+    style.configure("TNotebook", background=t["panel_bg"], borderwidth=0, bordercolor=border,
+                     # Same "clam" quirk as Treeview above, on the border
+                     # around the notebook's own content pane (the box
+                     # below the tab strip) - this was the bright white
+                     # frame around Settings' Theme/General/etc. content.
+                     lightcolor=border, darkcolor=border)
     style.configure("TNotebook.Tab", background=t["bg"], foreground=t["muted_fg"], padding=(10, 4),
                      bordercolor=border, lightcolor=t["bg"], darkcolor=t["bg"])
     style.map(
