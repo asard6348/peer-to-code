@@ -1,4 +1,4 @@
-PEER TO CODE
+# PEER TO CODE
 -----------
 Peer to Code is a lightweight desktop text/code editor built with Python's
 Tkinter GUI toolkit. Alongside standard editing features (syntax
@@ -9,7 +9,7 @@ the same session (client/server or peer-to-peer) and edit the same file
 together, with changes synchronized live using operational transformation.
 
 
-INSTRUCTIONS
+## INSTRUCTIONS
 ------------
 1. Make sure Python 3 is installed on your system.
 2. Clone or download the repository:
@@ -28,10 +28,14 @@ INSTRUCTIONS
    peer-to-peer), then start editing together.
 
 
-DEPENDENCIES
+## DEPENDENCIES
 ------------
 - Python 3.x
 - Tkinter (usually included with Python; on Linux you may need to install
   it separately, e.g. `sudo apt install python3-tk`)
 - tkinterdnd2 (optional - enables drag-and-drop file opening; the app runs
   fine without it, just without that feature)
+  
+## CREDITS
+-------
+- Claude Sonnet 5
