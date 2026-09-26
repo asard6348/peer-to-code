@@ -5,6 +5,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -204,20 +205,66 @@ class EditorApp(ttk.Frame):
     def _build_menu(self):
         root = self.winfo_toplevel()
         t = self.theme
-        menubar = tk.Menu(root)
-        root.config(menu=menubar)
         a = self._accel
-        # Kept so a later live theme switch can repaint every menu
-        # without rebuilding them (see _theme_menus) - tk.Menu isn't a
-        # ttk widget, so it doesn't pick up style changes automatically,
-        # and unlike a combobox's popdown it also doesn't read the option
-        # database fresh each time it's posted, so it has to be told
-        # directly. On Windows/macOS the OS draws the menu bar itself
-        # and largely ignores these colors anyway - this mainly matters
-        # on Linux/X11, where Tk draws menus itself.
-        self._menus = [menubar]
 
-        m_file = tk.Menu(menubar, tearoff=0)
+        # On Windows, a menu bar attached the normal way (root.config(menu=))
+        # is drawn by the OS itself, using the system's own menu-bar theme -
+        # tk.Menu's bg/fg options get mostly ignored, and what's left behind
+        # is a thin light-colored border/strip along the bar that no Tk
+        # option can touch, however dark the rest of the window is. Building
+        # the bar ourselves instead - a plain Frame holding a Menubutton per
+        # top-level entry, each posting its dropdown like any other popup
+        # menu - keeps every pixel of it, border included, a normal themed
+        # widget. macOS's menu bar lives outside the window entirely (so
+        # this bug doesn't occur there, and replacing it would also lose
+        # the native Mac menu bar for no benefit), and Linux/X11 already
+        # draws tk.Menu itself and honors these colors - see _theme_menus -
+        # so both keep the native menu bar as before.
+        self._use_custom_menubar = sys.platform.startswith("win")
+
+        old_bar = getattr(self, "_custom_menubar", None)
+        if old_bar is not None:
+            old_bar.destroy()
+            self._custom_menubar = None
+
+        self._menus = []
+        self._menu_buttons = []
+
+        if self._use_custom_menubar:
+            root.config(menu="")
+            bar = tk.Frame(self, bg=t["bg"], bd=0, highlightthickness=0)
+            bar.pack(side="top", fill="x")
+            self._custom_menubar = bar
+
+            def add_menu(label):
+                mb = tk.Menubutton(bar, text=label, bg=t["bg"], fg=t["fg"],
+                                    activebackground=t["sel_bg"], activeforeground=t["fg"],
+                                    bd=0, highlightthickness=0, padx=10, pady=4)
+                mb.pack(side="left")
+                menu = tk.Menu(mb, tearoff=0)
+                mb.configure(menu=menu)
+                self._menu_buttons.append(mb)
+                self._menus.append(menu)
+                return menu
+        else:
+            self._custom_menubar = None
+            menubar = tk.Menu(root)
+            root.config(menu=menubar)
+            # Kept so a later live theme switch can repaint every menu
+            # without rebuilding them (see _theme_menus) - tk.Menu isn't a
+            # ttk widget, so it doesn't pick up style changes automatically,
+            # and unlike a combobox's popdown it also doesn't read the
+            # option database fresh each time it's posted, so it has to be
+            # told directly.
+            self._menus.append(menubar)
+
+            def add_menu(label):
+                menu = tk.Menu(menubar, tearoff=0)
+                menubar.add_cascade(label=label, menu=menu)
+                self._menus.append(menu)
+                return menu
+
+        m_file = add_menu("File")
         m_file.add_command(label="New", accelerator=a("new_file"), command=self.action_new)
         m_file.add_command(label="Open", accelerator=a("open_file"), command=self.action_open)
         m_file.add_command(label="Save", accelerator=a("save_file"), command=self.action_save)
@@ -232,10 +279,8 @@ class EditorApp(ttk.Frame):
         m_file.add_separator()
         m_file.add_command(label=("Close" if self.mode == "solo" else "Disconnect"), command=self.action_disconnect)
         m_file.add_command(label="Exit", command=root.destroy)
-        menubar.add_cascade(label="File", menu=m_file)
-        self._menus.append(m_file)
 
-        m_edit = tk.Menu(menubar, tearoff=0)
+        m_edit = add_menu("Edit")
         m_edit.add_command(label="Undo", accelerator="Ctrl+Z", command=self.action_undo)
         m_edit.add_command(label="Redo", accelerator="Ctrl+Y", command=self.action_redo)
         if self.mode != "solo":
@@ -257,22 +302,16 @@ class EditorApp(ttk.Frame):
         m_edit.add_command(label="Delete Line", accelerator=a("delete_line"), command=self.action_delete_line)
         m_edit.configure(postcommand=self._refresh_edit_menu)
         self._edit_menu = m_edit
-        menubar.add_cascade(label="Edit", menu=m_edit)
-        self._menus.append(m_edit)
 
-        m_run = tk.Menu(menubar, tearoff=0)
+        m_run = add_menu("Run")
         m_run.add_command(label="Run Script", accelerator=a("run"), command=self.action_run)
         m_run.add_command(label="Stop", accelerator=a("stop"), command=self.action_stop)
-        menubar.add_cascade(label="Run", menu=m_run)
-        self._menus.append(m_run)
 
-        m_view = tk.Menu(menubar, tearoff=0)
+        m_view = add_menu("View")
         m_view.add_command(label="Toggle Explorer", accelerator=a("toggle_explorer"), command=self.toggle_explorer)
         m_view.add_command(label="Toggle Terminal", accelerator=a("toggle_output"), command=self.toggle_console)
-        menubar.add_cascade(label="View", menu=m_view)
-        self._menus.append(m_view)
 
-        self.menubar = menubar
+        self.menubar = self._custom_menubar if self._use_custom_menubar else menubar
         self._theme_menus(t)
 
     def _theme_menus(self, t):
@@ -282,15 +321,28 @@ class EditorApp(ttk.Frame):
         one, so restyling "TMenubutton"/etc. never reaches it, and unlike
         the option-database-driven widgets in theme.apply_classic_widget_
         defaults, it doesn't reread anything on its own either - it has
-        to be told directly, every time. See _build_menu for why this is
-        mainly a Linux/X11 fix: Windows and macOS draw the actual menu
-        bar themselves and mostly ignore these colors."""
+        to be told directly, every time. See _build_menu for why Windows
+        instead gets a custom widget-based bar here (self._menu_buttons)
+        rather than relying on this to reach the native one: Linux/X11
+        draws tk.Menu itself and honors these colors, and macOS draws its
+        menu bar outside the window and mostly ignores them anyway."""
         for menu in getattr(self, "_menus", ()):
             try:
                 menu.configure(bg=t["bg"], fg=t["fg"], activebackground=t["sel_bg"],
                                 activeforeground=t["fg"], disabledforeground=t["muted_fg"])
             except tk.TclError:
                 pass
+        bar = getattr(self, "_custom_menubar", None)
+        if bar is not None:
+            try:
+                bar.configure(bg=t["bg"])
+            except tk.TclError:
+                pass
+            for mb in getattr(self, "_menu_buttons", ()):
+                try:
+                    mb.configure(bg=t["bg"], fg=t["fg"], activebackground=t["sel_bg"], activeforeground=t["fg"])
+                except tk.TclError:
+                    pass
 
     def _author_display(self, author):
         return self._author_names.get(author) or "another user"
@@ -343,6 +395,9 @@ class EditorApp(ttk.Frame):
                 self._set_console_font_family(ui_cfg["console_font_family"])
             if "console_font_size" in ui_cfg:
                 self._set_console_font_size(int(ui_cfg["console_font_size"]))
+            if "explorer_sort_key" in ui_cfg or "explorer_sort_reverse" in ui_cfg:
+                self.explorer.set_sort(ui_cfg.get("explorer_sort_key", self.explorer._sort_key),
+                                        ui_cfg.get("explorer_sort_reverse", self.explorer._sort_reverse))
         if "editor" in changed:
             editor_cfg = self.cfg.setdefault("editor", {})
             self._default_new_file_language = editor_cfg.get("default_new_file_language", "python")
@@ -463,6 +518,8 @@ class EditorApp(ttk.Frame):
         self._explorer_font_family = ui_prefs.get("explorer_font_family") or "sans-serif"
         self._explorer_font_size = int(ui_prefs.get("explorer_font_size") or 9)
         self.explorer.set_font(self._explorer_font_family, self._explorer_font_size)
+        self.explorer.set_sort(ui_prefs.get("explorer_sort_key", "name"),
+                                ui_prefs.get("explorer_sort_reverse", False))
         dnd_support.register_drop(self.explorer, self._on_explorer_drop)
         dnd_support.register_drop(self.explorer.tree, self._on_explorer_drop)
         if self._opened_single_file:
@@ -1075,6 +1132,8 @@ class EditorApp(ttk.Frame):
         ui["explorer_font_family"] = self._explorer_font_family
         ui["console_font_size"] = self._console_font_size
         ui["console_font_family"] = self._console_font_family
+        ui["explorer_sort_key"] = self.explorer._sort_key
+        ui["explorer_sort_reverse"] = self.explorer._sort_reverse
         if self._explorer_visible:
             ui["explorer_width"] = self.explorer.winfo_width()
         if self._console_visible:
@@ -1358,20 +1417,37 @@ class EditorApp(ttk.Frame):
         self._update_cursor_status()
 
     def _prepare_run_target(self):
-        """Writes out a scratch file for an unsaved/dirty buffer if needed
-        and returns (cmd, target), or None (after showing an error) if the
-        scratch file couldn't be written."""
-        target = self.current_file
-        if target is None or self.dirty:
-            target = os.path.join(self.working_dir, "._scratch_run.py")
-            try:
-                with open(target, "w", encoding="utf-8") as f:
-                    f.write(self.text.get("1.0", "end-1c"))
-            except OSError as e:
-                messagebox.showerror("Run", str(e))
-                return None
+        """Returns (cmd, target, is_temp) for the buffer to run, or None
+        (after showing an error, or the user declining a save prompt) if
+        it couldn't be prepared. A buffer that's already saved and clean
+        runs straight from its own file; a dirty one is saved back to
+        that same file first (so what runs matches what's on screen,
+        the same "save before run" most editors do) rather than forked
+        off into a second, untracked copy sitting next to it. Only a
+        buffer that was never saved anywhere - so there's no file to
+        run - falls back to a temp file, and even then it's written to
+        the OS temp directory rather than the project folder, and
+        removed again once the run finishes (see _watch_run_proc)."""
         cmd = self.run_cmd.get().strip() or sys.executable
-        return cmd, target
+        if self.current_file is not None:
+            if self.dirty:
+                self.action_save()
+                if self.dirty:
+                    # action_save can no-op (declined an external-change
+                    # prompt) or fail (write error, already reported by
+                    # action_save itself) - either way there's nothing
+                    # safe to run.
+                    return None
+            return cmd, self.current_file, False
+
+        try:
+            fd, target = tempfile.mkstemp(prefix="peer2code_run_", suffix=".py")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(self.text.get("1.0", "end-1c"))
+        except OSError as e:
+            messagebox.showerror("Run", str(e))
+            return None
+        return cmd, target, True
 
     def action_run(self):
         if self.run_proc and self.run_proc.poll() is None:
@@ -1380,11 +1456,11 @@ class EditorApp(ttk.Frame):
         prepared = self._prepare_run_target()
         if prepared is None:
             return
-        cmd, target = prepared
+        cmd, target, is_temp = prepared
         self.ansi_console.state.reset()
         self._ensure_newline()
         self._console_write(f"$ {cmd} {os.path.basename(target)}\n", "info")
-        self._launch_process([cmd, target])
+        self._launch_process([cmd, target], cleanup_path=(target if is_temp else None))
 
     def _run_terminal_command(self, command):
         """Runs a line typed straight at the Terminal's own $ prompt as a
@@ -1402,11 +1478,14 @@ class EditorApp(ttk.Frame):
         self.ansi_console.state.reset()
         self._launch_process(command, shell=True)
 
-    def _launch_process(self, args, shell=False):
+    def _launch_process(self, args, shell=False, cleanup_path=None):
         """Actually starts args - either an argv list (Run button) or a
         single shell command string (shell=True, a line typed at the
         Terminal's own prompt) - as run_proc, and wires up the pump/
-        watch machinery every run shares regardless of how it started."""
+        watch machinery every run shares regardless of how it started.
+        cleanup_path, when given (an unsaved buffer's temp file - see
+        _prepare_run_target), is removed once the process ends, or right
+        away if it never managed to start."""
         # A separate process group so Ctrl+C can be sent to just the
         # child later - without this it would also land on our own
         # process. On Windows that's CREATE_NEW_PROCESS_GROUP (console
@@ -1432,23 +1511,36 @@ class EditorApp(ttk.Frame):
             self._ensure_newline()
             self._console_write(f"Failed to launch: {e}\n", "stderr")
             self._show_prompt()
+            if cleanup_path:
+                try:
+                    os.remove(cleanup_path)
+                except OSError:
+                    pass
             return
         self._proc_exit_expected = False
         threading.Thread(target=self._pump_stream, args=(self.run_proc.stdout, False), daemon=True).start()
         threading.Thread(target=self._pump_stream, args=(self.run_proc.stderr, True), daemon=True).start()
-        threading.Thread(target=self._watch_run_proc, args=(self.run_proc,), daemon=True).start()
+        threading.Thread(target=self._watch_run_proc, args=(self.run_proc, cleanup_path), daemon=True).start()
 
-    def _watch_run_proc(self, proc):
+    def _watch_run_proc(self, proc, cleanup_path=None):
         """Waits (off the main thread - proc.wait() blocks) for this run
         to actually end, how ever it ends: normal exit, our own Stop or
         interrupt, or - the thing we actually can't see any other way -
         something outside this app killing it directly (a stray terminal
         signal delivered to the child's process/session despite the
         isolation in _launch_process, another process sending it a
-        signal, etc.). Only enqueues a report for the run this thread was
-        started for, so a stale watcher from a previous run can't report
-        on top of a new one that's since started."""
+        signal, etc.). cleanup_path is removed once it does, regardless
+        of which of those it was, so an unsaved buffer's temp file (see
+        _prepare_run_target) never outlives the run it was made for.
+        Only enqueues a report for the run this thread was started for,
+        so a stale watcher from a previous run can't report on top of a
+        new one that's since started."""
         returncode = proc.wait()
+        if cleanup_path:
+            try:
+                os.remove(cleanup_path)
+            except OSError:
+                pass
         if proc is self.run_proc:
             self._exit_queue.put(returncode)
 

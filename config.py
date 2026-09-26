@@ -31,6 +31,14 @@ DEFAULTS = {
         # the OS's current light/dark setting on every launch - see
         # theme.apply_active_preset().
         "theme_preset": "system",
+        # How the file explorer's tree is ordered by default - see
+        # file_explorer.SORT_OPTIONS for the keys "explorer_sort_key" can
+        # take. Changing it from the explorer's own right-click "Sort by"
+        # submenu updates this too (see EditorApp._persist_ui_state), so
+        # Settings > General just shows/edits whatever's currently live
+        # rather than being a separate copy of it.
+        "explorer_sort_key": "name",
+        "explorer_sort_reverse": False,
     },
     "editor": {
         "default_new_file_language": "python",

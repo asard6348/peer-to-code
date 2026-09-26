@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, simpledialog, font as tkfont
 
 import color_picker
 import config
+import file_explorer
 import scrollutil
 
 IGNORED_KEYSYMS = {
@@ -119,6 +120,10 @@ class SettingsWindow(tk.Toplevel):
             "explorer_font_family", getattr(app, "_explorer_font_family", "sans-serif"))
         self._orig_explorer_font_size = int(ui_cfg_init.get(
             "explorer_font_size", getattr(app, "_explorer_font_size", 9)))
+        self._orig_explorer_sort_key = ui_cfg_init.get(
+            "explorer_sort_key", getattr(getattr(app, "explorer", None), "_sort_key", "name"))
+        self._orig_explorer_sort_reverse = bool(ui_cfg_init.get(
+            "explorer_sort_reverse", getattr(getattr(app, "explorer", None), "_sort_reverse", False)))
         self._orig_console_font_family = ui_cfg_init.get(
             "console_font_family", getattr(app, "_console_font_family", "Consolas"))
         self._orig_console_font_size = int(ui_cfg_init.get(
@@ -396,6 +401,40 @@ class SettingsWindow(tk.Toplevel):
             "<Configure>", lambda e: window_desc_label.configure(wraplength=max(60, e.width)))
         row += 1
 
+        section_header(row, "Explorer")
+        row += 1
+
+        self._sort_key_choices = list(file_explorer.SORT_OPTIONS)
+        self._label_to_sort_key = {label: key for key, label in self._sort_key_choices}
+        current_sort_label = dict(self._sort_key_choices).get(self._orig_explorer_sort_key, "Name")
+
+        self._row_label(rows, row, "Sort files and folders by")
+        self.explorer_sort_key_var = tk.StringVar(value=current_sort_label)
+        sort_combo = ttk.Combobox(rows, textvariable=self.explorer_sort_key_var, state="readonly", width=16,
+                                   values=[label for _key, label in self._sort_key_choices])
+        sort_combo.grid(row=row, column=1, sticky="e", padx=(0, 4), pady=4)
+        sort_combo.bind("<<ComboboxSelected>>", self._on_explorer_sort_key_selected)
+        row += 1
+
+        self.explorer_sort_reverse_var = tk.BooleanVar(value=self._orig_explorer_sort_reverse)
+        self._reg(tk.Checkbutton(
+            rows, text="Sort descending",
+            variable=self.explorer_sort_reverse_var, bg=t["panel_bg"], fg=t["fg"],
+            selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
+            highlightthickness=0, anchor="w", command=self._on_explorer_sort_reverse_toggled,
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(0, 4))
+        row += 1
+        sort_desc_label = self._reg(tk.Label(
+            rows, text="Folders always come before files; this only controls the order within "
+                       "each. The explorer's own right-click \"Sort by\" menu changes the same setting.",
+            bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left"),
+            bg="panel_bg", fg="muted_fg")
+        sort_desc_label.grid(row=row, column=0, columnspan=2, sticky="we", padx=4, pady=(0, 10))
+        sort_desc_label.bind(
+            "<Configure>", lambda e: sort_desc_label.configure(wraplength=max(60, e.width)))
+        row += 1
+
         section_header(row, "Terminal")
         row += 1
         self.terminal_message_vars = {
@@ -468,6 +507,15 @@ class SettingsWindow(tk.Toplevel):
         code = self._label_to_language.get(self.default_language_var.get(), "python")
         self.cfg.setdefault("editor", {})["default_new_file_language"] = code
         self._preview({"editor"})
+
+    def _on_explorer_sort_key_selected(self, _event=None):
+        key = self._label_to_sort_key.get(self.explorer_sort_key_var.get(), "name")
+        self.cfg.setdefault("ui", {})["explorer_sort_key"] = key
+        self._preview({"ui"})
+
+    def _on_explorer_sort_reverse_toggled(self):
+        self.cfg.setdefault("ui", {})["explorer_sort_reverse"] = self.explorer_sort_reverse_var.get()
+        self._preview({"ui"})
 
     def _open_advanced_syntax_colors(self):
         """Per-token-category color picker, for anyone the two built-in
@@ -1390,6 +1438,11 @@ class SettingsWindow(tk.Toplevel):
         for key, var in self.terminal_message_vars.items():
             var.set(term_cfg.get(key, True))
         self.word_wrap_var.set(self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]))
+        ui_cfg = self.cfg.get("ui", {})
+        sort_key = ui_cfg.get("explorer_sort_key", config.DEFAULTS["ui"]["explorer_sort_key"])
+        self.explorer_sort_key_var.set(dict(self._sort_key_choices).get(sort_key, "Name"))
+        self.explorer_sort_reverse_var.set(
+            ui_cfg.get("explorer_sort_reverse", config.DEFAULTS["ui"]["explorer_sort_reverse"]))
 
     def _reset_defaults(self):
         import syntax
@@ -1436,8 +1489,11 @@ class SettingsWindow(tk.Toplevel):
             editor_cfg["default_new_file_language"] = config.DEFAULTS["editor"]["default_new_file_language"]
             editor_cfg["terminal_messages"] = dict(config.DEFAULTS["editor"]["terminal_messages"])
             editor_cfg["word_wrap"] = config.DEFAULTS["editor"]["word_wrap"]
+            ui_cfg = self.cfg.setdefault("ui", {})
+            ui_cfg["explorer_sort_key"] = config.DEFAULTS["ui"]["explorer_sort_key"]
+            ui_cfg["explorer_sort_reverse"] = config.DEFAULTS["ui"]["explorer_sort_reverse"]
             self._refresh_general_ui()
-            self._preview({"editor"})
+            self._preview({"editor", "ui"})
 
     def _save(self):
         self.theme_working["font_family"] = self.font_family_var.get() or "Consolas"
@@ -1478,6 +1534,12 @@ class SettingsWindow(tk.Toplevel):
             changed.add("ui")
         if self.cfg.get("ui", {}).get("console_font_family", self._orig_console_font_family) \
                 != self._orig_console_font_family:
+            changed.add("ui")
+        if self.cfg.get("ui", {}).get("explorer_sort_key", self._orig_explorer_sort_key) \
+                != self._orig_explorer_sort_key:
+            changed.add("ui")
+        if self.cfg.get("ui", {}).get("explorer_sort_reverse", self._orig_explorer_sort_reverse) \
+                != self._orig_explorer_sort_reverse:
             changed.add("ui")
         if self.cfg.get("ui", {}).get("theme_preset", self._orig_theme_preset) != self._orig_theme_preset:
             changed.add("ui")
@@ -1544,6 +1606,12 @@ class SettingsWindow(tk.Toplevel):
             reverted.add("ui")
         if ui_cfg.get("console_font_family", self._orig_console_font_family) != self._orig_console_font_family:
             ui_cfg["console_font_family"] = self._orig_console_font_family
+            reverted.add("ui")
+        if ui_cfg.get("explorer_sort_key", self._orig_explorer_sort_key) != self._orig_explorer_sort_key:
+            ui_cfg["explorer_sort_key"] = self._orig_explorer_sort_key
+            reverted.add("ui")
+        if ui_cfg.get("explorer_sort_reverse", self._orig_explorer_sort_reverse) != self._orig_explorer_sort_reverse:
+            ui_cfg["explorer_sort_reverse"] = self._orig_explorer_sort_reverse
             reverted.add("ui")
         if self.cfg.get("theme_presets", {}) != self._orig_theme_presets:
             self.cfg["theme_presets"] = {k: dict(v) for k, v in self._orig_theme_presets.items()}
