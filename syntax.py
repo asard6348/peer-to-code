@@ -375,18 +375,42 @@ def _highlight_python(text_widget, source):
 
         if _FSTRING_START is not None and ttype == _FSTRING_START:
             start = (srow, scol)
-            end = (erow, ecol)
+            open_end = (erow, ecol)
             depth = 1
-            i += 1
-            while i < n and depth > 0:
-                jtype, jstr, _jstart, jend, _jline = tokens[i]
+            j = i + 1
+            end = None
+            while j < n:
+                jtype, jstr, _jstart, jend, _jline = tokens[j]
                 if jtype == _FSTRING_START:
                     depth += 1
                 elif jtype == _FSTRING_END:
                     depth -= 1
-                end = jend
+                    if depth == 0:
+                        end = jend
+                        j += 1
+                        break
+                j += 1
+            if end is not None:
+                # Found the matching FSTRING_END - tag the whole literal,
+                # same as before.
+                text_widget.tag_add("string", f"{start[0]}.{start[1]}", f"{end[0]}.{end[1]}")
+                i = j
+            else:
+                # No matching FSTRING_END anywhere in the rest of the
+                # token stream - the normal, constant state while someone
+                # is mid-way through typing an f-string (just after the
+                # opening f"/f', before its closing quote lands), and
+                # also what's left once error recovery re-tokenizes past
+                # a genuinely broken one. Without this branch the loop
+                # above would run to the end of `tokens`, so every line
+                # typed below the open quote - a "def" two lines down,
+                # say - gets folded into one giant "string" tag instead
+                # of keeping its own color. Tag only the opening quote
+                # itself and let everything after it, including the
+                # f-string's own unfinished contents, fall through to the
+                # normal per-token handling below.
+                text_widget.tag_add("string", f"{start[0]}.{start[1]}", f"{open_end[0]}.{open_end[1]}")
                 i += 1
-            text_widget.tag_add("string", f"{start[0]}.{start[1]}", f"{end[0]}.{end[1]}")
             expect_definition = False
             prev_is_dot = False
             continue
