@@ -1,0 +1,83 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"          # triggers on tags like v1.0.0
+  workflow_dispatch:    # lets you run it manually from the Actions tab too
+
+permissions:
+  contents: write        # needed so the workflow can create the release & upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: peer-to-code-windows.exe
+            build_name: peer-to-code
+          - os: ubuntu-latest
+            artifact_name: peer-to-code-linux
+            build_name: peer-to-code
+          - os: macos-latest
+            artifact_name: peer-to-code-macos
+            build_name: peer-to-code
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system Tk (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller tkinterdnd2
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --windowed --name "${{ matrix.build_name }}" main.py
+
+      # PyInstaller puts the result in dist/. Rename it to a per-OS artifact name.
+      - name: Rename artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: mv dist/${{ matrix.build_name }}.exe dist/${{ matrix.artifact_name }}
+
+      - name: Rename artifact (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: mv dist/${{ matrix.build_name }} dist/${{ matrix.artifact_name }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          draft: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
