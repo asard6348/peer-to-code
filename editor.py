@@ -898,8 +898,7 @@ class EditorApp(ttk.Frame):
     def _schedule_highlight(self):
         if self._highlight_job:
             self.after_cancel(self._highlight_job)
-            self._highlight_job = None
-        self._do_highlight()
+        self._highlight_job = self.after(120, self._do_highlight)
 
     def _current_language(self):
         """The active buffer's language, falling back to the user's
@@ -1539,12 +1538,22 @@ class EditorApp(ttk.Frame):
         # selection-aware Ctrl+C handling ever gets a say.
         is_windows = sys.platform.startswith("win")
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if is_windows else 0
+        # bufsize=1 above only affects how *we* read the pipe. It says
+        # nothing about the child itself: since its stdout isn't a tty,
+        # a Python child defaults to full block buffering there, so
+        # prints (e.g. from a script that then sits in a tkinter
+        # mainloop) don't cross the pipe until the buffer fills or the
+        # process exits - looking like the terminal only "wakes up"
+        # once the run finishes. PYTHONUNBUFFERED forces it unbuffered.
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
         try:
             self.run_proc = subprocess.Popen(
                 args, cwd=self.working_dir, shell=shell,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                 creationflags=creationflags,
                 start_new_session=(not is_windows),
+                env=env,
             )
         except OSError as e:
             self._ensure_newline()
