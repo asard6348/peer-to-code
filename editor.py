@@ -1250,9 +1250,10 @@ class EditorApp(ttk.Frame):
     def _swap_shared_buffer(self, text, filename_hint):
         """Loads new content into the shared, collaborative buffer - this
         reaches every connected peer, not just this window. Also announces
-        the new filename hint so peers' syntax highlighting follows along and
-        their own (unrelated) local file association is safely cleared -
-        see _on_buffer_context."""
+        the new filename hint so peers' syntax highlighting follows along,
+        and any peer whose own local file association turns out to point
+        somewhere different is safely cleared (peers already pointed at
+        this same file are left alone) - see _handle_buffer_context."""
         self._suppress_capture = True
         try:
             self.text.delete("1.0", "end")
@@ -1433,15 +1434,25 @@ class EditorApp(ttk.Frame):
         if by == self.client.client_id:
             self._update_file_path_label()
             return
-        had_local_file = self.current_file is not None
-        self.current_file = None
-        self._loaded_mtime = None
-        self._update_file_path_label()
         who = next((n for pid, n in self._known_peer_names.items() if pid == by), "someone")
         label = filename or "a blank buffer"
         self._console_write(f"{who} loaded {label} into the shared buffer\n", "info")
-        if had_local_file:
+        # Only clear our own local association if the incoming context
+        # actually points somewhere *different* from the file we already
+        # have. Two peers who both have the same file open locally (or a
+        # peer re-announcing the file they already had, e.g. after a
+        # reconnect resync or reopening it post external-edit) shouldn't
+        # have their association yanked out from under them just because
+        # a buffer_context message arrived - that was interrupting quick
+        # save-then-run cycles with an unpredictable "Save As" prompt
+        # whenever an unrelated peer touched New/Open, even though
+        # nothing about *this* peer's file actually changed.
+        own_hint = self._share_hint_for(self.current_file) if self.current_file else None
+        if self.current_file is not None and own_hint != filename:
+            self.current_file = None
+            self._loaded_mtime = None
             self._console_write("  (your local file association was cleared to avoid an accidental overwrite)\n", "info")
+        self._update_file_path_label()
         self._update_cursor_status()
 
     def _prepare_run_target(self):
