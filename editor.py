@@ -898,7 +898,7 @@ class EditorApp(ttk.Frame):
     def _schedule_highlight(self):
         if self._highlight_job:
             self.after_cancel(self._highlight_job)
-        self._highlight_job = self.after(120, self._do_highlight)
+        self._highlight_job = self.after_idle(self._do_highlight)
 
     def _current_language(self):
         """The active buffer's language, falling back to the user's

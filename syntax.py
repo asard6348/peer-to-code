@@ -418,18 +418,43 @@ def _highlight_python(text_widget, source):
 
 def _tokenize_best_effort(source):
     """Real tokenize() raises on unterminated strings / bad indentation, which
-    is the normal state of a buffer mid-edit. Collect whatever tokens it
-    manages before that so highlighting degrades gracefully rather than
-    freezing on invalid-but-in-progress code."""
+    is the normal state of a buffer mid-edit - e.g. the instant after typing
+    an opening quote, before its closing one. Collecting only the tokens
+    gathered before that error isn't enough on its own: generate_tokens is a
+    generator, so once it raises it's dead and can never produce tokens for
+    anything after that point either - which would otherwise blank out every
+    line below the one currently being edited, not just the broken bit.
+    So on error we re-tokenize the remaining lines as their own fresh chunk
+    and keep going, one error at a time, rather than giving up on the whole
+    rest of the buffer."""
     out = []
-    try:
-        gen = tokenize.generate_tokens(io.StringIO(source).readline)
-        for tok in gen:
-            out.append(tok)
-    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        pass
-    except StopIteration:
-        pass
+    lines = source.splitlines(keepends=True)
+    start = 0
+    while start < len(lines):
+        chunk = "".join(lines[start:])
+        try:
+            for ttype, tstr, (srow, scol), (erow, ecol), tline in tokenize.generate_tokens(io.StringIO(chunk).readline):
+                if start:
+                    srow += start
+                    erow += start
+                out.append((ttype, tstr, (srow, scol), (erow, ecol), tline))
+            break
+        except (tokenize.TokenError, IndentationError, SyntaxError, ValueError) as e:
+            # Resume just past the offending line so we don't loop forever
+            # re-hitting the same error on an unchanged remainder. Where
+            # that line is is reported differently by different error
+            # types: TokenError's args[1] is (row, col); SyntaxError (and
+            # IndentationError, a subclass of it) instead carries it as
+            # the .lineno attribute - its own args[1] is an unrelated
+            # (filename, lineno, offset, text, ...) tuple, not (row, col).
+            if isinstance(e, tokenize.TokenError):
+                err_row = e.args[1][0] if len(e.args) > 1 and isinstance(e.args[1], tuple) and e.args[1] else None
+            else:
+                err_row = getattr(e, "lineno", None)
+            advance = err_row if isinstance(err_row, int) and err_row > 0 else 1
+            start += max(advance, 1)
+        except StopIteration:
+            break
     return out
 
 
