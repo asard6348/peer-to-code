@@ -25,6 +25,7 @@ class App:
         # _start_system_theme_watch.
         self._system_dark = theme.detect_system_dark_mode()
         self._system_theme_job = None
+        self._signal_pump_job = None
 
         self.root = dnd_support.make_root()
         entry_paste.install(self.root)
@@ -97,13 +98,33 @@ class App:
             return
         self._cleanup(ask_to_save=False)
         self._stop_system_theme_watch()
+        self._stop_signal_pump()
         try:
             self.root.destroy()
         except tk.TclError:
             pass
 
     def _pump_signals(self):
+        if not self.root.winfo_exists():
+            self._signal_pump_job = None
+            return
         self._signal_pump_job = self.root.after(200, self._pump_signals)
+
+    def _stop_signal_pump(self):
+        """Cancels the recurring _pump_signals timer. Must run before
+        self.root.destroy() - unlike _stop_system_theme_watch (called
+        from the same places), this one was previously never cancelled
+        at all, so the pending `after` timer kept firing every 200ms
+        after the root window (and its Tcl command list) was torn down,
+        crashing deep inside tkinter's own callit()/deletecommand() with
+        "AttributeError: 'NoneType' object has no attribute 'remove'"
+        the next time it fired."""
+        if self._signal_pump_job is not None:
+            try:
+                self.root.after_cancel(self._signal_pump_job)
+            except tk.TclError:
+                pass
+            self._signal_pump_job = None
 
     def _start_system_theme_watch(self):
         """Polling is the only portable way to notice the OS's light/dark
@@ -243,6 +264,7 @@ class App:
         if not self._cleanup(ask_to_save=True):
             return
         self._stop_system_theme_watch()
+        self._stop_signal_pump()
         try:
             self.root.destroy()
         except tk.TclError:
@@ -317,6 +339,7 @@ class App:
         except KeyboardInterrupt:
             self._cleanup(ask_to_save=False)
             self._stop_system_theme_watch()
+            self._stop_signal_pump()
             try:
                 self.root.destroy()
             except tk.TclError:

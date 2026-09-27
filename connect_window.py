@@ -493,25 +493,33 @@ class ConnectWindow(ttk.Frame):
         for path in recents:
             row = tk.Frame(self.recent_list, bg=t["panel_bg"])
             row.pack(fill="x")
-            remove_btn = tk.Label(row, text="Remove", bg=t["panel_bg"], fg=t["muted_fg"],
-                                   font=("Segoe UI", 9), cursor="hand2", padx=6)
-            remove_btn.pack(side="right", anchor="n")
-            label = tk.Label(row, text=self._display_path(path), bg=t["panel_bg"], fg=t["fg"],
+            display_text = self._display_path(path)
+            label = tk.Label(row, text=display_text, bg=t["panel_bg"], fg=t["fg"],
                               font=("Consolas", 10), anchor="w", justify="left", cursor="hand2", padx=4, pady=3)
             label.pack(side="left", fill="both", expand=True)
             label.bind("<Configure>", lambda e, l=label: l.configure(wraplength=max(60, e.width)))
 
-            def on_enter(_e, r=row, l=label, b=remove_btn):
-                r.configure(bg=t["sel_bg"]); l.configure(bg=t["sel_bg"]); b.configure(bg=t["sel_bg"])
+            menu = tk.Menu(row, tearoff=0)
+            menu.add_command(label="Copy", command=lambda p=path, l=label, d=display_text: self._copy_recent_project(p, l, d))
+            menu.add_command(label="Remove", command=lambda p=path: self._remove_recent_project(p))
 
-            def on_leave(_e, r=row, l=label, b=remove_btn):
-                r.configure(bg=t["panel_bg"]); l.configure(bg=t["panel_bg"]); b.configure(bg=t["panel_bg"])
+            def on_enter(_e, r=row, l=label):
+                r.configure(bg=t["sel_bg"]); l.configure(bg=t["sel_bg"])
 
-            for widget in (row, label, remove_btn):
+            def on_leave(_e, r=row, l=label):
+                r.configure(bg=t["panel_bg"]); l.configure(bg=t["panel_bg"])
+
+            def on_right_click(e, m=menu):
+                try:
+                    m.tk_popup(e.x_root, e.y_root)
+                finally:
+                    m.grab_release()
+
+            for widget in (row, label):
                 widget.bind("<Enter>", on_enter)
                 widget.bind("<Leave>", on_leave)
+                widget.bind("<Button-3>", on_right_click)
             label.bind("<Button-1>", lambda _e, p=path: self._do_open_project(p))
-            remove_btn.bind("<Button-1>", lambda _e, p=path: self._remove_recent_project(p))
             self._recent_row_widgets.append(row)
         self._rebind_wheel()
 
@@ -519,6 +527,24 @@ class ConnectWindow(ttk.Frame):
         config.remove_recent_project(self.cfg, path)
         config.save_config(self.cfg)
         self._refresh_recent_projects()
+
+    def _copy_recent_project(self, path, label=None, original_text=None):
+        """Puts `path` on the system clipboard rather than filling any
+        particular field directly - the Recent list only shows up on the
+        Open tab, but the whole point of Copy is reusing one of these
+        paths to host on the Connect or Peer to Peer tab instead, so
+        there's no single field to fill it into automatically. From the
+        clipboard it can be pasted into whichever Path field is actually
+        wanted with a normal Ctrl+V, instead of browsing to it again."""
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        if label is not None and original_text is not None:
+            job = getattr(label, "_copy_flash_job", None)
+            if job is not None:
+                label.after_cancel(job)
+            label.configure(text="Copied path to clipboard")
+            label._copy_flash_job = label.after(
+                1400, lambda: (label.configure(text=original_text), setattr(label, "_copy_flash_job", None)))
 
     def _display_path(self, path):
         name = os.path.basename(path.rstrip("/\\")) or path

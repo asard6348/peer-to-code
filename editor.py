@@ -35,6 +35,28 @@ from net.client import FailoverController
 CONSOLE_TAG_COLORS_DARK = {"stderr": "#e06c75", "info": "#61afef", "prompt": "#98c379"}
 CONSOLE_TAG_COLORS_LIGHT = {"stderr": "#cf222e", "info": "#0969da", "prompt": "#1a7f37"}
 
+# How many spaces one indent level is - Tab, auto-indent-on-Enter, and the
+# backspace-removes-a-whole-level behavior all agree on this single width
+# rather than each hardcoding their own "    ".
+INDENT_WIDTH = 4
+# A line ending in one of these (ignoring trailing whitespace) gets one
+# extra indent level on the line Enter creates - covers the common
+# "opens a block" punctuation across most of this editor's supported
+# languages (Python's ':', C-family/JS/etc.'s '{', and an open '(' or '['
+# left dangling at line end) without needing per-language grammar.
+_INDENT_AFTER_SUFFIXES = (":", "{", "(", "[")
+_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+_CLOSE_TO_OPEN = {v: k for k, v in _OPEN_TO_CLOSE.items()}
+# Python has no closing bracket to hang a dedent off of for its
+# colon-based blocks, so the electric-dedent-on-':' behavior keys off
+# these instead - a bare 'else'/'elif'/'except'/'finally' clause dedents
+# to line up with the statement it belongs to.
+_PY_DEDENT_KEYWORDS = re.compile(r"^(else|elif|except|finally)\b")
+# What a dedented else/elif/except/finally is allowed to land next to at
+# the same indent level - a sibling clause of the block it's continuing,
+# not just any statement that happens to be shallower.
+_PY_BLOCK_OPENERS = re.compile(r"^(if|elif|else|for|while|try|except|finally|with)\b")
+
 
 def _console_tag_colors(console_bg):
     return CONSOLE_TAG_COLORS_LIGHT if syntax.brightness(console_bg) >= 0.5 else CONSOLE_TAG_COLORS_DARK
@@ -1855,6 +1877,16 @@ class EditorApp(ttk.Frame):
             return "break"
         if not clip:
             return "break"
+        # Normalize line endings before inserting. Clipboard content that
+        # came from Windows (or was copied from a file with CRLF endings)
+        # commonly uses "\r\n", and some sources use a lone "\r" - Tk's
+        # Text widget treats those as literal characters rather than line
+        # breaks, so without this every pasted line would carry a stray
+        # control character at its end. That breaks anything downstream
+        # that works line-by-line: leading-whitespace/indent math,
+        # trailing-whitespace display, and the peer sync char-offset
+        # accounting all assume "\n" is the only line separator.
+        clip = clip.replace("\r\n", "\n").replace("\r", "\n")
         with self._single_undo_step():
             if text.tag_ranges("sel"):
                 start = text.index("sel.first")
@@ -1953,13 +1985,21 @@ class EditorApp(ttk.Frame):
     def action_indent(self, event=None):
         sel = self._selection_line_range()
         if sel is None:
-            self.text.insert("insert", "    ")
+            # No selection: pad to the next tab-stop rather than always
+            # inserting a flat INDENT_WIDTH block, so Tab lands on the
+            # same aligned columns (4, 8, 12, ...) regardless of where in
+            # the line the cursor happens to be - matching Tab in VS
+            # Code/Sublime/etc. rather than always adding exactly 4
+            # characters even from an already-misaligned column.
+            col = int(self.text.index("insert").split(".")[1])
+            pad = INDENT_WIDTH - (col % INDENT_WIDTH)
+            self.text.insert("insert", " " * pad)
             return "break"
         start, end = sel
         with self._single_undo_step():
             for n in range(start, end + 1):
                 if self.text.get(f"{n}.0", f"{n}.end").strip():
-                    self.text.insert(f"{n}.0", "    ")
+                    self.text.insert(f"{n}.0", " " * INDENT_WIDTH)
         return "break"
 
     def action_dedent(self, event=None):
@@ -1972,10 +2012,175 @@ class EditorApp(ttk.Frame):
             for n in range(start, end + 1):
                 line = self.text.get(f"{n}.0", f"{n}.end")
                 cut = len(line) - len(line.lstrip(" "))
-                cut = min(cut, 4)
+                cut = min(cut, INDENT_WIDTH)
                 if cut:
                     self.text.delete(f"{n}.0", f"{n}.{cut}")
         return "break"
+
+    def _line_indent(self, line_text):
+        """The leading run of spaces/tabs on a line of text."""
+        return line_text[:len(line_text) - len(line_text.lstrip(" \t"))]
+
+    def _matching_bracket_index(self, before_text, close_char):
+        """Scans `before_text` (everything in the buffer up to some
+        position) backward for the opener that `close_char` would match
+        if inserted right after it, tracking nesting depth of that one
+        bracket type only. Returns a character offset into `before_text`,
+        or None if there's no unmatched opener - e.g. a stray ')' with
+        nothing open, or genuinely balanced code with no gap to fill."""
+        open_char = _CLOSE_TO_OPEN[close_char]
+        depth = 0
+        i = len(before_text) - 1
+        while i >= 0:
+            c = before_text[i]
+            if c == close_char:
+                depth += 1
+            elif c == open_char:
+                if depth == 0:
+                    return i
+                depth -= 1
+            i -= 1
+        return None
+
+    def _on_text_return(self, event=None):
+        """Auto-indent, the way every mainstream code editor does it:
+        - A new line starts at the same indent level as the line it was
+          split from, rather than snapping back to column 0.
+        - One extra level is added when the line up to the cursor ends
+          with something that conventionally opens a new block (':',
+          '{', '(', '[') - covers Python's colon-based blocks and
+          brace/paren-based blocks in most of this editor's other
+          languages without needing per-language grammar.
+        - Pressing Enter with the cursor sitting directly between a
+          matching bracket pair ('{|}', '(|)', '[|]', nothing typed
+          between them yet) splits it into three lines instead of one,
+          with the cursor indented a level deeper and the closing
+          bracket left behind at the original indent - e.g. '{}' becomes
+          '{', an indented blank line with the cursor, then '}'."""
+        text = self.text
+        with self._single_undo_step():
+            if text.tag_ranges("sel"):
+                text.delete("sel.first", "sel.last")
+            line_no = int(text.index("insert").split(".")[0])
+            full_line = text.get(f"{line_no}.0", f"{line_no}.end")
+            indent = self._line_indent(full_line)
+            before_cursor = text.get(f"{line_no}.0", "insert").rstrip()
+            char_before = text.get("insert-1c", "insert")
+            char_after = text.get("insert", "insert+1c")
+            if char_before in _OPEN_TO_CLOSE and char_after == _OPEN_TO_CLOSE.get(char_before):
+                inner_indent = indent + " " * INDENT_WIDTH
+                text.insert("insert", "\n" + inner_indent + "\n" + indent)
+                text.mark_set("insert", f"{line_no + 1}.{len(inner_indent)}")
+            else:
+                if before_cursor.endswith(_INDENT_AFTER_SUFFIXES):
+                    indent += " " * INDENT_WIDTH
+                text.insert("insert", "\n" + indent)
+        text.see("insert")
+        self._schedule_highlight()
+        return "break"
+
+    def _on_text_backspace(self, event=None):
+        """Backspace removes a whole indent level (up to the previous
+        multiple-of-INDENT_WIDTH column) in one press when everything
+        from the start of the line to the cursor is indentation - instead
+        of the default one-space-per-press, which means either repeatedly
+        pressing Backspace or holding it (and overshooting into the
+        previous line's text) just to back out one level. Falls through
+        to the Text widget's normal Backspace anywhere else (a selection,
+        mid-word, column 0, or a line that mixes indentation with tabs -
+        left alone rather than guessed at)."""
+        text = self.text
+        if text.tag_ranges("sel"):
+            return None
+        line_no, col = (int(p) for p in text.index("insert").split("."))
+        if col == 0:
+            return None
+        before = text.get(f"{line_no}.0", f"{line_no}.{col}")
+        if before.strip(" ") != "":
+            return None
+        remainder = col % INDENT_WIDTH
+        delete_count = min(remainder or INDENT_WIDTH, col)
+        with self._single_undo_step():
+            text.delete(f"{line_no}.{col - delete_count}", f"{line_no}.{col}")
+        return "break"
+
+    def _on_text_keypress(self, event):
+        """Two more "electric" behaviors that fire on the keystroke that
+        completes them, both applied before the character itself lands
+        (this runs on <Key>/<KeyPress>, ahead of the widget's own default
+        insertion) so the typed character still ends up in the right
+        place afterward:
+        - Typing a closing bracket (')', ']', '}') as the first non-
+          whitespace thing on a line re-indents that line to match the
+          line holding its opener first - the standard "closing bracket
+          snaps to its block" behavior, instead of leaving it sitting at
+          whatever indent Enter last guessed.
+        - In Python, typing the ':' that completes a bare 'else',
+          'elif', 'except', or 'finally' line dedents that line to line
+          up with the nearest enclosing statement at a shallower indent
+          (its matching 'if'/'for'/'while'/'try', or a sibling
+          'elif'/'except' at the same level) - Python has no closing
+          bracket to hang that dedent off of, so IDEs key it off the
+          keyword instead.
+        Every other key is left untouched and simply falls through
+        (returns None) to normal typing."""
+        ch = event.char
+        text = self.text
+        if ch in _CLOSE_TO_OPEN:
+            if text.tag_ranges("sel"):
+                return None
+            line_no, col = (int(p) for p in text.index("insert").split("."))
+            before = text.get(f"{line_no}.0", f"{line_no}.{col}")
+            if before.strip(" \t") != "":
+                return None
+            buffer_before = text.get("1.0", "insert")
+            match_offset = self._matching_bracket_index(buffer_before, ch)
+            if match_offset is None:
+                return None
+            match_line = int(text.index(f"1.0+{match_offset}c").split(".")[0])
+            match_line_text = text.get(f"{match_line}.0", f"{match_line}.end")
+            target_indent = self._line_indent(match_line_text)
+            if target_indent == before:
+                return None
+            with self._single_undo_step():
+                text.delete(f"{line_no}.0", f"{line_no}.{col}")
+                text.insert(f"{line_no}.0", target_indent)
+            text.mark_set("insert", f"{line_no}.{len(target_indent)}")
+            return None
+        if ch == ":" and self._current_language() == "python":
+            line_no = int(text.index("insert").split(".")[0])
+            full_line = text.get(f"{line_no}.0", f"{line_no}.end")
+            stripped = full_line.lstrip(" \t")
+            if not _PY_DEDENT_KEYWORDS.match(stripped):
+                return None
+            current_indent = self._line_indent(full_line)
+            target_indent = None
+            n = line_no - 1
+            while n >= 1:
+                prev = text.get(f"{n}.0", f"{n}.end")
+                if prev.strip():
+                    prev_indent = self._line_indent(prev)
+                    prev_stripped = prev.lstrip(" \t")
+                    if len(prev_indent) < len(current_indent):
+                        target_indent = prev_indent
+                        break
+                    if len(prev_indent) == len(current_indent) and _PY_BLOCK_OPENERS.match(prev_stripped):
+                        target_indent = prev_indent
+                        break
+                    # Same or deeper indent but not a sibling clause (an
+                    # ordinary statement inside the block, or a nested
+                    # block's contents) - keep walking up past it rather
+                    # than giving up, since skipping over regular
+                    # same-level statements to find the block's own
+                    # header/sibling is exactly the normal case.
+                n -= 1
+            if target_indent is None or target_indent == current_indent:
+                return None
+            with self._single_undo_step():
+                text.delete(f"{line_no}.0", f"{line_no}.{len(current_indent)}")
+                text.insert(f"{line_no}.0", target_indent)
+            return None
+        return None
 
     def _cancel_pending_jobs(self):
         """Cancels every self-rescheduling after() job. Without this, a
@@ -2068,6 +2273,10 @@ class EditorApp(ttk.Frame):
 
         self.text.bind("<Tab>", self.action_indent)
         self.text.bind("<Shift-Tab>", self.action_dedent)
+        self.text.bind("<Return>", self._on_text_return)
+        self.text.bind("<KP_Enter>", self._on_text_return)
+        self.text.bind("<BackSpace>", self._on_text_backspace)
+        self.text.bind("<Key>", self._on_text_keypress)
         self.text.bind("<Configure>", self._redraw_linenumbers)
 
     def _unbind_output_shortcuts(self):
