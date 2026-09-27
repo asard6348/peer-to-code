@@ -510,10 +510,14 @@ class ConnectWindow(ttk.Frame):
                 r.configure(bg=t["panel_bg"]); l.configure(bg=t["panel_bg"])
 
             def on_right_click(e, m=menu):
-                try:
-                    m.tk_popup(e.x_root, e.y_root)
-                finally:
-                    m.grab_release()
+                # No explicit grab_release() here - tk_popup() already
+                # sets its own internal grab so it can detect and
+                # dismiss on an outside click; releasing that grab right
+                # away (the usual copy-pasted idiom) undoes it before
+                # the user gets a chance to click anything, leaving the
+                # menu stuck open forever. file_explorer.py's tree
+                # context menu relies on the same built-in behavior.
+                m.tk_popup(e.x_root, e.y_root)
 
             for widget in (row, label):
                 widget.bind("<Enter>", on_enter)

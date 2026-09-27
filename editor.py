@@ -56,6 +56,12 @@ _PY_DEDENT_KEYWORDS = re.compile(r"^(else|elif|except|finally)\b")
 # the same indent level - a sibling clause of the block it's continuing,
 # not just any statement that happens to be shallower.
 _PY_BLOCK_OPENERS = re.compile(r"^(if|elif|else|for|while|try|except|finally|with)\b")
+# A line whose statement is one of these unconditionally ends control
+# flow at that point - nothing after it in the same block can still run
+# - so the line Enter creates lands one level shallower instead of
+# carrying the same indent forward, the same way it would if you'd
+# dedented by hand to start the next statement in the enclosing block.
+_PY_FLOW_DEDENT_KEYWORDS = re.compile(r"^(return|break|continue|pass|raise)\b")
 
 
 def _console_tag_colors(console_bg):
@@ -2056,7 +2062,14 @@ class EditorApp(ttk.Frame):
           between them yet) splits it into three lines instead of one,
           with the cursor indented a level deeper and the closing
           bracket left behind at the original indent - e.g. '{}' becomes
-          '{', an indented blank line with the cursor, then '}'."""
+          '{', an indented blank line with the cursor, then '}'.
+        - In Python, pressing Enter at the end of a line whose statement
+          is a bare 'return', 'break', 'continue', 'pass', or 'raise'
+          (with or without a value/argument) dedents the new line one
+          level, since nothing else in that block can execute after it -
+          covers the same "no closing bracket to hang it off of" gap as
+          the electric else/elif/except/finally dedent, but for the
+          other direction: leaving a block instead of joining one."""
         text = self.text
         with self._single_undo_step():
             if text.tag_ranges("sel"):
@@ -2074,6 +2087,11 @@ class EditorApp(ttk.Frame):
             else:
                 if before_cursor.endswith(_INDENT_AFTER_SUFFIXES):
                     indent += " " * INDENT_WIDTH
+                elif (self._current_language() == "python"
+                        and len(indent) >= INDENT_WIDTH
+                        and before_cursor == full_line.rstrip()
+                        and _PY_FLOW_DEDENT_KEYWORDS.match(full_line.lstrip(" \t"))):
+                    indent = indent[:-INDENT_WIDTH]
                 text.insert("insert", "\n" + indent)
         text.see("insert")
         self._schedule_highlight()
