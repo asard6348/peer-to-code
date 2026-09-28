@@ -202,7 +202,6 @@ class EditorApp(ttk.Frame):
         self._tabs = [first_tab]
         self._active = first_tab
         self.shared_tab = first_tab
-        self._untitled_counter = itertools.count(1)
         self._author_names = {}
         self._dirty = False
         self.dirty = False
@@ -276,8 +275,12 @@ class EditorApp(ttk.Frame):
     _loaded_mtime = _active_tab_attr("loaded_mtime")
 
     def _update_title(self):
+        # Reflects *any* tab having unsaved changes, not just the one
+        # currently on screen - a background tab a peer just dirtied, or
+        # one the user typed into before switching away, shouldn't be
+        # invisible just because it isn't the active tab right now.
         base = "Peer to Code"
-        self.winfo_toplevel().title(f"*{base}*" if self._dirty else base)
+        self.winfo_toplevel().title(f"*{base}*" if self.has_unsaved_tabs() else base)
 
     def _refresh_dirty(self):
         dirty = self.doc != self._saved_doc
@@ -1343,23 +1346,45 @@ class EditorApp(ttk.Frame):
         return self._confirm_discard()
 
     def _confirm_discard_all(self):
-        for tab in list(self.visible_tabs):
-            if tab.dirty and not self._confirm_discard_tab(tab):
-                return False
-        return True
+        """Gate before anything that would throw away every open buffer at
+        once (Disconnect/Close, the window's own close button). One
+        unsaved tab gets exactly the normal single-buffer "Save changes?"
+        prompt (_confirm_discard_tab) - no point asking "save them all?"
+        about one thing. More than one gets a single combined prompt
+        instead of one dialog per tab, and a Yes saves them all via
+        save_all_tabs()."""
+        unsaved = [tab for tab in self.visible_tabs if tab.dirty]
+        if not unsaved:
+            return True
+        if len(unsaved) == 1:
+            return self._confirm_discard_tab(unsaved[0])
+        choice = messagebox.askyesnocancel(
+            "Save changes?",
+            f"{len(unsaved)} tabs have unsaved changes. Save them all before continuing?")
+        if choice is None:
+            return False
+        if not choice:
+            return True
+        return self.save_all_tabs()
 
     def has_unsaved_tabs(self):
         return any(tab.dirty for tab in self.visible_tabs)
 
     def save_all_tabs(self):
-        """Saves every unsaved tab (asking Save As for untitled ones).
-        Returns False if any of them ended up still unsaved."""
-        for tab in list(self.visible_tabs):
-            if tab.dirty:
-                self._switch_to(tab)
-                self.action_save()
-                if self.dirty:
-                    return False
+        """Saves every unsaved tab, returning False if any of them ended
+        up still unsaved. Tabs that already have a file are saved first,
+        silently - then whatever's left (untitled buffers, each needing
+        its own Save As dialog) is prompted for in tab order, so a stack
+        of "Save As" dialogs doesn't get interrupted by a save that
+        should have been silent to begin with."""
+        unsaved = [tab for tab in self.visible_tabs if tab.dirty]
+        already_named = [tab for tab in unsaved if tab.current_file]
+        untitled = [tab for tab in unsaved if not tab.current_file]
+        for tab in already_named + untitled:
+            self._switch_to(tab)
+            self.action_save()
+            if self.dirty:
+                return False
         return True
 
     def _confirm_discard(self):
@@ -1492,9 +1517,12 @@ class EditorApp(ttk.Frame):
         already has it) - it is NOT sent to peers; right-click the tab >
         Share for that. `into_shared` is for the file a session was
         started with, which is meant to be the shared buffer from the
-        start. In Solo mode there's nobody to share with, so opening a
-        file over a still-untouched first tab just fills that tab
-        instead of leaving an empty one behind."""
+        start. Opening a file over a still-untouched shared tab (nobody's
+        typed into it or put a file in it - true whether that's a Solo
+        session's only tab, or the still-blank buffer a host or peer
+        hasn't done anything with yet) just fills that tab and makes the
+        opened file the shared one, instead of leaving an empty, useless
+        tab sitting around next to it."""
         existing = self._find_tab_for_path(path)
         if existing is not None:
             if into_shared:
@@ -1514,9 +1542,9 @@ class EditorApp(ttk.Frame):
         tab.filename_hint = self._share_hint_for(path)
         self._tabs.append(tab)
         old = self.shared_tab
-        pristine_solo = (self.mode == "solo" and old.visible and len(self.visible_tabs) == 2
-                         and old.current_file is None and not old.local_edited and old.doc == "")
-        if into_shared or pristine_solo:
+        pristine_shared = (old.visible and len(self.visible_tabs) == 2
+                            and old.current_file is None and not old.local_edited and old.doc == "")
+        if into_shared or pristine_shared:
             self._make_shared(tab)
         else:
             self._switch_to(tab)
@@ -1647,13 +1675,33 @@ class EditorApp(ttk.Frame):
             return os.path.basename(tab.current_file)
         if tab.shared and tab.filename_hint:
             return os.path.basename(tab.filename_hint)
-        if tab.shared and self.mode != "solo":
-            return "Shared"
         if tab.untitled_no is None:
-            tab.untitled_no = next(self._untitled_counter)
+            tab.untitled_no = self._next_untitled_no()
         return f"Untitled-{tab.untitled_no}"
 
+    def _next_untitled_no(self):
+        """Lowest number not currently shown as "Untitled-N" on any open
+        tab - not just an ever-growing counter, so closing (or saving)
+        Untitled-1 while Untitled-2 stays open frees 1 back up for the
+        next new/blank tab instead of jumping straight to 3."""
+        used = set()
+        for tab in self._tabs:
+            if tab.untitled_no is None:
+                continue
+            if tab.current_file or (tab.shared and tab.filename_hint):
+                continue  # no longer displayed as Untitled-N; number is free
+            used.add(tab.untitled_no)
+        n = 1
+        while n in used:
+            n += 1
+        return n
+
     def _refresh_tabs(self):
+        # Any refresh of the tab strip is a good time to also recheck the
+        # window-title asterisk, since it depends on every tab's dirty
+        # state (see _update_title) and not just the active one - this
+        # covers e.g. a background tab a peer's edit just dirtied.
+        self._update_title()
         bar = getattr(self, "tabbar", None)
         if bar is None:
             return
@@ -1805,10 +1853,30 @@ class EditorApp(ttk.Frame):
                              command=lambda: self._copy_text(self._tab_base_title(tab), "name"))
         menu.add_separator()
         menu.add_command(label="Close", command=lambda: self.close_tab(tab))
+        # tk_popup()'s own local grab is enough to dismiss the menu on a
+        # click inside this window, but it doesn't reliably catch the
+        # pointer leaving the app entirely (clicking another window,
+        # alt-tabbing away) - on several window managers that leaves the
+        # popup's override-redirect toplevel stuck on screen with nothing
+        # left to unpost it. Binding <FocusOut> covers that case
+        # explicitly. <Unmap> fires once the menu *has* gone away, however
+        # that happened (an item picked, Escape, or the FocusOut above),
+        # and is the safe point to destroy it - Tk still delivers any
+        # picked entry's command afterwards, since that's just a bound
+        # Python callable rather than anything that needs the (by-then
+        # unposted) menu widget to still exist.
+        menu.bind("<FocusOut>", lambda _e: menu.unpost())
+        menu.bind("<Unmap>", lambda _e: self.after_idle(self._destroy_tab_menu, menu))
         try:
             menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
+
+    def _destroy_tab_menu(self, menu):
+        try:
+            menu.destroy()
+        except tk.TclError:
+            pass
 
     def _copy_text(self, text, what):
         self.clipboard_clear()
@@ -1886,13 +1954,20 @@ class EditorApp(ttk.Frame):
             old.filename_hint = self._hint_for_tab(old)
             self._tabs.insert(self._tabs.index(old), fresh)
             self.shared_tab = fresh
-            if old is self._active:
-                self.cursor_layer.set_visible(False)
             self._console_write(f"  ({self._tab_base_title(old)} stays open as a local tab)\n", "info")
         else:
             old.visible = True
             old.filename_hint = new_hint
             old.local_edited = old.local_edited and same_file
+        # Peer cursors are offsets into the shared document, so whichever
+        # tab is on screen now, its visibility has to match whether *that*
+        # tab is still the shared one - not just the branch above, which
+        # only reassigns self.shared_tab in the "demoted" case. Recomputing
+        # it unconditionally from the active tab's current .shared flag
+        # (rather than only clearing it inside that one branch) is what
+        # keeps a peer's cursor from lingering, mispositioned, in a tab
+        # that just stopped being shared.
+        self.cursor_layer.set_visible(self._active.shared)
 
     def _prepare_run_target(self):
         """Returns (cmd, target, is_temp) for the buffer to run, or None

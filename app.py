@@ -2,7 +2,6 @@ import re
 import signal
 import sys
 import tkinter as tk
-from tkinter import messagebox
 
 import config
 import theme
@@ -317,14 +316,8 @@ class App:
         Returns False if the person cancelled out of an (optional) prompt
         to save unsaved changes first, meaning the caller should NOT
         proceed with closing."""
-        if ask_to_save and self.editor and self.editor.has_unsaved_tabs():
-            choice = messagebox.askyesnocancel("Save before quitting?", "Save before quitting?")
-            if choice is None:
-                return False
-            if choice:
-                # Every tab with unsaved changes, not just the visible one.
-                if not self.editor.save_all_tabs():
-                    return False
+        if ask_to_save and self.editor and not self.editor._confirm_discard_all():
+            return False
         if self.editor:
             self.editor._persist_ui_state()
             self.editor._unbind_shortcuts()
