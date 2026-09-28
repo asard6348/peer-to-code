@@ -1,5 +1,6 @@
 import re
 import signal
+import sys
 import tkinter as tk
 from tkinter import messagebox
 
@@ -40,6 +41,10 @@ class App:
         self.client = None
         self.server = None
         self._initial_path = initial_path
+        # Height (px) the editor's native X11 menubar adds to the window
+        # on top of what Tk's geometry() reports. 0 everywhere else. See
+        # _measure_menubar_extra.
+        self._menubar_extra = 0
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._install_sigint_handler()
@@ -223,9 +228,41 @@ class App:
         y = max(0, min(y, max(0, screen_h - h)))
         return f"+{x}+{y}"
 
+    def _is_zoomed(self):
+        try:
+            return bool(self.root.attributes("-zoomed"))
+        except tk.TclError:
+            return False
+
+    def _geometry_size(self):
+        m = re.match(r"^(\d+)x(\d+)", self.root.geometry())
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
+    def _measure_menubar_extra(self, before_rooty):
+        """On X11 a native menubar is added on top of the window's
+        client area: the window is a menubar's height taller than Tk's
+        geometry() says. Normally the window manager simply grows the
+        window, so nothing needs correcting - and this must NOT resize
+        or move the window itself (any geometry() call made while the
+        window is mapped can make some window managers re-place it, which
+        showed up as the window jumping down when the editor opened).
+        The one case that needs help is a window already filling the
+        screen (maximized): it can't grow, so the menubar takes its
+        height out of geometry() instead, and the height saved on close
+        would be that much too short - see _cleanup, which adds it back.
+        The menubar's height shows up as a jump in the window's root y,
+        which is how it's measured here. Windows (custom in-window
+        menubar) and macOS (menubar outside the window) have nothing to
+        correct."""
+        if not sys.platform.startswith("linux"):
+            return 0
+        self.root.update_idletasks()
+        return max(0, self.root.winfo_rooty() - before_rooty)
+
     def _show_connect_screen(self):
         self.client = None
         self.server = None
+        self._menubar_extra = 0
         if self.editor:
             self.editor._unbind_shortcuts()
             self.editor._unbind_output_shortcuts()
@@ -246,11 +283,13 @@ class App:
         self.connect_frame.destroy()
         self.connect_frame = None
         extra = extra or {}
+        before_rooty = self.root.winfo_rooty()
         self.editor = EditorApp(self.root, client, server, working_dir, username, mode,
                                  cfg=self.cfg, on_leave=self._show_connect_screen,
                                  p2p_advertise=extra.get("p2p_advertise"),
                                  p2p_advertise_socket=extra.get("p2p_advertise_socket"),
                                  initial_file=extra.get("open_file"))
+        self._menubar_extra = self._measure_menubar_extra(before_rooty)
 
     def _stop_system_theme_watch(self):
         if self._system_theme_job is not None:
@@ -304,6 +343,15 @@ class App:
             ui = self.cfg.setdefault("ui", {})
             m = re.match(r"^(\d+x\d+)([+-]\d+[+-]\d+)$", self.root.geometry())
             size, position = (m.group(1), m.group(2)) if m else (None, None)
+            if size and self.editor and self._menubar_extra and self._is_zoomed():
+                # A maximized window can't grow to make room for the
+                # editor's native menubar, so geometry() comes back that
+                # much shorter than the screen it fills; store the full
+                # height so the next launch matches what was on screen.
+                # (A normal window just grows by the menubar, and its
+                # geometry() height is already the right thing to save.)
+                w, h = (int(v) for v in size.split("x"))
+                size = f"{w}x{h + self._menubar_extra}"
             # Each half is independently opt-in (Settings > Config File):
             # when its checkbox is off, the key is removed from the
             # config entirely rather than merely left unwritten, so the

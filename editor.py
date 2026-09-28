@@ -261,7 +261,16 @@ class EditorApp(ttk.Frame):
         if self._use_custom_menubar:
             root.config(menu="")
             bar = tk.Frame(self, bg=t["bg"], bd=0, highlightthickness=0)
-            bar.pack(side="top", fill="x")
+            # On a rebuild (e.g. after changing shortcuts) the toolbar,
+            # status bar and body are already packed. A plain pack() would
+            # append the bar to the END of the pack order, after the body
+            # has claimed all the space, so it would collapse to nothing.
+            # Insert it ahead of whatever is already packed instead.
+            existing = self.pack_slaves()
+            if existing:
+                bar.pack(side="top", fill="x", before=existing[0])
+            else:
+                bar.pack(side="top", fill="x")
             self._custom_menubar = bar
 
             def add_menu(label):
