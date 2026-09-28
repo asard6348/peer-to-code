@@ -36,6 +36,12 @@ class Client:
         self.state = "synced"
         self.outstanding = None
         self.buffer = None
+        # Optional "this op replaces the whole shared buffer" marker that
+        # travels with the op it belongs to (see local_edit's `swap`).
+        # Tracked next to outstanding/buffer so it survives the same
+        # queueing/composition those go through.
+        self.outstanding_meta = None
+        self.buffer_meta = None
         self.expected_rev = 0
         self.rev_buffer = {}
         self._doc_chunks = {}
@@ -196,23 +202,38 @@ class Client:
         """Host connects to its own server as an ordinary client on localhost."""
         self.connect("127.0.0.1", port, username, extra_hello=extra_hello)
 
-    def local_edit(self, op: ot.Op):
+    def local_edit(self, op: ot.Op, swap=None):
+        """Sends a local edit. `swap`, when given, is a small dict
+        ({"filename": hint-or-None}) marking this op as one that replaces
+        the whole shared buffer with a different document rather than
+        being an ordinary edit. It rides inside the op's own message, so
+        every peer sees it at exactly the right spot in the op stream -
+        which is what lets them keep their old copy of the buffer as a
+        local tab without racing against the (unordered) separate
+        buffer-context message."""
         if op.is_noop():
             return
         with self._lock:
             if self.state == "synced":
                 self.state = "awaiting"
                 self.outstanding = op
+                self.outstanding_meta = swap
                 base_rev = self.expected_rev
-                self._send_op(base_rev, op)
+                self._send_op(base_rev, op, swap)
             elif self.state == "awaiting":
                 self.state = "awaiting_buffer"
                 self.buffer = op
+                self.buffer_meta = swap
             else:
                 self.buffer = ot.compose(self.buffer, op)
+                if swap is not None:
+                    self.buffer_meta = swap
 
-    def _send_op(self, base_rev, op):
-        self.transport.send(self.server_addr, p.OP, {"base_rev": base_rev, "ops": op.to_json()}, reliable=True)
+    def _send_op(self, base_rev, op, swap=None):
+        payload = {"base_rev": base_rev, "ops": op.to_json()}
+        if swap is not None:
+            payload["swap"] = swap
+        self.transport.send(self.server_addr, p.OP, payload, reliable=True)
 
     def send_cursor(self, index, has_selection, sel_start=None, sel_end=None):
         if not self.server_addr:
@@ -236,6 +257,8 @@ class Client:
                     self.state = "synced"
                     self.outstanding = None
                     self.buffer = None
+                    self.outstanding_meta = None
+                    self.buffer_meta = None
                     self._doc_chunks = {}
                     self._doc_total = None
             else:
@@ -278,24 +301,28 @@ class Client:
             payload = self.rev_buffer.pop(self.expected_rev)
             op = ot.Op.from_json(payload["ops"])
             is_mine = payload.get("from") == self.client_id
+            swap = payload.get("swap") if isinstance(payload.get("swap"), dict) else None
             to_apply = None
             if is_mine:
                 self._on_own_ack()
             else:
                 to_apply = self._transform_incoming(op)
             self.expected_rev += 1
-            if to_apply is not None and not to_apply.is_noop():
-                self._fire("remote_op", to_apply, payload.get("from"))
+            if to_apply is not None and (swap is not None or not to_apply.is_noop()):
+                self._fire("remote_op", to_apply, payload.get("from"), swap)
 
     def _on_own_ack(self):
         if self.state == "awaiting":
             self.state = "synced"
             self.outstanding = None
+            self.outstanding_meta = None
         elif self.state == "awaiting_buffer":
             self.state = "awaiting"
             self.outstanding = self.buffer
+            self.outstanding_meta = self.buffer_meta
             self.buffer = None
-            self._send_op(self.expected_rev + 1, self.outstanding)
+            self.buffer_meta = None
+            self._send_op(self.expected_rev + 1, self.outstanding, self.outstanding_meta)
 
     def _transform_incoming(self, op):
         if self.state == "synced":

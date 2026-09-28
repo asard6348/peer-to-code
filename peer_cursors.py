@@ -24,6 +24,13 @@ class PeerCursorLayer:
         self.pad_y = int(text_widget.cget("pady"))
         self.peers = {}
         self.widgets = {}
+        self.visible = True
+
+    def set_visible(self, visible):
+        """Peer cursors are offsets into the shared document, so they're
+        hidden while a local (non-shared) buffer is being shown."""
+        self.visible = bool(visible)
+        self.refresh()
 
     def set_self_id(self, self_id):
         """After a P2P failover promotion, a brand-new Server hands out
@@ -85,6 +92,10 @@ class PeerCursorLayer:
             if not w:
                 continue
             self.text.tag_remove(w["sel_tag"], "1.0", "end")
+            if not self.visible:
+                w["caret"].place_forget()
+                w["label"].place_forget()
+                continue
             if info["sel"]:
                 a, b = info["sel"]
                 if isinstance(a, int) and isinstance(b, int) and b > a:

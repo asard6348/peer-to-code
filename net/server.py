@@ -132,6 +132,12 @@ class Server:
                 op = ot.Op.from_json(payload["ops"])
             except (KeyError, ValueError, TypeError):
                 return
+            swap = payload.get("swap")
+            if isinstance(swap, dict):
+                filename = swap.get("filename")
+                swap = {"filename": filename if isinstance(filename, str) else None}
+            else:
+                swap = None
             base_rev = max(0, min(base_rev, self.revision))
             for hist_op in self.history[base_rev:self.revision]:
                 op, _ = ot.transform(op, hist_op)
@@ -144,7 +150,10 @@ class Server:
             applied_at = self.revision
             self.revision += 1
 
-        self._broadcast(p.OP, {"base_rev": applied_at, "ops": op.to_json(), "from": client_id}, reliable=True)
+        message = {"base_rev": applied_at, "ops": op.to_json(), "from": client_id}
+        if swap is not None:
+            message["swap"] = swap
+        self._broadcast(p.OP, message, reliable=True)
 
     def _resend_full_sync(self, addr):
         with self._lock:

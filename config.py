@@ -82,6 +82,9 @@ DEFAULTS = {
         "indent": "<Control-bracketright>",
         "dedent": "<Control-bracketleft>",
         "undo_peer": "<Alt-z>",
+        "close_tab": "<Control-w>",
+        "next_tab": "<Control-Next>",
+        "prev_tab": "<Control-Prior>",
     },
     "output_shortcuts": {
         "console_interrupt": "<Control-c>",
