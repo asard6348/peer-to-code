@@ -1174,6 +1174,8 @@ class EditorApp(ttk.Frame):
             ui["explorer_width"] = self.explorer.winfo_width()
         if self._console_visible:
             ui["console_height"] = self.console_frame.winfo_height()
+        for dialog in list(FindDialog._instances):
+            dialog._store_state()
         config.save_config(self.cfg)
 
     def action_disconnect(self):
@@ -2423,6 +2425,12 @@ class FindDialog(tk.Toplevel):
     # for the lifetime of the app.
     _last_find = ""
     _last_replace = ""
+    # Dialogs currently open, so EditorApp._persist_ui_state can store their
+    # geometry too when the whole app closes with one still showing (the
+    # window's own <Destroy> then fires after the config was already saved).
+    _instances = []
+
+    _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
 
     def __init__(self, app: EditorApp, replace: bool):
         super().__init__(app)
@@ -2430,8 +2438,15 @@ class FindDialog(tk.Toplevel):
         t = app.theme
         self.title("Replace" if replace else "Find")
         self.configure(bg=t["panel_bg"])
-        self.resizable(False, False)
+        # Width only: the height is fixed by the layout (and differs between
+        # Find and Replace), but a wider box is genuinely useful for long
+        # search strings, and gives "remember size" something real to keep.
+        self.resizable(True, False)
         self.transient(app.winfo_toplevel())
+        for col in (1, 2, 3):
+            self.columnconfigure(col, weight=1)
+        self._last_geometry = None
+        FindDialog._instances.append(self)
 
         tk.Label(self, text="Find:", bg=t["panel_bg"], fg=t["fg"]).grid(row=0, column=0, padx=8, pady=6, sticky="e")
         self.find_var = tk.StringVar()
@@ -2446,9 +2461,14 @@ class FindDialog(tk.Toplevel):
                      insertbackground=t["fg"], relief="flat").grid(
                 row=1, column=1, padx=8, pady=6, columnspan=3, sticky="we")
 
-        self.match_case_var = tk.BooleanVar(value=False)
-        self.whole_word_var = tk.BooleanVar(value=False)
-        self.wrap_var = tk.BooleanVar(value=True)
+        ui_cfg = app.cfg.get("ui", {})
+        defaults = config.DEFAULTS["ui"]
+        self.match_case_var = tk.BooleanVar(
+            value=bool(ui_cfg.get("find_match_case", defaults["find_match_case"])))
+        self.whole_word_var = tk.BooleanVar(
+            value=bool(ui_cfg.get("find_whole_word", defaults["find_whole_word"])))
+        self.wrap_var = tk.BooleanVar(
+            value=bool(ui_cfg.get("find_wrap", defaults["find_wrap"])))
         opts = tk.Frame(self, bg=t["panel_bg"])
         opts.grid(row=2, column=0, columnspan=4, padx=8, pady=(0, 4), sticky="w")
         for label, var in (("Match case", self.match_case_var),
@@ -2474,6 +2494,8 @@ class FindDialog(tk.Toplevel):
         self.bind("<Shift-Return>", lambda e: self.find_previous())
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Configure>", self._on_configure)
+        self._apply_saved_geometry()
         self.replace_var.set(FindDialog._last_replace)
         selected = self._selected_or_empty()
         self.find_var.set(selected or FindDialog._last_find)
@@ -2483,6 +2505,88 @@ class FindDialog(tk.Toplevel):
             self.focus_force()
             find_entry.focus_set()
         self.after(50, _focus)
+
+    def _apply_saved_geometry(self):
+        """Restores the dialog's last width and/or position, whichever of
+        the two Settings > General > Window says to remember. Both are
+        clamped to the current screen (a saved position can be stale after
+        a monitor layout change), and the width never drops below what the
+        buttons need. Anything not remembered is left to the window manager
+        / the layout's natural size."""
+        ui = self.app.cfg.get("ui", {})
+        self.update_idletasks()
+        req_w, req_h = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.minsize(req_w, req_h)
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+
+        width = req_w
+        m = re.match(r"^(\d+)x(\d+)$", ui.get("find_window_size", "") or "")
+        if ui.get("save_find_window_size", True) and m:
+            width = max(req_w, min(int(m.group(1)), screen_w))
+
+        geometry = f"{width}x{req_h}"
+        m = re.match(r"^([+-]-?\d+)([+-]-?\d+)$", ui.get("find_window_position", "") or "")
+        if ui.get("save_find_window_position", True) and m:
+            x = int(m.group(1).lstrip("+"))
+            y = int(m.group(2).lstrip("+"))
+            x = max(0, min(x, max(0, screen_w - width)))
+            y = max(0, min(y, max(0, screen_h - req_h)))
+            geometry += f"+{x}+{y}"
+        try:
+            self.geometry(geometry)
+        except tk.TclError:
+            pass
+
+    def _on_configure(self, event):
+        # Cache the last good geometry as it changes: by the time <Destroy>
+        # fires the window may already be unqueryable, and a minimized
+        # window reports nonsense (e.g. "1x1+-32000+-32000" on Windows), so
+        # only a normal, on-screen state is ever remembered.
+        if event.widget is not self:
+            return
+        try:
+            if self.state() == "normal":
+                self._last_geometry = self.geometry()
+        except tk.TclError:
+            pass
+
+    def _store_state(self):
+        """Writes this dialog's geometry and checkbox states into the app's
+        in-memory config (the caller decides when to flush it to disk).
+        Each half of the geometry is independently opt-in: when its
+        checkbox in Settings is off, the key is removed entirely, mirroring
+        how the main window's own size/position behave."""
+        ui = self.app.cfg.setdefault("ui", {})
+        try:
+            ui["find_match_case"] = bool(self.match_case_var.get())
+            ui["find_whole_word"] = bool(self.whole_word_var.get())
+            ui["find_wrap"] = bool(self.wrap_var.get())
+        except tk.TclError:
+            pass
+
+        # An option that's off means "forget it": drop the saved value
+        # outright rather than leaving a stale one behind.
+        if not ui.get("save_find_window_size", True):
+            ui.pop("find_window_size", None)
+        if not ui.get("save_find_window_position", True):
+            ui.pop("find_window_position", None)
+
+        # Prefer the cached last-good (normal-state) geometry; the live
+        # value is only a fallback, since a minimized window reports junk.
+        candidates = [self._last_geometry]
+        try:
+            if self.state() == "normal":
+                candidates.append(self.geometry())
+        except tk.TclError:
+            pass
+        m = next((mm for mm in (FindDialog._GEOMETRY_RE.match(c or "") for c in candidates) if mm), None)
+        if not m:
+            return
+        w, h, x, y = m.groups()
+        if ui.get("save_find_window_size", True):
+            ui["find_window_size"] = f"{w}x{h}"
+        if ui.get("save_find_window_position", True):
+            ui["find_window_position"] = f"+{int(x.lstrip('+'))}+{int(y.lstrip('+'))}"
 
     def _on_destroy(self, event):
         # <Destroy> bubbles up from every child as the window closes, not
@@ -2494,6 +2598,10 @@ class FindDialog(tk.Toplevel):
         if event.widget is self:
             FindDialog._last_find = self.find_var.get()
             FindDialog._last_replace = self.replace_var.get()
+            if self in FindDialog._instances:
+                FindDialog._instances.remove(self)
+                self._store_state()
+                config.save_config(self.app.cfg)
 
     def _selected_or_empty(self):
         try:

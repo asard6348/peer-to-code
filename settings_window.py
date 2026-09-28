@@ -287,6 +287,8 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg = self.cfg.setdefault("ui", {})
             ui_cfg["save_window_position"] = self.save_window_position_var.get()
             ui_cfg["save_window_size"] = self.save_window_size_var.get()
+            ui_cfg["save_find_window_position"] = self.save_find_window_position_var.get()
+            ui_cfg["save_find_window_size"] = self.save_find_window_size_var.get()
         if self.on_apply:
             try:
                 self.on_apply(set(sections))
@@ -372,6 +374,10 @@ class SettingsWindow(tk.Toplevel):
         self._orig_save_window_size = ui_cfg.get("save_window_size", True)
         self.save_window_position_var = tk.BooleanVar(value=self._orig_save_window_position)
         self.save_window_size_var = tk.BooleanVar(value=self._orig_save_window_size)
+        self._orig_save_find_window_position = ui_cfg.get("save_find_window_position", True)
+        self._orig_save_find_window_size = ui_cfg.get("save_find_window_size", True)
+        self.save_find_window_position_var = tk.BooleanVar(value=self._orig_save_find_window_position)
+        self.save_find_window_size_var = tk.BooleanVar(value=self._orig_save_find_window_size)
 
         section_header(row, "Window")
         row += 1
@@ -389,11 +395,29 @@ class SettingsWindow(tk.Toplevel):
             selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
             highlightthickness=0, anchor="w", command=lambda: self._preview({"ui"}),
         ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+        row += 1
+        self._reg(tk.Checkbutton(
+            rows, text="Remember Find/Replace window position between launches",
+            variable=self.save_find_window_position_var, bg=t["panel_bg"], fg=t["fg"],
+            selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
+            highlightthickness=0, anchor="w", command=lambda: self._preview({"ui"}),
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+        row += 1
+        self._reg(tk.Checkbutton(
+            rows, text="Remember Find/Replace window size between launches",
+            variable=self.save_find_window_size_var, bg=t["panel_bg"], fg=t["fg"],
+            selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
+            highlightthickness=0, anchor="w", command=lambda: self._preview({"ui"}),
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
            activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(2, 4))
         row += 1
         window_desc_label = self._reg(tk.Label(
             rows, text="Unchecking one deletes it from the config file on close, so next time "
-                       "the window opens with that part placed/sized automatically.",
+                       "that window opens with that part placed/sized automatically. "
+                       "(The Find/Replace window's checkboxes - Match case, Whole word, "
+                       "Wrap around - are always remembered.)",
             bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left"),
             bg="panel_bg", fg="muted_fg")
         window_desc_label.grid(row=row, column=0, columnspan=2, sticky="we", padx=4, pady=(0, 10))
@@ -1357,6 +1381,10 @@ class SettingsWindow(tk.Toplevel):
         self._orig_save_window_size = self.cfg["ui"]["save_window_size"]
         self.save_window_position_var.set(self._orig_save_window_position)
         self.save_window_size_var.set(self._orig_save_window_size)
+        self._orig_save_find_window_position = self.cfg["ui"]["save_find_window_position"]
+        self._orig_save_find_window_size = self.cfg["ui"]["save_find_window_size"]
+        self.save_find_window_position_var.set(self._orig_save_find_window_position)
+        self.save_find_window_size_var.set(self._orig_save_find_window_size)
         base_font_size = int(self.cfg["theme"].get("font_size", 11))
         base_font_family = self.cfg["theme"].get("font_family", "Consolas")
         self.cfg["ui"]["explorer_font_size"] = 9
@@ -1523,6 +1551,10 @@ class SettingsWindow(tk.Toplevel):
             changed.add("ui")
         if self.save_window_size_var.get() != self._orig_save_window_size:
             changed.add("ui")
+        if self.save_find_window_position_var.get() != self._orig_save_find_window_position:
+            changed.add("ui")
+        if self.save_find_window_size_var.get() != self._orig_save_find_window_size:
+            changed.add("ui")
         if self.cfg.get("ui", {}).get("explorer_font_size", self._orig_explorer_font_size) \
                 != self._orig_explorer_font_size:
             changed.add("ui")
@@ -1554,6 +1586,8 @@ class SettingsWindow(tk.Toplevel):
         ui_cfg = self.cfg.setdefault("ui", {})
         ui_cfg["save_window_position"] = self.save_window_position_var.get()
         ui_cfg["save_window_size"] = self.save_window_size_var.get()
+        ui_cfg["save_find_window_position"] = self.save_find_window_position_var.get()
+        ui_cfg["save_find_window_size"] = self.save_find_window_size_var.get()
         config.save_config(self.cfg)
 
         self.destroy()
@@ -1594,6 +1628,11 @@ class SettingsWindow(tk.Toplevel):
                 or ui_cfg.get("save_window_size", True) != self._orig_save_window_size):
             ui_cfg["save_window_position"] = self._orig_save_window_position
             ui_cfg["save_window_size"] = self._orig_save_window_size
+            reverted.add("ui")
+        if (ui_cfg.get("save_find_window_position", True) != self._orig_save_find_window_position
+                or ui_cfg.get("save_find_window_size", True) != self._orig_save_find_window_size):
+            ui_cfg["save_find_window_position"] = self._orig_save_find_window_position
+            ui_cfg["save_find_window_size"] = self._orig_save_find_window_size
             reverted.add("ui")
         if ui_cfg.get("explorer_font_size", self._orig_explorer_font_size) != self._orig_explorer_font_size:
             ui_cfg["explorer_font_size"] = self._orig_explorer_font_size

@@ -25,6 +25,18 @@ DEFAULTS = {
         "window_position": "",
         "save_window_position": True,
         "save_window_size": True,
+        # Find/Replace dialog: its own position/size (each independently
+        # opt-in via Settings > General > Window, same as the main window
+        # above - unchecking one deletes its saved value on the next close)
+        # plus the state of its three checkboxes, which are always
+        # remembered. Size is stored as "WxH"; position as "+X+Y".
+        "save_find_window_position": True,
+        "save_find_window_size": True,
+        "find_window_position": "",
+        "find_window_size": "",
+        "find_match_case": False,
+        "find_whole_word": False,
+        "find_wrap": True,
         # Which color theme preset is active ("system", "dark", "light",
         # or the name of a preset saved under "theme_presets" below).
         # "system" means the ten colors under "theme" get refreshed from
