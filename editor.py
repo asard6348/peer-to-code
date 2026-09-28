@@ -650,7 +650,8 @@ class EditorApp(ttk.Frame):
         self.edit_outer = edit_outer
 
         self.tabbar = TabBar(edit_outer, t, on_select=self._on_tab_select,
-                              on_close=self._on_tab_close_request, on_context=self._show_tab_menu)
+                              on_close=self._on_tab_close_request, on_context=self._show_tab_menu,
+                              on_move=self._on_tab_move)
         self.tabbar.pack(side="top", fill="x")
         dnd_support.register_drop(self.tabbar, self._on_explorer_drop)
         dnd_support.register_drop(edit_outer, self._on_explorer_drop)
@@ -1506,6 +1507,12 @@ class EditorApp(ttk.Frame):
     def _same_path(a, b):
         return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
+    @staticmethod
+    def _is_blank_local_tab(tab):
+        """A local tab with no file and nothing in it."""
+        return (not tab.shared and tab.visible and tab.current_file is None
+                and tab.doc == "" and tab.saved_doc == "")
+
     def _find_tab_for_path(self, path):
         for tab in self.visible_tabs:
             if tab.current_file and self._same_path(tab.current_file, path):
@@ -1540,14 +1547,25 @@ class EditorApp(ttk.Frame):
         tab.current_file = path
         tab.loaded_mtime = self._safe_mtime(path)
         tab.filename_hint = self._share_hint_for(path)
+        # An empty, never-saved local tab that's on screen is just a
+        # placeholder - the opened file takes its place (same slot in the
+        # strip) instead of leaving it sitting there.
+        blank = self._active if self._is_blank_local_tab(self._active) else None
         self._tabs.append(tab)
+        if blank is not None:
+            self._tabs.remove(tab)
+            self._tabs.insert(self._tabs.index(blank), tab)
         old = self.shared_tab
-        pristine_shared = (old.visible and len(self.visible_tabs) == 2
+        others = [t for t in self.visible_tabs if t is not tab and t is not blank]
+        pristine_shared = (old.visible and others == [old]
                             and old.current_file is None and not old.local_edited and old.doc == "")
         if into_shared or pristine_shared:
             self._make_shared(tab)
         else:
             self._switch_to(tab)
+        if blank is not None and blank in self._tabs:
+            self._tabs.remove(blank)
+            self._refresh_tabs()
 
     def action_save(self):
         if not self.current_file:
@@ -1804,6 +1822,10 @@ class EditorApp(ttk.Frame):
         self.close_tab(self._active)
 
     def close_tab(self, tab):
+        if tab.shared and self.mode != "solo":
+            # The shared tab can't be closed - it is the session's document.
+            # Closing it offers to clear it instead.
+            return self._clear_shared_tab(tab)
         if not self._confirm_discard_tab(tab):
             return False
         tabs = self.visible_tabs
@@ -1832,6 +1854,65 @@ class EditorApp(ttk.Frame):
             self._refresh_tabs()
         return True
 
+    def _clear_shared_tab(self, tab):
+        """Asks whether to really clear the shared buffer (for everyone in
+        the session); if so, empties it and renames the tab to Untitled.
+        Returns True if it was cleared."""
+        if tab.doc == "" and tab.current_file is None and not tab.filename_hint:
+            self._set_status("Clear shared buffer")
+            return False
+        if not messagebox.askyesno(
+                "Clear Shared Buffer",
+                "Clear the shared buffer? "
+                "Its contents will be removed for everyone in the session and the tab "
+                "will be renamed to Untitled."):
+            return False
+        if not self._confirm_discard_tab(tab):
+            return False
+        old_doc = tab.doc
+        tab.current_file = None
+        tab.loaded_mtime = None
+        tab.filename_hint = None
+        tab.untitled_no = None
+        tab.local_edited = False
+        tab.doc = ""
+        tab.saved_doc = ""
+        tab.history.reset()
+        tab.caret = 0
+        tab.yview = 0.0
+        if tab is self._active:
+            self._suppress_capture = True
+            try:
+                self.text.delete("1.0", "end")
+            finally:
+                self._suppress_capture = False
+        # Sent as a buffer swap so peers with their own edits/files in the
+        # shared tab keep them as local tabs, like any other replacement.
+        self.client.local_edit(ot.diff_to_op(old_doc, ""), {"filename": None})
+        self.client.send_buffer_context(None)
+        if tab is self._active:
+            self._display_active()
+        else:
+            self._refresh_tabs()
+        return True
+
+    def _on_tab_move(self, tab_id, index):
+        """Drag-and-drop reorder: `index` is the position among the visible
+        tabs other than the moved one."""
+        tab = self._tab_by_id(tab_id)
+        if tab is None or not tab.visible:
+            return
+        others = [t for t in self.visible_tabs if t is not tab]
+        index = max(0, min(index, len(others)))
+        self._tabs.remove(tab)
+        if not others:
+            self._tabs.append(tab)
+        elif index >= len(others):
+            self._tabs.insert(self._tabs.index(others[-1]) + 1, tab)
+        else:
+            self._tabs.insert(self._tabs.index(others[index]), tab)
+        self._refresh_tabs()
+
     def _show_tab_menu(self, tab_id, x_root, y_root):
         tab = self._tab_by_id(tab_id)
         if tab is None:
@@ -1852,7 +1933,10 @@ class EditorApp(ttk.Frame):
             menu.add_command(label="Copy Name",
                              command=lambda: self._copy_text(self._tab_base_title(tab), "name"))
         menu.add_separator()
-        menu.add_command(label="Close", command=lambda: self.close_tab(tab))
+        if tab.shared and self.mode != "solo":
+            menu.add_command(label="Clear Shared Buffer...", command=lambda: self.close_tab(tab))
+        else:
+            menu.add_command(label="Close", command=lambda: self.close_tab(tab))
         # tk_popup()'s own local grab is enough to dismiss the menu on a
         # click inside this window, but it doesn't reliably catch the
         # pointer leaving the app entirely (clicking another window,

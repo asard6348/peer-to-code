@@ -2,7 +2,7 @@
 
 Purely presentational: it knows nothing about buffers, files or the
 network. EditorApp hands it a list of plain dicts through render() and gets
-callbacks back (select / close / context menu), so all the state lives in
+callbacks back (select / close / context menu / move), so all the state lives in
 one place - the editor.
 """
 
@@ -14,12 +14,15 @@ _IS_MAC = sys.platform == "darwin"
 
 
 class TabBar(tk.Frame):
-    def __init__(self, master, theme, on_select, on_close, on_context):
+    def __init__(self, master, theme, on_select, on_close, on_context, on_move=None):
         super().__init__(master, bg=theme["bg"], highlightthickness=0, bd=0)
         self.theme = theme
         self.on_select = on_select
         self.on_close = on_close
         self.on_context = on_context
+        self.on_move = on_move
+        self._drag = None
+        self._indicator = None
         self._tabs = []
         self._active_id = None
         self._cells = {}
@@ -46,6 +49,7 @@ class TabBar(tk.Frame):
         """tabs: list of dicts {id, title, shared, dirty, tooltip}."""
         self._tabs = list(tabs)
         self._active_id = active_id
+        self._end_drag()
         for child in self.inner.winfo_children():
             child.destroy()
         self._cells = {}
@@ -107,7 +111,11 @@ class TabBar(tk.Frame):
         closer.bind("<Button-1>", lambda _e, i=tab["id"]: (self.on_close(i), "break")[1])
 
         for w in widgets:
-            w.bind("<Button-1>", lambda _e, i=tab["id"]: self.on_select(i))
+            # Selection happens on release (not press) so that a drag can
+            # start without the tab strip being re-rendered underneath it.
+            w.bind("<Button-1>", lambda e, i=tab["id"]: self._on_press(e, i))
+            w.bind("<B1-Motion>", self._on_drag)
+            w.bind("<ButtonRelease-1>", lambda e, i=tab["id"]: self._on_release(e, i))
             w.bind("<Button-2>" if not _IS_MAC else "<Button-3>",
                    lambda _e, i=tab["id"]: self.on_close(i))
             self._bind_context(w, tab["id"])
@@ -116,6 +124,81 @@ class TabBar(tk.Frame):
         self._bind_scroll(closer)
         self._bind_scroll(cell)
         return cell
+
+    # ---- drag to reorder --------------------------------------------
+
+    _DRAG_THRESHOLD = 5
+
+    def _on_press(self, event, tab_id):
+        self._drag = {"id": tab_id, "x0": event.x_root, "active": False, "index": None}
+
+    def _on_drag(self, event):
+        drag = self._drag
+        if drag is None or self.on_move is None:
+            return
+        if not drag["active"]:
+            if abs(event.x_root - drag["x0"]) < self._DRAG_THRESHOLD:
+                return
+            drag["active"] = True
+            self._indicator = tk.Frame(self.inner, bg=self.theme["accent"], width=3)
+        # Scroll the strip when the pointer is pushed against either edge.
+        left = self.canvas.winfo_rootx()
+        right = left + self.canvas.winfo_width()
+        if event.x_root < left:
+            self._scroll(-1)
+        elif event.x_root > right:
+            self._scroll(1)
+        drag["index"] = self._drop_index(event.x_root, drag["id"])
+        self._place_indicator(drag["index"], drag["id"])
+
+    def _on_release(self, event, tab_id):
+        drag, self._drag = self._drag, None
+        active = bool(drag and drag["active"])
+        index = drag["index"] if drag else None
+        self._remove_indicator()
+        if active and index is not None and self.on_move is not None:
+            self.on_move(tab_id, index)
+        self.on_select(tab_id)
+
+    def _end_drag(self):
+        self._drag = None
+        self._remove_indicator()
+
+    def _remove_indicator(self):
+        if self._indicator is not None:
+            try:
+                self._indicator.destroy()
+            except tk.TclError:
+                pass
+            self._indicator = None
+
+    def _others(self, dragged_id):
+        return [t["id"] for t in self._tabs if t["id"] != dragged_id and t["id"] in self._cells]
+
+    def _drop_index(self, x_root, dragged_id):
+        """Position (among the tabs other than the dragged one) it would be
+        inserted at if dropped at x_root."""
+        index = 0
+        for tid in self._others(dragged_id):
+            cell = self._cells[tid]
+            if x_root > cell.winfo_rootx() + cell.winfo_width() / 2:
+                index += 1
+        return index
+
+    def _place_indicator(self, index, dragged_id):
+        if self._indicator is None:
+            return
+        others = self._others(dragged_id)
+        if not others:
+            self._indicator.place_forget()
+            return
+        if index < len(others):
+            x = self._cells[others[index]].winfo_x() - 2
+        else:
+            last = self._cells[others[-1]]
+            x = last.winfo_x() + last.winfo_width() + 1
+        self._indicator.place(x=max(x, 0), y=0, width=3, height=self.inner.winfo_height())
+        self._indicator.lift()
 
     def _bind_context(self, widget, tab_id):
         def fire(event):
