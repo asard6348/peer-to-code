@@ -1,8 +1,7 @@
+import bisect
 import builtins
-import io
 import keyword
 import re
-import tokenize
 
 AUTO_COLOR_THEME = "auto"
 
@@ -358,128 +357,124 @@ def highlight(text_widget, language="python"):
         _highlight_regex(text_widget, source, language)
 
 
-_FSTRING_START = getattr(tokenize, "FSTRING_START", None)
-_FSTRING_END = getattr(tokenize, "FSTRING_END", None)
+_PY_STRING_PREFIX = re.compile(r"(?:[rRbBuUfF]{1,2})(?=[\"'])")
+_PY_NAME = re.compile(r"[^\W\d]\w*")
+_PY_NUMBER = re.compile(r"\.?\d(?:[\w]|\.(?!\.))*")
+
+
+def _py_scan_string(src, i, quote, triple, is_f, n):
+    """Returns the index just past the string literal whose body starts at
+    `i` (right after its opening quote). Never fails: an unterminated
+    single-quote string ends at the end of its line, an unterminated
+    triple-quoted one at the end of the buffer - the way every editor
+    colors a string that's still being typed - so the half-typed literal
+    itself is colored and nothing after it is affected."""
+    depth = 0
+    while i < n:
+        c = src[i]
+        if c == "\\":
+            i += 2
+            continue
+        if triple:
+            if src.startswith(quote * 3, i) and depth == 0:
+                return i + 3
+        else:
+            if c == "\n":
+                return i
+            if c == quote and depth == 0:
+                return i + 1
+        if is_f:
+            if c == "{":
+                if depth == 0 and src.startswith("{{", i):
+                    i += 2
+                    continue
+                depth += 1
+            elif c == "}" and depth > 0:
+                depth -= 1
+            elif depth > 0 and c in "\"'" and not (c == quote and not triple):
+                # A string nested inside a replacement field: {d["k"]}
+                q3 = src.startswith(c * 3, i)
+                i = _py_scan_string(src, i + (3 if q3 else 1), c, q3, False, n)
+                continue
+        i += 1
+    return n
 
 
 def _highlight_python(text_widget, source):
-    tokens = _tokenize_best_effort(source)
+    """Hand-written scanner instead of tokenize: tokenize raises on any
+    half-typed construct, and recovering by re-tokenizing the remainder as a
+    fresh chunk loses the indent stack, so the next dedented line raises
+    again and gets skipped (left uncolored). This scanner has no error
+    states, so every line is colored independently of what's broken above."""
+    n = len(source)
+    line_starts = [0]
+    pos = source.find("\n")
+    while pos != -1:
+        line_starts.append(pos + 1)
+        pos = source.find("\n", pos + 1)
+
+    def idx(off):
+        row = bisect.bisect_right(line_starts, off) - 1
+        return f"{row + 1}.{off - line_starts[row]}"
+
+    def add(tag, a, b):
+        if b > a:
+            text_widget.tag_add(tag, idx(a), idx(b))
+
+    i = 0
     expect_definition = False
-    prev_is_dot = False
-    i, n = 0, len(tokens)
+    prev_dot = False
     while i < n:
-        ttype, tstr, (srow, scol), (erow, ecol), _line = tokens[i]
-        if not tstr:
+        c = source[i]
+        if c in " \t\r\n\f\\":
             i += 1
             continue
-
-        if _FSTRING_START is not None and ttype == _FSTRING_START:
-            start = (srow, scol)
-            open_end = (erow, ecol)
-            depth = 1
-            j = i + 1
-            end = None
-            while j < n:
-                jtype, jstr, _jstart, jend, _jline = tokens[j]
-                if jtype == _FSTRING_START:
-                    depth += 1
-                elif jtype == _FSTRING_END:
-                    depth -= 1
-                    if depth == 0:
-                        end = jend
-                        j += 1
-                        break
-                j += 1
-            if end is not None:
-                # Found the matching FSTRING_END - tag the whole literal,
-                # same as before.
-                text_widget.tag_add("string", f"{start[0]}.{start[1]}", f"{end[0]}.{end[1]}")
-                i = j
-            else:
-                # No matching FSTRING_END anywhere in the rest of the
-                # token stream - the normal, constant state while someone
-                # is mid-way through typing an f-string (just after the
-                # opening f"/f', before its closing quote lands), and
-                # also what's left once error recovery re-tokenizes past
-                # a genuinely broken one. Without this branch the loop
-                # above would run to the end of `tokens`, so every line
-                # typed below the open quote - a "def" two lines down,
-                # say - gets folded into one giant "string" tag instead
-                # of keeping its own color. Tag only the opening quote
-                # itself and let everything after it, including the
-                # f-string's own unfinished contents, fall through to the
-                # normal per-token handling below.
-                text_widget.tag_add("string", f"{start[0]}.{start[1]}", f"{open_end[0]}.{open_end[1]}")
-                i += 1
-            expect_definition = False
-            prev_is_dot = False
+        if c == "#":
+            j = source.find("\n", i)
+            j = n if j == -1 else j
+            add("comment", i, j)
+            i = j
             continue
-
-        tag = None
-        if ttype == tokenize.COMMENT:
-            tag = "comment"
-        elif ttype == tokenize.STRING:
-            tag = "string"
-        elif ttype == tokenize.NAME:
+        start = i
+        is_f = False
+        m = _PY_STRING_PREFIX.match(source, i)
+        if m or c in "\"'":
+            if m:
+                is_f = "f" in m.group().lower()
+                i = m.end()
+            quote = source[i]
+            triple = source.startswith(quote * 3, i)
+            i = _py_scan_string(source, i + (3 if triple else 1), quote, triple, is_f, n)
+            add("string", start, i)
+            expect_definition = prev_dot = False
+            continue
+        m = _PY_NAME.match(source, i)
+        if m:
+            word = m.group()
             if expect_definition:
                 tag = "definition"
-            elif tstr in KEYWORDS:
+            elif word in KEYWORDS:
                 tag = "keyword"
-            elif tstr in SOFT_KEYWORDS:
+            elif word in SOFT_KEYWORDS:
                 tag = "softkeyword"
-            elif not prev_is_dot and tstr in BUILTIN_NAMES:
+            elif not prev_dot and word in BUILTIN_NAMES:
                 tag = "builtin"
-        elif ttype == tokenize.ERRORTOKEN:
-            tag = "error_tok"
-        if tag:
-            text_widget.tag_add(tag, f"{srow}.{scol}", f"{erow}.{ecol}")
-
-        if ttype not in (tokenize.NEWLINE, tokenize.NL, tokenize.INDENT, tokenize.DEDENT, tokenize.COMMENT):
-            expect_definition = (ttype == tokenize.NAME and tstr in ("def", "class"))
-            prev_is_dot = (ttype == tokenize.OP and tstr == ".")
-        i += 1
-
-
-def _tokenize_best_effort(source):
-    """Real tokenize() raises on unterminated strings / bad indentation, which
-    is the normal state of a buffer mid-edit - e.g. the instant after typing
-    an opening quote, before its closing one. Collecting only the tokens
-    gathered before that error isn't enough on its own: generate_tokens is a
-    generator, so once it raises it's dead and can never produce tokens for
-    anything after that point either - which would otherwise blank out every
-    line below the one currently being edited, not just the broken bit.
-    So on error we re-tokenize the remaining lines as their own fresh chunk
-    and keep going, one error at a time, rather than giving up on the whole
-    rest of the buffer."""
-    out = []
-    lines = source.splitlines(keepends=True)
-    start = 0
-    while start < len(lines):
-        chunk = "".join(lines[start:])
-        try:
-            for ttype, tstr, (srow, scol), (erow, ecol), tline in tokenize.generate_tokens(io.StringIO(chunk).readline):
-                if start:
-                    srow += start
-                    erow += start
-                out.append((ttype, tstr, (srow, scol), (erow, ecol), tline))
-            break
-        except (tokenize.TokenError, IndentationError, SyntaxError, ValueError) as e:
-            # Resume just past the offending line so we don't loop forever
-            # re-hitting the same error on an unchanged remainder. Where
-            # that line is is reported differently by different error
-            # types: TokenError's args[1] is (row, col); SyntaxError (and
-            # IndentationError, a subclass of it) instead carries it as
-            # the .lineno attribute - its own args[1] is an unrelated
-            # (filename, lineno, offset, text, ...) tuple, not (row, col).
-            if isinstance(e, tokenize.TokenError):
-                err_row = e.args[1][0] if len(e.args) > 1 and isinstance(e.args[1], tuple) and e.args[1] else None
             else:
-                err_row = getattr(e, "lineno", None)
-            advance = err_row if isinstance(err_row, int) and err_row > 0 else 1
-            start += max(advance, 1)
-        except StopIteration:
-            break
-    return out
+                tag = None
+            if tag:
+                add(tag, i, m.end())
+            expect_definition = word in ("def", "class")
+            prev_dot = False
+            i = m.end()
+            continue
+        m = _PY_NUMBER.match(source, i)
+        if m:
+            i = m.end()
+            expect_definition = prev_dot = False
+            continue
+        prev_dot = c == "." and source[i - 1:i] != "." and source[i + 1:i + 2] != "."
+        expect_definition = False
+        i += 1
 
 
 _BASH_KEYWORDS = {
@@ -1328,9 +1323,18 @@ _LANG_SPECS = {
 def _compile_lang(spec):
     parts = []
     if "comment" in spec:
-        parts.append(f"(?P<comment>{spec['comment']})")
+        # An unclosed block comment runs to the end of the buffer.
+        fallback = r"|/\*[\s\S]*" if r"/\*" in spec["comment"] else ""
+        parts.append(f"(?P<comment>{spec['comment']}{fallback})")
     if "string" in spec:
-        parts.append(f"(?P<string>{spec['string']})")
+        # Second alternative: a half-typed string. Only tried where the
+        # real pattern failed, so it colors an unclosed quote to the end
+        # of its line instead of leaving it uncolored - and, by consuming
+        # it, keeps its contents from being lexed as code.
+        fallback = "".join(
+            f"|{q}[^{q}\\n]*" for q in ('"', "'") if q in spec["string"]
+        )
+        parts.append(f"(?P<string>{spec['string']}{fallback})")
     if "decorator_pat" in spec:
         parts.append(f"(?P<decorator>{spec['decorator_pat']})")
     if "preproc" in spec:

@@ -1956,12 +1956,6 @@ class EditorApp(ttk.Frame):
                     elif stripped.startswith("#"):
                         idx = line.index("#")
                         self.text.delete(f"{n}.{idx}", f"{n}.{idx + 1}")
-        # Toggle Comment is reachable from the Edit menu (a plain mouse
-        # click), not just its "Ctrl+/" shortcut, so it can't count on a
-        # keystroke elsewhere scheduling the recolor for it - the '#'
-        # just inserted or removed on each line would otherwise sit
-        # uncolored (or wrongly still tagged "comment") until the next
-        # unrelated edit.
         self._schedule_highlight()
         return "break"
 
@@ -1969,10 +1963,6 @@ class EditorApp(ttk.Frame):
         line_no = int(self.text.index("insert").split(".")[0])
         content = self.text.get(f"{line_no}.0", f"{line_no}.end")
         self.text.insert(f"{line_no}.end", "\n" + content)
-        # Same reasoning as Toggle Comment above: Duplicate Line is also
-        # a menu item, so the new line can't rely on a keystroke to
-        # trigger its highlighting - without this it stays uncolored
-        # until something else happens to touch the buffer.
         self._schedule_highlight()
         return "break"
 
@@ -2001,10 +1991,6 @@ class EditorApp(ttk.Frame):
             self.text.insert(f"{lo}.0", new_pair[0] + "\n" + new_pair[1])
         self.text.mark_set("insert", f"{target}.{col}")
         self.text.see("insert")
-        # The moved lines were deleted and reinserted, which drops
-        # whatever color tags they had - explicitly reschedule rather
-        # than counting on the Alt+Up/Down keypress's own KeyRelease to
-        # happen to fire this too.
         self._schedule_highlight()
         return "break"
 
