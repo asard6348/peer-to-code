@@ -11,7 +11,9 @@ import tempfile
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 
+import interpreters
 import ot
 import syntax
 import config
@@ -604,14 +606,28 @@ class EditorApp(ttk.Frame):
         self.stop_btn.pack(side="left", pady=4)
         self.interp_label = tk.Label(toolbar, text="Interpreter:", bg=t["bg"], fg=t["fg"])
         self.interp_label.pack(side="left", padx=(16, 4))
-        self.run_cmd = tk.StringVar(value=sys.executable)
+        self.run_cmd = tk.StringVar(value="")
         self.run_cmd_entry = tk.Entry(toolbar, textvariable=self.run_cmd, width=28, bg=t["edit_bg"], fg=t["fg"],
                                        insertbackground=t["fg"], relief="flat")
         self.run_cmd_entry.pack(side="left", fill="x", expand=True)
         self.run_cmd.trace_add("write", self._on_run_cmd_edited)
 
-        self.file_path_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["muted_fg"], anchor="w")
+        # width=1 keeps the label's requested size fixed no matter how long
+        # (or how far scrolled) its text is - it just takes whatever room
+        # the toolbar has left. The text itself is scrolled by hand, see
+        # _render_file_path.
+        self.file_path_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["muted_fg"], anchor="w", width=1)
         self.file_path_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
+        self._path_full_text = ""
+        self._path_offset = 0
+        self._path_drag = None
+        for seq in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>",
+                    "<Shift-Button-4>", "<Shift-Button-5>"):
+            self.file_path_label.bind(seq, self._on_path_wheel)
+        self.file_path_label.bind("<ButtonPress-1>", self._on_path_drag_start)
+        self.file_path_label.bind("<B1-Motion>", self._on_path_drag)
+        self.file_path_label.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_path_drag", None))
+        self.file_path_label.bind("<Configure>", lambda _e: self._render_file_path())
 
         status = tk.Frame(self, bg=t["status_bg"], height=22)
         status.pack(fill="x", side="bottom")
@@ -1024,29 +1040,97 @@ class EditorApp(ttk.Frame):
     def _run_command_key(self, language):
         return language or "plaintext"
 
+    def _use_global_interpreter(self):
+        return bool(self.cfg.get("editor", {}).get("use_global_interpreter", False))
+
     def _on_run_cmd_edited(self, *_args):
         if self._suppress_run_cmd_trace:
             return
-        key = self._run_command_key(self._current_language())
         value = self.run_cmd.get().strip()
+        if self._use_global_interpreter():
+            self.cfg.setdefault("editor", {})["global_interpreter"] = value
+            return
+        key = self._run_command_key(self._current_language())
         if value:
             self._run_commands[key] = value
         else:
             self._run_commands.pop(key, None)
 
     def _recall_run_command(self, language):
-        """Swaps the Interpreter box to whatever command was last used for
-        `language`, if anything was - leaving it untouched otherwise, so
-        switching to a file type with no memorized command yet doesn't
-        blank out or guess-overwrite what's already typed there."""
-        remembered = self._run_commands.get(self._run_command_key(language))
-        if not remembered or remembered == self.run_cmd.get():
+        """Puts the interpreter for `language` into the Interpreter box:
+        the global one when that option is on, else whatever was
+        remembered for this file type, else an auto-detected runner (which
+        then gets remembered too). A file type with nothing remembered or
+        detectable shows an empty box instead of keeping the previous
+        type's command. A remembered command that is just this packaged
+        app's own executable is dropped, since it can't run scripts."""
+        if self._use_global_interpreter():
+            target = self.cfg.get("editor", {}).get("global_interpreter", "")
+        else:
+            key = self._run_command_key(language)
+            target = self._run_commands.get(key, "")
+            if target and interpreters.is_self_executable(target, self.working_dir):
+                self._run_commands.pop(key, None)
+                target = ""
+            if not target:
+                target = interpreters.detect(language)
+                if target:
+                    self._run_commands[key] = target
+        if target == self.run_cmd.get():
             return
         self._suppress_run_cmd_trace = True
         try:
-            self.run_cmd.set(remembered)
+            self.run_cmd.set(target)
         finally:
             self._suppress_run_cmd_trace = False
+
+    def _ask_set_interpreter(self):
+        """Small prompt shown when Run finds no usable interpreter. Returns
+        True if the person wants to set it by hand."""
+        t = self.theme
+        top = self.winfo_toplevel()
+        dlg = tk.Toplevel(top)
+        dlg.title("Run")
+        dlg.configure(bg=t["panel_bg"], highlightthickness=1,
+                      highlightbackground=t["border"], highlightcolor=t["border"])
+        dlg.transient(top)
+        dlg.resizable(False, False)
+        answer = {"set": False}
+
+        def finish(value):
+            answer["set"] = value
+            dlg.destroy()
+
+        tk.Label(dlg, text="Interpreter not found.\nSet it manually?", bg=t["panel_bg"], fg=t["fg"],
+                 justify="left").pack(padx=24, pady=(18, 12))
+        buttons = tk.Frame(dlg, bg=t["panel_bg"])
+        buttons.pack(pady=(0, 14))
+        set_btn = tk.Button(buttons, text="Set manually", command=lambda: finish(True), bg=t["panel_bg"],
+                            fg=t["fg"], activebackground=t["sel_bg"], activeforeground=t["fg"], padx=10)
+        set_btn.pack(side="left", padx=6)
+        tk.Button(buttons, text="Cancel", command=lambda: finish(False), bg=t["panel_bg"], fg=t["fg"],
+                  activebackground=t["sel_bg"], activeforeground=t["fg"], padx=10).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda _e: finish(True))
+        dlg.bind("<Escape>", lambda _e: finish(False))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+
+        dlg.update_idletasks()
+        x = top.winfo_rootx() + max(0, (top.winfo_width() - dlg.winfo_reqwidth()) // 2)
+        y = top.winfo_rooty() + max(0, (top.winfo_height() - dlg.winfo_reqheight()) // 3)
+        dlg.geometry(f"+{x}+{y}")
+        set_btn.focus_set()
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        dlg.wait_window()
+        return answer["set"]
+
+    def _focus_interpreter_entry(self):
+        self.run_cmd_entry.focus_set()
+        self.run_cmd_entry.select_range(0, "end")
+        self.run_cmd_entry.icursor("end")
 
     def _on_local_insert(self, offset, text):
         self._redraw_linenumbers()
@@ -1444,7 +1528,59 @@ class EditorApp(ttk.Frame):
             text = ""
         else:
             text = "(unsaved buffer)"
-        self.file_path_label.configure(text=text)
+        if text != self._path_full_text:
+            self._path_full_text = text
+            self._path_offset = 0
+        self._render_file_path()
+
+    def _path_max_offset(self):
+        """How many leading characters can be scrolled off before the end
+        of the path is fully visible (0 when it all fits already)."""
+        label = self.file_path_label
+        text = self._path_full_text
+        pad = 2 * (int(label.cget("padx")) + int(label.cget("bd")) + int(label.cget("highlightthickness")))
+        avail = label.winfo_width() - pad
+        if avail <= 1 or not text:
+            return 0
+        font = tkfont.Font(font=label.cget("font"))
+        if font.measure(text) <= avail:
+            return 0
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if font.measure(text[mid:]) <= avail:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _render_file_path(self):
+        self._path_offset = max(0, min(self._path_offset, self._path_max_offset()))
+        shown = self._path_full_text[self._path_offset:]
+        if self.file_path_label.cget("text") != shown:
+            self.file_path_label.configure(text=shown)
+
+    def _on_path_wheel(self, event):
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+        self._path_offset += step * 3
+        self._render_file_path()
+        return "break"
+
+    def _on_path_drag_start(self, event):
+        self._path_drag = (event.x_root, self._path_offset)
+
+    def _on_path_drag(self, event):
+        if not self._path_drag:
+            return
+        start_x, start_offset = self._path_drag
+        char_w = max(1, tkfont.Font(font=self.file_path_label.cget("font")).measure("0"))
+        self._path_offset = start_offset + round((start_x - event.x_root) / char_w)
+        self._render_file_path()
 
     def action_new(self):
         """A new, empty, local tab - like opening a file, it doesn't touch
@@ -2068,7 +2204,11 @@ class EditorApp(ttk.Frame):
         run - falls back to a temp file, and even then it's written to
         the OS temp directory rather than the project folder, and
         removed again once the run finishes (see _watch_run_proc)."""
-        cmd = self.run_cmd.get().strip() or sys.executable
+        cmd = self.run_cmd.get().strip()
+        if not interpreters.is_valid(cmd, self.working_dir):
+            if self._ask_set_interpreter():
+                self._focus_interpreter_entry()
+            return None
         if self.current_file is not None:
             if self.dirty:
                 self.action_save()
@@ -2081,13 +2221,22 @@ class EditorApp(ttk.Frame):
             return cmd, self.current_file, False
 
         try:
-            fd, target = tempfile.mkstemp(prefix="peer2code_run_", suffix=".py")
+            fd, target = tempfile.mkstemp(prefix="peer2code_run_", suffix=self._temp_run_suffix())
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(self.text.get("1.0", "end-1c"))
         except OSError as e:
             messagebox.showerror("Run", str(e))
             return None
         return cmd, target, True
+
+    def _temp_run_suffix(self):
+        """File extension for an unsaved buffer's temp copy, matching its
+        language so the interpreter sees the kind of file it expects."""
+        language = self._current_language()
+        for ext, lang in syntax.EXTENSION_LANGUAGE.items():
+            if lang == language:
+                return ext
+        return ".txt"
 
     def action_run(self):
         if self.run_proc and self.run_proc.poll() is None:
@@ -2100,7 +2249,8 @@ class EditorApp(ttk.Frame):
         self.ansi_console.state.reset()
         self._ensure_newline()
         self._console_write(f"$ {cmd} {os.path.basename(target)}\n", "info")
-        self._launch_process([cmd, target], cleanup_path=(target if is_temp else None))
+        self._launch_process(interpreters.split_command(cmd) + [target],
+                             cleanup_path=(target if is_temp else None))
 
     def _run_terminal_command(self, command):
         """Runs a line typed straight at the Terminal's own $ prompt as a

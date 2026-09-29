@@ -120,6 +120,10 @@ class SettingsWindow(tk.Toplevel):
             "terminal_messages", dict(config.DEFAULTS["editor"]["terminal_messages"])))
         self._orig_word_wrap = cfg.setdefault("editor", {}).get(
             "word_wrap", config.DEFAULTS["editor"]["word_wrap"])
+        self._orig_run_commands = dict(cfg["editor"].get("run_commands", {}))
+        self._orig_use_global_interpreter = bool(cfg["editor"].get("use_global_interpreter", False))
+        self._orig_global_interpreter = cfg["editor"].get("global_interpreter", "")
+        self._interp_preview_job = None
         ui_cfg_init = cfg.setdefault("ui", {})
         self._orig_explorer_font_family = ui_cfg_init.get(
             "explorer_font_family", getattr(app, "_explorer_font_family", "sans-serif"))
@@ -384,6 +388,14 @@ class SettingsWindow(tk.Toplevel):
         self.save_find_window_position_var = tk.BooleanVar(value=self._orig_save_find_window_position)
         self.save_find_window_size_var = tk.BooleanVar(value=self._orig_save_find_window_size)
 
+        section_header(row, "Run")
+        row += 1
+        self._row_label(rows, row, "File-type-specific execution interpreters")
+        self._reg(tk.Button(rows, text="Configure", command=self._open_interpreters),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").grid(
+            row=row, column=1, sticky="e", padx=(0, 4), pady=4)
+        row += 1
+
         section_header(row, "Window")
         row += 1
         self._reg(tk.Checkbutton(
@@ -545,6 +557,113 @@ class SettingsWindow(tk.Toplevel):
     def _on_explorer_sort_reverse_toggled(self):
         self.cfg.setdefault("ui", {})["explorer_sort_reverse"] = self.explorer_sort_reverse_var.get()
         self._preview({"ui"})
+
+    def _schedule_interpreter_preview(self):
+        """Interpreter boxes update the config on every keystroke; the live
+        editor only hears about it once typing pauses."""
+        if self._interp_preview_job:
+            self.after_cancel(self._interp_preview_job)
+        self._interp_preview_job = self.after(300, self._flush_interpreter_preview)
+
+    def _flush_interpreter_preview(self):
+        self._interp_preview_job = None
+        self._preview({"editor"})
+
+    def _open_interpreters(self):
+        """Per-file-type interpreter commands, or one shared command when
+        "Global interpreter" is ticked. Ticking it only hides the per-type
+        list - what's in it stays in the config. Like the Advanced syntax
+        colors window, changes apply live and the Settings window's own
+        Save/Cancel decide whether they stick."""
+        import syntax
+
+        t = self.app.theme
+        editor_cfg = self.cfg.setdefault("editor", {})
+        run_commands = editor_cfg.setdefault("run_commands", {})
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Execution Interpreters")
+        self._reg(dlg, bg="panel_bg", highlightbackground="border", highlightcolor="border")
+        dlg.configure(bg=t["panel_bg"], highlightthickness=1,
+                      highlightbackground=t["border"], highlightcolor=t["border"])
+        dlg.transient(self)
+        dlg.geometry("480x420")
+        dlg.minsize(360, 260)
+
+        self._reg(tk.Button(dlg, text="Close", command=dlg.destroy),
+                  bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(
+            side="bottom", pady=10)
+
+        global_var = tk.BooleanVar(value=bool(editor_cfg.get("use_global_interpreter", False)))
+        global_check = self._reg(tk.Checkbutton(
+            dlg, text="Global interpreter", variable=global_var, bg=t["panel_bg"], fg=t["fg"],
+            selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
+            highlightthickness=0, anchor="w"),
+            bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+            activeforeground="fg")
+        global_check.pack(side="top", fill="x", padx=10, pady=(10, 4))
+
+        # Global mode: a single Interpreter field.
+        global_frame = self._reg(tk.Frame(dlg, bg=t["panel_bg"]), bg="panel_bg")
+        global_frame.columnconfigure(1, weight=1)
+        self._row_label(global_frame, 0, "Interpreter", padx=(10, 8))
+        global_cmd_var = tk.StringVar(value=editor_cfg.get("global_interpreter", ""))
+
+        def on_global_cmd(*_):
+            editor_cfg["global_interpreter"] = global_cmd_var.get().strip()
+            self._schedule_interpreter_preview()
+
+        global_cmd_var.trace_add("write", on_global_cmd)
+        self._reg(tk.Entry(global_frame, textvariable=global_cmd_var, relief="flat", bg=t["edit_bg"],
+                           fg=t["fg"], insertbackground=t["fg"]),
+                  bg="edit_bg", fg="fg", insertbackground="fg").grid(
+            row=0, column=1, sticky="we", padx=(0, 10), pady=4)
+
+        # Per-type mode: one field per file type.
+        types_frame = self._reg(tk.Frame(dlg, bg=t["panel_bg"]), bg="panel_bg")
+        _canvas, rows = self._make_scrollable_rows(types_frame, t)
+        rows.columnconfigure(1, weight=1)
+        for row, (code, label) in enumerate(syntax.LANGUAGE_LABELS.items()):
+            key = code or "plaintext"
+            self._row_label(rows, row, label, padx=(6, 8))
+            var = tk.StringVar(value=run_commands.get(key, ""))
+
+            def on_type_cmd(*_, key=key, var=var):
+                value = var.get().strip()
+                if value:
+                    run_commands[key] = value
+                else:
+                    run_commands.pop(key, None)
+                self._schedule_interpreter_preview()
+
+            var.trace_add("write", on_type_cmd)
+            self._reg(tk.Entry(rows, textvariable=var, relief="flat", bg=t["edit_bg"], fg=t["fg"],
+                               insertbackground=t["fg"]),
+                      bg="edit_bg", fg="fg", insertbackground="fg").grid(
+                row=row, column=1, sticky="we", padx=(0, 6), pady=2)
+        scrollutil.bind_wheel(_canvas, rows)
+
+        def show_mode():
+            global_frame.pack_forget()
+            types_frame.pack_forget()
+            if global_var.get():
+                global_frame.pack(side="top", fill="x")
+            else:
+                types_frame.pack(side="top", fill="both", expand=True)
+
+        def on_global_toggled():
+            use_global = global_var.get()
+            editor_cfg["use_global_interpreter"] = use_global
+            if use_global and not global_cmd_var.get().strip():
+                # Start from what the toolbar is using right now, so
+                # switching on doesn't leave every run without a command.
+                current = getattr(getattr(self.app, "run_cmd", None), "get", lambda: "")()
+                global_cmd_var.set(current)
+            show_mode()
+            self._preview({"editor"})
+
+        global_check.configure(command=on_global_toggled)
+        show_mode()
 
     def _open_advanced_syntax_colors(self):
         """Per-token-category color picker, for anyone the two built-in
@@ -1362,6 +1481,8 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["editor"] = {
             "default_new_file_language": config.DEFAULTS["editor"]["default_new_file_language"],
             "run_commands": {},
+            "use_global_interpreter": config.DEFAULTS["editor"]["use_global_interpreter"],
+            "global_interpreter": config.DEFAULTS["editor"]["global_interpreter"],
             "syntax_theme": config.DEFAULTS["editor"]["syntax_theme"],
             "custom_syntax_colors": dict(config.DEFAULTS["editor"]["custom_syntax_colors"]),
             "terminal_messages": dict(config.DEFAULTS["editor"]["terminal_messages"]),
@@ -1552,6 +1673,11 @@ class SettingsWindow(tk.Toplevel):
             changed.add("editor")
         if self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]) != self._orig_word_wrap:
             changed.add("editor")
+        editor_now = self.cfg.get("editor", {})
+        if (editor_now.get("run_commands", {}) != self._orig_run_commands
+                or bool(editor_now.get("use_global_interpreter", False)) != self._orig_use_global_interpreter
+                or editor_now.get("global_interpreter", "") != self._orig_global_interpreter):
+            changed.add("editor")
         if self.save_window_position_var.get() != self._orig_save_window_position:
             changed.add("ui")
         if self.save_window_size_var.get() != self._orig_save_window_size:
@@ -1627,6 +1753,14 @@ class SettingsWindow(tk.Toplevel):
             reverted.add("editor")
         if self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]) != self._orig_word_wrap:
             self.cfg.setdefault("editor", {})["word_wrap"] = self._orig_word_wrap
+            reverted.add("editor")
+        editor_now = self.cfg.setdefault("editor", {})
+        if (editor_now.get("run_commands", {}) != self._orig_run_commands
+                or bool(editor_now.get("use_global_interpreter", False)) != self._orig_use_global_interpreter
+                or editor_now.get("global_interpreter", "") != self._orig_global_interpreter):
+            editor_now["run_commands"] = dict(self._orig_run_commands)
+            editor_now["use_global_interpreter"] = self._orig_use_global_interpreter
+            editor_now["global_interpreter"] = self._orig_global_interpreter
             reverted.add("editor")
         ui_cfg = self.cfg.setdefault("ui", {})
         if (ui_cfg.get("save_window_position", True) != self._orig_save_window_position

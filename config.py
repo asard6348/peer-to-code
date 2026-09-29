@@ -54,7 +54,13 @@ DEFAULTS = {
     },
     "editor": {
         "default_new_file_language": "python",
+        # File type -> interpreter command, remembered per type (typed by
+        # the person or auto-detected on first use).
         "run_commands": {},
+        # When on, use_global_interpreter makes every file type run with
+        # global_interpreter instead; run_commands is kept untouched.
+        "use_global_interpreter": False,
+        "global_interpreter": "",
         "syntax_theme": "auto",
         "custom_syntax_colors": {},
         "word_wrap": True,
