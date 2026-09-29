@@ -13,6 +13,7 @@ from net.client import Client, ConnectError, ConnectCancelled
 from net import nat
 
 DEFAULT_PORT = 5123
+CODE_FONT = "Consolas" if os.name=='nt' else "Hack"
 
 
 def parse_address(text, default_host="127.0.0.1", default_port=DEFAULT_PORT):
@@ -495,7 +496,7 @@ class ConnectWindow(ttk.Frame):
             row.pack(fill="x")
             display_text = self._display_path(path)
             label = tk.Label(row, text=display_text, bg=t["panel_bg"], fg=t["fg"],
-                              font=("Consolas", 10), anchor="w", justify="left", cursor="hand2", padx=4, pady=3)
+                              font=(CODE_FONT, 10), anchor="w", justify="left", cursor="hand2", padx=4, pady=3)
             label.pack(side="left", fill="both", expand=True)
             label.bind("<Configure>", lambda e, l=label: l.configure(wraplength=max(60, e.width)))
 
@@ -622,7 +623,7 @@ class ConnectWindow(ttk.Frame):
 
         ttk.Label(inner, text="Address", style="Panel.TLabel").grid(row=2, column=0, sticky="w")
         self.addr_var = tk.StringVar(value=conn.get("address") or f"127.0.0.1:{DEFAULT_PORT}")
-        ttk.Entry(inner, textvariable=self.addr_var, width=42, font=("Consolas", 11)).grid(
+        ttk.Entry(inner, textvariable=self.addr_var, width=42, font=(CODE_FONT, 11)).grid(
             row=3, column=0, columnspan=2, sticky="we", pady=(2, 16))
 
         self.udp_dir_var = tk.StringVar(value=self.working_dir)
@@ -745,7 +746,7 @@ class ConnectWindow(ttk.Frame):
         ttk.Entry(inner, textvariable=self.p2p_name_var, width=42).grid(row=1, column=0, columnspan=2, sticky="we", pady=(2, 12))
 
         ttk.Label(inner, text="Address", style="Panel.TLabel").grid(row=2, column=0, sticky="w")
-        self.p2p_addr_entry = ttk.Entry(inner, width=42, font=("Consolas", 11))
+        self.p2p_addr_entry = ttk.Entry(inner, width=42, font=(CODE_FONT, 11))
         self.p2p_addr_entry.grid(row=3, column=0, columnspan=2, sticky="we", pady=(2, 2))
         saved_addr = conn.get("p2p_address")
         if saved_addr and not _is_loopback_host(saved_addr.rsplit(":", 1)[0]):
@@ -757,7 +758,7 @@ class ConnectWindow(ttk.Frame):
         self._p2p_addr_hint = addr_hint
 
         ttk.Label(inner, text="Join", style="Panel.TLabel").grid(row=5, column=0, columnspan=2, sticky="w")
-        self.p2p_join_entry = ttk.Entry(inner, width=42, font=("Consolas", 11))
+        self.p2p_join_entry = ttk.Entry(inner, width=42, font=(CODE_FONT, 11))
         self.p2p_join_entry.grid(row=6, column=0, columnspan=2, sticky="we", pady=(2, 2))
         saved_join = conn.get("p2p_join_address")
         if saved_join:

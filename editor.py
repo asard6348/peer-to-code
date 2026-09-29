@@ -66,6 +66,9 @@ _PY_BLOCK_OPENERS = re.compile(r"^(if|elif|else|for|while|try|except|finally|wit
 # dedented by hand to start the next statement in the enclosing block.
 _PY_FLOW_DEDENT_KEYWORDS = re.compile(r"^(return|break|continue|pass|raise)\b")
 
+# Default code-like font
+CODE_FONT = "Consolas" if os.name=='nt' else "Hack"
+
 
 def _console_tag_colors(console_bg):
     return CONSOLE_TAG_COLORS_LIGHT if syntax.brightness(console_bg) >= 0.5 else CONSOLE_TAG_COLORS_DARK
@@ -528,7 +531,7 @@ class EditorApp(ttk.Frame):
 
     def apply_theme_live(self, new_theme):
         self.theme = t = new_theme
-        font_family = t.get("font_family", "Consolas")
+        font_family = t.get("font_family", CODE_FONT)
         self._font_size = int(t.get("font_size", 11))
         self._apply_ttk_style(t)
         toplevel = self.winfo_toplevel()
@@ -575,7 +578,7 @@ class EditorApp(ttk.Frame):
     def _build_layout(self):
         t = self.theme
         ui_prefs = self.cfg.get("ui", {})
-        font_family = t.get("font_family", "Consolas")
+        font_family = t.get("font_family", CODE_FONT)
         font_size = int(t.get("font_size", 11))
         self._font_size = int(ui_prefs.get("editor_font_size") or font_size)
         self._console_font_family = ui_prefs.get("console_font_family") or font_family
@@ -829,7 +832,7 @@ class EditorApp(ttk.Frame):
             y = dline[1]
             line_no = str(i).split(".")[0]
             self.linenumbers.create_text(40, y, anchor="ne", text=line_no, fill=self.theme["gutter_fg"],
-                                          font=(self.theme.get("font_family", "Consolas"), self._font_size))
+                                          font=(self.theme.get("font_family", CODE_FONT), self._font_size))
             i = self.text.index(f"{i}+1line")
             if self.text.compare(i, ">=", "end"):
                 dline2 = self.text.dlineinfo(i)
@@ -926,7 +929,7 @@ class EditorApp(ttk.Frame):
         if size == self._font_size:
             return
         self._font_size = size
-        font_family = self.theme.get("font_family", "Consolas")
+        font_family = self.theme.get("font_family", CODE_FONT)
         self.text.configure(font=(font_family, size))
         self._redraw_linenumbers()
 

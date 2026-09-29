@@ -6,6 +6,8 @@ import config
 import file_explorer
 import scrollutil
 
+import os
+
 IGNORED_KEYSYMS = {
     "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
     "Caps_Lock", "Num_Lock", "Super_L", "Super_R", "Meta_L", "Meta_R",
@@ -62,6 +64,9 @@ THEME_FIELD_GROUPS = [
 # Flat (key, title) view of the same data, kept for code that just needs
 # every key/title pair without caring about grouping.
 THEME_FIELDS = [(key, title) for _group, fields in THEME_FIELD_GROUPS for key, title, _desc in fields]
+
+# Default code font
+CODE_FONT = "Consolas" if os.name=='nt' else "Hack"
 
 
 def _capture_accel(event):
@@ -125,7 +130,7 @@ class SettingsWindow(tk.Toplevel):
         self._orig_explorer_sort_reverse = bool(ui_cfg_init.get(
             "explorer_sort_reverse", getattr(getattr(app, "explorer", None), "_sort_reverse", False)))
         self._orig_console_font_family = ui_cfg_init.get(
-            "console_font_family", getattr(app, "_console_font_family", "Consolas"))
+            "console_font_family", getattr(app, "_console_font_family", CODE_FONT))
         self._orig_console_font_size = int(ui_cfg_init.get(
             "console_font_size", getattr(app, "_console_font_size", 10)))
         self._orig_theme_preset = ui_cfg_init.get("theme_preset", "system")
@@ -275,7 +280,7 @@ class SettingsWindow(tk.Toplevel):
         if "output_shortcuts" in sections:
             self.cfg["output_shortcuts"] = dict(self.output_shortcuts_working)
         if "theme" in sections:
-            self.theme_working["font_family"] = self.font_family_var.get() or "Consolas"
+            self.theme_working["font_family"] = self.font_family_var.get() or CODE_FONT
             try:
                 self.theme_working["font_size"] = int(self.font_size_var.get())
             except (tk.TclError, ValueError):
@@ -751,7 +756,7 @@ class SettingsWindow(tk.Toplevel):
     def _save_theme_preset(self):
         import theme
 
-        self.theme_working["font_family"] = self.font_family_var.get() or "Consolas"
+        self.theme_working["font_family"] = self.font_family_var.get() or CODE_FONT
         name = simpledialog.askstring(
             "Save Color Theme Preset", "Preset name:", parent=self)
         if name is None:
@@ -1197,7 +1202,7 @@ class SettingsWindow(tk.Toplevel):
 
         self._row_label(rows, row, "Font family")
         families = sorted(set(tkfont.families()))
-        self.font_family_var = tk.StringVar(value=self.theme_working.get("font_family", "Consolas"))
+        self.font_family_var = tk.StringVar(value=self.theme_working.get("font_family", CODE_FONT))
         font_combo = ttk.Combobox(rows, textvariable=self.font_family_var, values=families, width=22, state="normal")
         font_combo.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
         font_combo.bind("<<ComboboxSelected>>", lambda e: self._preview({"theme"}))
@@ -1386,7 +1391,7 @@ class SettingsWindow(tk.Toplevel):
         self.save_find_window_position_var.set(self._orig_save_find_window_position)
         self.save_find_window_size_var.set(self._orig_save_find_window_size)
         base_font_size = int(self.cfg["theme"].get("font_size", 11))
-        base_font_family = self.cfg["theme"].get("font_family", "Consolas")
+        base_font_family = self.cfg["theme"].get("font_family", CODE_FONT)
         self.cfg["ui"]["explorer_font_size"] = 9
         self.cfg["ui"]["explorer_font_family"] = "sans-serif"
         self.cfg["ui"]["console_font_size"] = max(base_font_size - 1, 8)
@@ -1492,7 +1497,7 @@ class SettingsWindow(tk.Toplevel):
             self.theme_working = dict(config.DEFAULTS["theme"])
             self.theme_working.update(theme.resolve_preset_colors(theme.SYSTEM_PRESET))
             base_font_size = int(self.theme_working.get("font_size", 11))
-            base_font_family = self.theme_working.get("font_family", "Consolas")
+            base_font_family = self.theme_working.get("font_family", CODE_FONT)
             ui_cfg = self.cfg.setdefault("ui", {})
             ui_cfg["theme_preset"] = "system"
             ui_cfg["explorer_font_size"] = 9
@@ -1524,7 +1529,7 @@ class SettingsWindow(tk.Toplevel):
             self._preview({"editor", "ui"})
 
     def _save(self):
-        self.theme_working["font_family"] = self.font_family_var.get() or "Consolas"
+        self.theme_working["font_family"] = self.font_family_var.get() or CODE_FONT
         try:
             self.theme_working["font_size"] = int(self.font_size_var.get())
         except (tk.TclError, ValueError):

@@ -103,7 +103,7 @@ DEFAULTS = {
         "status_bg": "#131416",
         "status_fg": "#c9ccd1",
         "border": "#3d4046",
-        "font_family": "Consolas",
+        "font_family": "Consolas" if sys.platform.startswith('win') else "Hack",
         "font_size": 11,
     },
     # User-saved color theme presets: {name: {the THEME_COLOR_KEYS
