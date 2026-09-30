@@ -18,6 +18,9 @@ jobs:
           - os: windows-latest
             artifact_name: peer-to-code-windows.exe
             build_name: peer-to-code
+            # Exe file icon + bundle icon.ico so the running window can use it too.
+            # (Windows only: PyInstaller wants .icns on macOS and ignores --icon on Linux.)
+            extra_args: --icon icon.ico --add-data "icon.ico;."
           - os: ubuntu-latest
             artifact_name: peer-to-code-linux
             build_name: peer-to-code
@@ -47,7 +50,7 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --windowed --name "${{ matrix.build_name }}" main.py
+          pyinstaller --onefile --windowed --name "${{ matrix.build_name }}" ${{ matrix.extra_args }} main.py
 
       # PyInstaller puts the result in dist/. Rename it to a per-OS artifact name.
       - name: Rename artifact (Windows)

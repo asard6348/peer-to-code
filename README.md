@@ -38,4 +38,8 @@ together, with changes synchronized live using operational transformation.
   
 ## CREDITS
 
-- Claude Sonnet 5
+Code implementation:
+- Claude Sonnet
+
+Icon:
+- [@le-jacob](https://github.com/le-jacob)

@@ -1,3 +1,4 @@
+import os
 import re
 import signal
 import sys
@@ -9,6 +10,14 @@ import dnd_support
 import entry_paste
 from connect_window import ConnectWindow
 from editor import EditorApp
+
+
+def resource_path(name):
+    """Path to a bundled data file - next to the sources when run from
+    source, or inside PyInstaller's temp extraction dir (sys._MEIPASS)
+    when running as a frozen executable."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 
 class App:
@@ -27,9 +36,11 @@ class App:
         self._system_theme_job = None
         self._signal_pump_job = None
 
+        self._set_app_id()
         self.root = dnd_support.make_root()
         entry_paste.install(self.root)
         self.root.title("Peer to Code")
+        self._set_window_icon()
         self._apply_saved_geometry()
         self.root.configure(bg=self.cfg["theme"]["bg"])
         self.root.minsize(340, 260)
@@ -49,6 +60,39 @@ class App:
         self._install_sigint_handler()
         self._show_connect_screen()
         self._start_system_theme_watch()
+
+    @staticmethod
+    def _set_app_id():
+        """Windows groups taskbar buttons by AppUserModelID; without an
+        explicit one, a script run through python.exe shows Python's icon
+        instead of ours. Must happen before the first window exists."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "asard6348.peertocode")
+        except Exception:
+            pass
+
+    def _set_window_icon(self):
+        """Title-bar/taskbar icon. Windows uses icon.ico; elsewhere Tk can
+        only take a PNG, so an optional icon.png is used if present. Any
+        failure just leaves Tk's default icon - never fatal."""
+        if sys.platform == "win32":
+            try:
+                self.root.iconbitmap(default=resource_path("icon.ico"))
+            except tk.TclError:
+                pass
+            return
+        png = resource_path("icon.png")
+        if os.path.exists(png):
+            try:
+                # Keep a reference, or Tk drops the image on GC.
+                self._icon_img = tk.PhotoImage(file=png)
+                self.root.iconphoto(True, self._icon_img)
+            except tk.TclError:
+                pass
 
     def _install_sigint_handler(self):
         """Ctrl+C in a terminal (or `kill -INT`, same thing Termux sends)
