@@ -8,8 +8,15 @@ editor), it adds real-time collaboration: multiple people can connect to
 the same session (client/server or peer-to-peer) and edit the same file
 together, with changes synchronized live using operational transformation.
 
+## DOWNLOAD
 
-## INSTRUCTIONS
+Prebuilt executables are available on the
+[Releases page](https://github.com/asard6348/peer-to-code/releases/latest).
+Download the file for your OS and run it.
+
+> Note: unsigned executables may trigger a SmartScreen/Gatekeeper warning.
+
+## RUN FROM SOURCE
 
 1. Make sure Python 3 is installed on your system.
 2. Clone or download the repository:
