@@ -24,9 +24,11 @@ jobs:
           - os: ubuntu-latest
             artifact_name: peer-to-code-linux
             build_name: peer-to-code
+            extra_args: --add-data "icon.png:."
           - os: macos-latest
             artifact_name: peer-to-code-macos
             build_name: peer-to-code
+            extra_args: --add-data "icon.png:."
 
     runs-on: ${{ matrix.os }}
 
