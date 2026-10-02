@@ -70,6 +70,21 @@ DEFAULTS = {
             "interrupted": True,
         },
     },
+    # Terminal chat (the `m` command). See chat_util.CHAT_DEFAULTS for the
+    # meaning of each key; editor.py reads this section through
+    # chat_util.chat_settings(), which tolerates missing or garbled values.
+    "chat": {
+        "enabled": True,
+        "trigger": "m",
+        "show_timestamps": False,
+        "notify": True,
+        "notify_bell": False,
+        "do_not_disturb": False,
+        "muted": [],
+        "show_join_leave": True,
+        "color_names": True,
+        "view_shared": True,
+    },
     "shortcuts": {
         "new_file": "<Control-n>",
         "open_file": "<Control-o>",

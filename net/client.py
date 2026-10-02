@@ -1,3 +1,4 @@
+import collections
 import queue
 import random
 import socket
@@ -5,6 +6,8 @@ import threading
 import time
 
 import ot
+from chat_util import CHAT_MAX_LEN, NAME_MAX_LEN, sanitize_name, sanitize_text
+import share_util
 from . import transport as p
 from .transport import ReliableUDP
 from .server import Server
@@ -30,7 +33,14 @@ class Client:
         self.server_addr = None
         self.client_id = None
         self.color = None
-        self.username = None
+        self.username = None  # the name the server finally assigned (may be "bob#2")
+        self.requested_username = None
+        # Terminal chat: dedupe + short reorder window (see _handle_chat).
+        self.chat_reorder_window = 0.15
+        self._chat_seen = set()
+        self._chat_seen_order = collections.deque()
+        self._chat_hold = []
+        self._chat_timer = None
         self._heartbeat_stop = threading.Event()
 
         self.state = "synced"
@@ -55,7 +65,9 @@ class Client:
         self._on_cursor = None
         self._on_disconnected = None
         self._on_buffer_context = None
-        self._pending = {"remote_op": [], "full_sync": [], "peers": [], "cursor": [], "disconnected": [], "buffer_context": []}
+        self._on_chat = None
+        self._on_share = None
+        self._pending = {"remote_op": [], "full_sync": [], "peers": [], "cursor": [], "disconnected": [], "buffer_context": [], "chat": [], "share": []}
         self._connect_result = queue.Queue()
         self._cancelled = threading.Event()
 
@@ -82,6 +94,8 @@ class Client:
     on_cursor = _make_callback_prop("cursor")
     on_disconnected = _make_callback_prop("disconnected")
     on_buffer_context = _make_callback_prop("buffer_context")
+    on_chat = _make_callback_prop("chat")
+    on_share = _make_callback_prop("share")
 
     def _fire(self, name, *args):
         """Invoke a callback if set, else buffer the event so a callback
@@ -96,7 +110,7 @@ class Client:
 
     def connect(self, host, port, username, timeout=6.0, extra_hello=None):
         self._cancelled.clear()
-        self.username = username
+        self.username = self.requested_username = username
         self.transport.start()
         deadline = time.monotonic() + timeout
 
@@ -132,6 +146,8 @@ class Client:
             raise ConnectError(payload.get("reason", "Connection refused by host."))
         self.client_id = payload["client_id"]
         self.color = payload["color"]
+        # The server may have renamed us to keep names unique (bob -> bob#2).
+        self.username = sanitize_name(payload.get("username", username), NAME_MAX_LEN)
         with self._lock:
             self.expected_rev = payload["revision"]
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
@@ -249,6 +265,149 @@ class Client:
             return
         self.transport.send(self.server_addr, p.BUFFER_CONTEXT, {"filename": filename}, reliable=True)
 
+    def send_chat(self, text, to=None):
+        """Sends a terminal chat message. `to` is None (everyone), a name /
+        "#id" string, or a list of them. Returns False if not connected."""
+        if not self.server_addr:
+            return False
+        payload = {"text": sanitize_text(text, CHAT_MAX_LEN)}
+        if isinstance(to, str):
+            to = [to]
+        if to:
+            payload["to"] = list(to)
+        self.transport.send(self.server_addr, p.CHAT, payload, reliable=True)
+        return True
+
+    # ---- shared run output (opt-in; see share_util) ----
+
+    def send_share_start(self, run, title):
+        if not self.server_addr:
+            return False
+        self.transport.send(self.server_addr, p.RUN_START,
+                            {"run": run, "title": sanitize_text(title, share_util.SHARE_TITLE_MAX)}, reliable=True)
+        return True
+
+    def send_share_output(self, run, seq, segs, truncated=False):
+        if not self.server_addr:
+            return False
+        payload = {"run": run, "seq": seq}
+        if truncated:
+            payload["truncated"] = True
+        else:
+            payload["segs"] = segs
+        self.transport.send(self.server_addr, p.RUN_OUTPUT, payload, reliable=True)
+        return True
+
+    def send_share_end(self, run, seq, code=None, reason=""):
+        if not self.server_addr:
+            return False
+        self.transport.send(self.server_addr, p.RUN_END,
+                            {"run": run, "seq": seq, "code": code, "reason": reason}, reliable=True)
+        return True
+
+    def _handle_share(self, kind, payload):
+        """Normalizes (and so re-sanitizes) a relayed run message before the
+        UI sees it: the relay isn't trusted any more than a peer is."""
+        if not isinstance(payload, dict):
+            return
+        run = share_util._int(payload.get("run"), lo=1)
+        sender = share_util._int(payload.get("from"), lo=0)
+        if run is None or sender is None:
+            return
+        msg = {"from": sender, "run": run, "name": sanitize_name(payload.get("name"), NAME_MAX_LEN),
+               "replay": bool(payload.get("replay"))}
+        if kind == p.RUN_START:
+            msg["title"] = sanitize_text(payload.get("title", ""), share_util.SHARE_TITLE_MAX) or "command"
+            msg["from_seq"] = share_util._int(payload.get("from_seq"), default=1, lo=1)
+            name = "start"
+        else:
+            seq = share_util._int(payload.get("seq"), lo=1)
+            if seq is None:
+                return
+            msg["seq"] = seq
+            if kind == p.RUN_OUTPUT:
+                msg["segs"] = share_util.normalize_segs(payload.get("segs"))
+                msg["skipped"] = share_util._int(payload.get("skipped"), default=0, lo=0)
+                msg["truncated"] = bool(payload.get("truncated"))
+                name = "output"
+            else:
+                msg["code"] = share_util._int(payload.get("code"), lo=-(2 ** 31), hi=2 ** 31)
+                msg["reason"] = sanitize_text(payload.get("reason", ""), 60)
+                name = "end"
+        self._fire("share", name, msg)
+
+    @staticmethod
+    def _normalize_chat(msg):
+        """Re-sanitizes one relayed message (never trust the relay: the
+        server may be a peer running modified code). None if unusable."""
+        if not isinstance(msg, dict):
+            return None
+        try:
+            seq = int(msg["seq"])
+            sender = int(msg.get("from", 0))
+            ts = float(msg.get("ts") or 0)
+        except (KeyError, TypeError, ValueError):
+            return None
+        text = sanitize_text(msg.get("text", ""), CHAT_MAX_LEN)
+        if not text:
+            return None
+        private = bool(msg.get("private"))
+        to = msg.get("to") if isinstance(msg.get("to"), list) else []
+        return {"seq": seq, "ts": ts, "from": sender, "private": private,
+                "name": sanitize_name(msg.get("name"), NAME_MAX_LEN),
+                "to": [sanitize_name(t, NAME_MAX_LEN) for t in to[:16] if isinstance(t, str)],
+                "text": text}
+
+    def _chat_mark_seen(self, seq):
+        """True if seq is new (and remembers it), False for a duplicate."""
+        if seq in self._chat_seen:
+            return False
+        self._chat_seen.add(seq)
+        self._chat_seen_order.append(seq)
+        if len(self._chat_seen_order) > 1024:
+            self._chat_seen.discard(self._chat_seen_order.popleft())
+        return True
+
+    def _handle_chat(self, payload):
+        """Relayed chat arrives over reliable UDP, which is not ordered across
+        messages. Each message carries a server-assigned `seq`: duplicates
+        are dropped, and live messages are held for chat_reorder_window
+        seconds and released sorted by seq. (A message later than that is
+        still delivered - late beats lost - just out of order.) Server
+        errors are not sequenced and pass straight through; the join
+        history arrives as one batch, sorted, as {"history": [...]}."""
+        if not isinstance(payload, dict):
+            return
+        if "error" in payload:
+            self._fire("chat", {"error": sanitize_text(payload["error"], 300)})
+            return
+        if isinstance(payload.get("history"), list):
+            with self._lock:
+                msgs = [m for m in (self._normalize_chat(x) for x in payload["history"][:200]) if m]
+                msgs.sort(key=lambda m: m["seq"])
+                fresh = [m for m in msgs if self._chat_mark_seen(m["seq"])]
+            if fresh:
+                self._fire("chat", {"history": fresh})
+            return
+        msg = self._normalize_chat(payload)
+        if msg is None:
+            return
+        with self._lock:
+            if not self._chat_mark_seen(msg["seq"]):
+                return
+            self._chat_hold.append(msg)
+            if self._chat_timer is None:
+                self._chat_timer = threading.Timer(self.chat_reorder_window, self._flush_chat)
+                self._chat_timer.daemon = True
+                self._chat_timer.start()
+
+    def _flush_chat(self):
+        with self._lock:
+            held, self._chat_hold = self._chat_hold, []
+            self._chat_timer = None
+        for msg in sorted(held, key=lambda m: m["seq"]):
+            self._fire("chat", msg)
+
     def _on_message(self, kind, payload, addr):
         if kind == p.WELCOME:
             if payload.get("resync"):
@@ -275,6 +434,10 @@ class Client:
             self._fire("cursor", payload)
         elif kind == p.BUFFER_CONTEXT:
             self._fire("buffer_context", payload)
+        elif kind == p.CHAT:
+            self._handle_chat(payload)
+        elif kind in (p.RUN_START, p.RUN_OUTPUT, p.RUN_END):
+            self._handle_share(kind, payload)
         elif kind == p.HOST_SHUTDOWN:
             self._fire("disconnected", "The host ended the session.")
         elif kind == p.PONG:

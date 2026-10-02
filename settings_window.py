@@ -3,6 +3,8 @@ from tkinter import ttk, messagebox, simpledialog, font as tkfont
 
 import color_picker
 import config
+import copy
+from chat_util import chat_settings, normalize_trigger, sanitize_name
 import file_explorer
 import scrollutil
 
@@ -118,6 +120,11 @@ class SettingsWindow(tk.Toplevel):
                                      .get("custom_syntax_colors", {}).items()}
         self._orig_terminal_messages = dict(cfg.setdefault("editor", {}).setdefault(
             "terminal_messages", dict(config.DEFAULTS["editor"]["terminal_messages"])))
+        # Older configs (or a hand-edited one) may have no "chat" section or
+        # garbled values in it: fill in / coerce so the page always loads.
+        raw_chat = cfg.get("chat") if isinstance(cfg.get("chat"), dict) else {}
+        cfg["chat"] = dict(raw_chat, **chat_settings(cfg))
+        self._orig_chat = copy.deepcopy(cfg["chat"])
         self._orig_word_wrap = cfg.setdefault("editor", {}).get(
             "word_wrap", config.DEFAULTS["editor"]["word_wrap"])
         self._orig_run_commands = dict(cfg["editor"].get("run_commands", {}))
@@ -182,18 +189,22 @@ class SettingsWindow(tk.Toplevel):
         shortcuts_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
         theme_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
         config_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
+        chat_tab = self._reg(tk.Frame(nb, bg=t["panel_bg"]), bg="panel_bg")
         nb.add(general_tab, text="General")
+        nb.add(chat_tab, text="Chat")
         nb.add(shortcuts_tab, text="Shortcuts")
         nb.add(theme_tab, text="Theme")
         nb.add(config_tab, text="Config File")
         self._tab_ids = {
             str(general_tab): "General",
+            str(chat_tab): "Chat",
             str(shortcuts_tab): "Shortcuts",
             str(theme_tab): "Theme",
             str(config_tab): "Config File",
         }
 
         self._build_general_tab(general_tab)
+        self._build_chat_tab(chat_tab)
         self._build_shortcuts_tab(shortcuts_tab)
         self._build_theme_tab(theme_tab)
         self._build_config_tab(config_tab)
@@ -727,6 +738,144 @@ class SettingsWindow(tk.Toplevel):
                 row=row, column=2, padx=6, pady=4)
 
         scrollutil.bind_wheel(_canvas, rows)
+
+    def _build_chat_tab(self, parent):
+        """Settings > Chat: the Terminal chat (`m` command) options. Like the
+        General page, every change is applied to the running app right away
+        (via _preview) and only reverted by Cancel or kept by Save."""
+        t = self.app.theme
+        _canvas, rows = self._make_scrollable_rows(parent, t)
+        rows.columnconfigure(0, weight=1)
+        chat = self.cfg["chat"]
+
+        def label(row, text, fg="fg", pady=(2, 2), wrap=True, **grid):
+            lbl = self._reg(tk.Label(rows, text=text, bg=t["panel_bg"], fg=t[fg],
+                                     anchor="w", justify="left"), bg="panel_bg", fg=fg)
+            if wrap:
+                lbl.bind("<Configure>", lambda e, l=lbl: l.configure(wraplength=max(60, e.width)))
+            lbl.grid(row=row, column=0, columnspan=2, sticky="we", padx=4, pady=pady, **grid)
+            return lbl
+
+        def check(row, key, text):
+            var = tk.BooleanVar(value=bool(chat.get(key)))
+            self.chat_vars[key] = var
+            self._reg(tk.Checkbutton(
+                rows, text=text, variable=var, bg=t["panel_bg"], fg=t["fg"], selectcolor=t["edit_bg"],
+                activebackground=t["panel_bg"], activeforeground=t["fg"], highlightthickness=0, anchor="w",
+                command=lambda k=key: self._on_chat_toggled(k),
+            ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+               activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+
+        self.chat_vars = {}
+        row = 0
+        label(row, "Terminal chat", pady=(4, 2)).configure(font=("Segoe UI", 9, "bold"))
+        row += 1
+        label(row, "Talk to the other people in the session from the Terminal's $ prompt: "
+                   "m <message>, m -p <user> <message>, m -r <reply>, m -l (who's here), "
+                   "m -m / -u <user> (mute / unmute). While a program runs, use /m instead.",
+              fg="muted_fg", pady=(0, 8))
+        row += 1
+        check(row, "enabled", "Enable terminal chat (show incoming messages, and treat the trigger word as chat)")
+        row += 1
+
+        label(row, "Command trigger word", pady=(10, 2))
+        row += 1
+        self.chat_trigger_var = tk.StringVar(value=chat.get("trigger", "m"))
+        entry = self._reg(tk.Entry(rows, textvariable=self.chat_trigger_var, width=12, bg=t["edit_bg"], fg=t["fg"],
+                                   insertbackground=t["fg"], relief="flat"),
+                          bg="edit_bg", fg="fg", insertbackground="fg")
+        entry.grid(row=row, column=0, sticky="w", padx=4, pady=2)
+        self.chat_trigger_note = self._reg(tk.Label(rows, text="", bg=t["panel_bg"], fg=t["muted_fg"], anchor="w"),
+                                           bg="panel_bg")
+        self.chat_trigger_note.grid(row=row, column=1, sticky="we", padx=4)
+        self.chat_trigger_var.trace_add("write", lambda *_: self._on_chat_trigger_edited())
+        row += 1
+
+        label(row, "Notifications", pady=(14, 2)).configure(font=("Segoe UI", 9, "bold"))
+        row += 1
+        check(row, "show_timestamps", "Show a timestamp before each message")
+        row += 1
+        check(row, "notify", "Flash the unread counter when a message arrives while the Terminal is hidden")
+        row += 1
+        check(row, "notify_bell", "Also ring the system bell")
+        row += 1
+        check(row, "do_not_disturb", "Do not disturb (no flash or bell; messages are still shown)")
+        row += 1
+
+        label(row, "Display", pady=(14, 2)).configure(font=("Segoe UI", 9, "bold"))
+        row += 1
+        check(row, "show_join_leave", "Show join / leave lines in the Terminal")
+        row += 1
+        check(row, "color_names", "Color names with each person's assigned color")
+        row += 1
+
+        label(row, "Shared run output", pady=(14, 2)).configure(font=("Segoe UI", 9, "bold"))
+        row += 1
+        check(row, "view_shared", "Show output other people share (opens in a separate read-only window: 'share view')")
+        row += 1
+        self.share_output_var = tk.BooleanVar(value=self.app._share_on)
+        self._reg(tk.Checkbutton(
+            rows, text="Share the output of MY runs with everyone in the session (off at every launch)",
+            variable=self.share_output_var, bg=t["panel_bg"], fg=t["fg"], selectcolor=t["edit_bg"],
+            activebackground=t["panel_bg"], activeforeground=t["fg"], highlightthickness=0, anchor="w",
+            command=self._on_share_output_toggled,
+        ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+           activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+        row += 1
+        label(row, "Warning: shared output can contain secrets (tokens, passwords, personal paths). Only "
+                   "output is shared - never your input or environment - and viewers can't send you anything. "
+                   "Applies to runs you start after turning it on. This setting is not saved.",
+              fg="muted_fg", pady=(0, 4))
+        row += 1
+
+        label(row, "Muted users (comma separated; their messages are hidden)", pady=(14, 2))
+        row += 1
+        self.chat_muted_var = tk.StringVar(value=", ".join(chat.get("muted", [])))
+        self._reg(tk.Entry(rows, textvariable=self.chat_muted_var, bg=t["edit_bg"], fg=t["fg"],
+                           insertbackground=t["fg"], relief="flat"),
+                  bg="edit_bg", fg="fg", insertbackground="fg").grid(
+            row=row, column=0, columnspan=2, sticky="we", padx=4, pady=2)
+        self.chat_muted_var.trace_add("write", lambda *_: self._on_chat_muted_edited())
+        row += 1
+        label(row, "Reset to Defaults on this page also clears the muted list.", fg="muted_fg", pady=(8, 2))
+
+    def _on_chat_toggled(self, key):
+        self.cfg["chat"][key] = bool(self.chat_vars[key].get())
+        self._preview({"chat"})
+
+    def _on_share_output_toggled(self):
+        self.share_output_var.set(self.app.set_share_output(self.share_output_var.get(), confirm=True))
+
+    def _on_chat_trigger_edited(self):
+        if self._suspend_preview:
+            return
+        value = normalize_trigger(self.chat_trigger_var.get())
+        if value is None:
+            self.chat_trigger_note.configure(text="1-16 characters, no spaces (keeps the current word)")
+            return
+        self.chat_trigger_note.configure(text="")
+        self.cfg["chat"]["trigger"] = value
+        self._preview({"chat"})
+
+    def _on_chat_muted_edited(self):
+        if self._suspend_preview:
+            return
+        names = [sanitize_name(n) for n in self.chat_muted_var.get().split(",") if n.strip()]
+        self.cfg["chat"]["muted"] = names
+        self._preview({"chat"})
+
+    def _refresh_chat_ui(self):
+        chat = chat_settings(self.cfg)
+        self._suspend_preview = True
+        try:
+            for key, var in self.chat_vars.items():
+                var.set(bool(chat[key]))
+            self.chat_trigger_var.set(chat["trigger"])
+            self.chat_trigger_note.configure(text="")
+            self.chat_muted_var.set(", ".join(chat["muted"]))
+            self.share_output_var.set(self.app._share_on)
+        finally:
+            self._suspend_preview = False
 
     def _build_shortcuts_tab(self, parent):
         from editor import SHORTCUT_SPECS, OUTPUT_SHORTCUT_SPECS, accel_display
@@ -1529,11 +1678,14 @@ class SettingsWindow(tk.Toplevel):
         import syntax
         syntax.set_custom_colors(self.cfg["editor"]["custom_syntax_colors"])
         syntax.set_color_theme(self.cfg["editor"]["syntax_theme"])
+        self.cfg["chat"] = copy.deepcopy(config.DEFAULTS["chat"])
+        self._orig_chat = copy.deepcopy(self.cfg["chat"])
         self._refresh_shortcuts_ui()
         self._refresh_theme_ui()
         self._refresh_general_ui()
+        self._refresh_chat_ui()
         if self.on_apply:
-            self.on_apply({"shortcuts", "output_shortcuts", "theme", "editor", "ui"})
+            self.on_apply({"shortcuts", "output_shortcuts", "theme", "editor", "ui", "chat"})
 
     def _refresh_shortcuts_ui(self):
         for action_id, (label, _btn) in self._row_widgets.items():
@@ -1638,6 +1790,11 @@ class SettingsWindow(tk.Toplevel):
             syntax.set_color_theme(editor_cfg["syntax_theme"])
             self._refresh_theme_ui()
             self._preview({"theme", "ui", "editor"})
+        elif tab == "Chat":
+            self.cfg["chat"] = copy.deepcopy(config.DEFAULTS["chat"])
+            self.app.set_share_output(False)
+            self._refresh_chat_ui()
+            self._preview({"chat"})
         elif tab == "General":
             editor_cfg = self.cfg.setdefault("editor", {})
             editor_cfg["default_new_file_language"] = config.DEFAULTS["editor"]["default_new_file_language"]
@@ -1710,6 +1867,8 @@ class SettingsWindow(tk.Toplevel):
             changed.add("theme")
         if self.cfg.get("syntax_palette_presets", {}) != self._orig_syntax_palette_presets:
             changed.add("editor")
+        if self.cfg.get("chat") != self._orig_chat:
+            changed.add("chat")
 
         self.cfg["shortcuts"] = dict(self.shortcuts_working)
         self.cfg["output_shortcuts"] = dict(self.output_shortcuts_working)
@@ -1804,6 +1963,9 @@ class SettingsWindow(tk.Toplevel):
             self.cfg["syntax_palette_presets"] = restored_presets
             syntax.sync_saved_palettes(restored_presets)
             reverted.add("editor")
+        if self.cfg.get("chat") != self._orig_chat:
+            self.cfg["chat"] = copy.deepcopy(self._orig_chat)
+            reverted.add("chat")
         self.destroy()
         if reverted and self.on_apply:
             try:

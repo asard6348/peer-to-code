@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
@@ -19,6 +20,11 @@ import syntax
 import config
 import theme
 import ansi
+from chat_util import (parse_chat_command, chat_settings, chat_usage, sanitize_text, sanitize_name,
+                       find_code_refs, adapt_color, completion_context, format_name_for_command)
+from share_util import (parse_share_command, share_title, ShareStreamer, RunAssembler, render_sgr,
+                        sanitize_output, SHARE_WARNING, SHARE_PENDING_MAX)
+from shared_output_view import SharedOutputWindow
 import dnd_support
 import undo_history
 from text_proxy import install_proxy, install_delete_guard, char_offset
@@ -220,6 +226,20 @@ class EditorApp(ttk.Frame):
         self._poll_job = None
         self._console_resize_job = None
         self._known_peer_names = {}
+        # Terminal chat state (see the "Terminal chat" section below).
+        self._roster = []              # last roster from the server: [{"id", "name", "color", ...}]
+        self._last_private = None      # (client id, name) of the last private sender, for `m -r`
+        self._chat_unread = 0
+        self._chat_flash_job = None
+        self._chat_name_tags = {}      # peer id -> color its name tag was last configured with
+        self._chat_link_n = 0
+        # Shared run output (see the "Shared run output" section below).
+        self._share_on = False         # session-only, never saved: opt-in each launch
+        self._share = None             # the run currently being shared: {"run", "streamer"}
+        self._share_run_counter = 0
+        self._share_runs = {}          # viewer side: sender id -> {"run", "title", "name", "asm"}
+        self._share_early = {}         # viewer side: output that beat its RUN_START
+        self._share_win = None
         self._console_history = []
         self._console_history_pos = None
         self._console_history_stash = ""
@@ -255,6 +275,7 @@ class EditorApp(ttk.Frame):
         self._apply_output_shortcuts()
 
         self._bind_client(self.client)
+        self._note_assigned_name()
 
         self._pending_initial_file = initial_file
 
@@ -301,6 +322,8 @@ class EditorApp(ttk.Frame):
         client.on_cursor = self._on_cursor_msg
         client.on_disconnected = self._on_disconnected
         client.on_buffer_context = self._on_buffer_context
+        client.on_chat = self._on_chat
+        client.on_share = self._on_share
 
     def _build_menu(self):
         root = self.winfo_toplevel()
@@ -514,6 +537,9 @@ class EditorApp(ttk.Frame):
             if "explorer_sort_key" in ui_cfg or "explorer_sort_reverse" in ui_cfg:
                 self.explorer.set_sort(ui_cfg.get("explorer_sort_key", self.explorer._sort_key),
                                         ui_cfg.get("explorer_sort_reverse", self.explorer._sort_reverse))
+        if "chat" in changed:
+            self._refresh_chat_tags(self.theme["console_bg"])
+            self._update_unread_label()
         if "editor" in changed:
             editor_cfg = self.cfg.setdefault("editor", {})
             self._default_new_file_language = editor_cfg.get("default_new_file_language", "python")
@@ -546,6 +572,7 @@ class EditorApp(ttk.Frame):
         self.tabbar.set_theme(t)
         self.interp_label.configure(bg=t["bg"], fg=t["fg"])
         self.peers_label.configure(bg=t["bg"], fg=t["fg"])
+        self.unread_label.configure(bg=t["bg"], fg=t["fg"])
         self.file_path_label.configure(bg=t["bg"], fg=t["muted_fg"])
         self.run_cmd_entry.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"])
         self.linenumbers.configure(bg=t["gutter_bg"])
@@ -570,6 +597,7 @@ class EditorApp(ttk.Frame):
         self.console.tag_configure("info", foreground=console_tag_colors["info"])
         self.console.tag_configure("prompt", foreground=console_tag_colors["prompt"])
         self.ansi_console.base_tag_colors = console_tag_colors
+        self._refresh_chat_tags(t["console_bg"])
 
         self.cursor_layer.set_theme(t["edit_bg"])
         syntax.set_editor_background(t["edit_bg"])
@@ -597,6 +625,14 @@ class EditorApp(ttk.Frame):
         self.disconnect_btn.pack(side="right", padx=(0, 6), pady=4)
         self.peers_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.peers_label.pack(side="right", padx=(16, 6))
+        # Unread terminal-chat counter, shown just left of the peers label
+        # only while chat arrived with the Terminal panel hidden.
+        self.unread_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["fg"], cursor="hand2")
+        self.unread_label.bind("<Button-1>", lambda e: self._on_unread_click())
+        # Shown for as long as run-output sharing is on; click to turn it off.
+        self.share_label = tk.Label(toolbar, text="\u25cf Sharing run output (click to stop)", bg="#8b2e2e",
+                                    fg="white", padx=6, cursor="hand2")
+        self.share_label.bind("<Button-1>", lambda e: self.set_share_output(False))
 
         self.run_btn = tk.Button(toolbar, text="Run", command=self.action_run, bg="#2f8f5b", fg="white", relief="flat",
                   activebackground="#3aa76a", padx=10)
@@ -737,6 +773,7 @@ class EditorApp(ttk.Frame):
         self.console.tag_configure("info", foreground=console_tag_colors["info"])
         self.console.tag_configure("prompt", foreground=console_tag_colors["prompt"])
         self.ansi_console = ansi.AnsiConsole(self.console, base_tag_colors=console_tag_colors)
+        self._refresh_chat_tags(t["console_bg"])
 
         # A run's prompt (e.g. input(">> ")) is shown right in this same
         # pane, and the person types their reply directly after it -
@@ -758,7 +795,10 @@ class EditorApp(ttk.Frame):
         # (its emacs-style bindings), a right-click context menu - that
         # would otherwise bypass that key-level check entirely. This
         # catches all of them at once, whatever they're bound to.
-        install_delete_guard(self.console, "input_start")
+        # Keep the guard's handle on the real Text command: chat/join lines are
+        # inserted *above* the live input line (before input_start), which the
+        # guard would otherwise clamp to input_start. See _console_insert_segments.
+        self._console_raw_cmd = install_delete_guard(self.console, "input_start")
         self.console.bind("<Key>", self._on_console_key)
         self.console.bind("<<Paste>>", self._on_console_paste)
         self.console.bind("<Tab>", self._on_console_tab)
@@ -837,6 +877,8 @@ class EditorApp(ttk.Frame):
                 kwargs["height"] = ui_prefs["console_height"]
             self.center.add(self.console_frame, **kwargs)
         self._console_visible = not self._console_visible
+        if self._console_visible:
+            self._chat_clear_unread()
 
     def _redraw_linenumbers(self, *_):
         self.linenumbers.delete("all")
@@ -1313,14 +1355,19 @@ class EditorApp(ttk.Frame):
         self.after(0, lambda: self._render_peers(peers))
 
     def _render_peers(self, peers, note_failover=True):
+        # Names come from other machines: sanitize before they reach the
+        # console, the peers label, cursor labels or the chat roster.
+        peers = [dict(pr, name=sanitize_name(pr.get("name"))) for pr in peers]
+        self._roster = peers
         others = [pr for pr in peers if pr["id"] != self.client.client_id]
         current = {pr["id"]: pr["name"] for pr in others}
-        for pid, name in current.items():
-            if pid not in self._known_peer_names:
-                self._console_write(f"{name} joined the session\n", "info")
-        for pid, name in self._known_peer_names.items():
-            if pid not in current:
-                self._console_write(f"{name} disconnected\n", "info")
+        if self._chat_cfg()["show_join_leave"]:
+            for pid, name in current.items():
+                if pid not in self._known_peer_names:
+                    self._console_insert_segments([(f"{name} joined the session\n", "info")])
+            for pid, name in self._known_peer_names.items():
+                if pid not in current:
+                    self._console_insert_segments([(f"{name} disconnected\n", "info")])
         self._known_peer_names = current
         self._author_names.update(current)
         names = ", ".join(current.values())
@@ -1328,6 +1375,535 @@ class EditorApp(ttk.Frame):
         self.cursor_layer.set_roster(peers)
         if note_failover and self._failover is not None:
             self._failover.note_roster(peers)
+
+    # ------------------------------------------------------------------
+    # Terminal chat
+    #
+    # `m [-p <user>] <message>` at the Terminal's $ prompt (or `/m ...`
+    # while a process is running) talks to the other people in the session.
+    # Everything a peer sends is sanitized again here (chat_util) and is
+    # drawn with plain Text.insert - never through AnsiConsole - so nothing
+    # a peer types can be interpreted as a terminal escape sequence.
+    # ------------------------------------------------------------------
+
+    def _chat_cfg(self):
+        return chat_settings(self.cfg)
+
+    def _on_chat(self, payload):
+        # Network thread: marshal onto Tk's, like every other callback.
+        self.after(0, lambda: self._show_chat(payload))
+
+    def _note_assigned_name(self):
+        got = getattr(self.client, "username", None)
+        want = getattr(self.client, "requested_username", None)
+        if got and want and got != want:
+            self._console_insert_segments(
+                [(f"The name '{sanitize_text(want, 40)}' was already taken here; you appear as '{got}'.\n", "info")])
+
+    # -- drawing -------------------------------------------------------
+
+    @staticmethod
+    def _tags_arg(tag):
+        if not tag:
+            return ()
+        return (tag,) if isinstance(tag, str) else tuple(tag)
+
+    def _refresh_chat_tags(self, console_bg):
+        """(Re)configures the chat tags for the console background: the
+        colors adapt to light/dark exactly like the console's own tags do
+        (see _console_tag_colors), and each per-peer name tag keeps its
+        peer's assigned color, darkened on a light background."""
+        light = syntax.brightness(console_bg) >= 0.5
+        colors = _console_tag_colors(console_bg)
+        c = self.console
+        c.tag_configure("chat_time", foreground=colors["info"])
+        c.tag_configure("chat_link", foreground="#0b5cad" if light else "#6cb6ff", underline=True)
+        c.tag_bind("chat_link", "<Enter>", lambda e: c.configure(cursor="hand2"))
+        c.tag_bind("chat_link", "<Leave>", lambda e: c.configure(cursor="xterm"))
+        for pid, color in self._chat_name_tags.items():
+            c.tag_configure(f"chat_name_{pid}", foreground=adapt_color(color, light) or colors["info"])
+
+    def _chat_name_tag(self, peer_id):
+        """The text tag that colors a name with its peer's assigned color, or
+        "info" when coloring is off or the peer is no longer in the roster."""
+        if not self._chat_cfg()["color_names"]:
+            return "info"
+        color = next((pr.get("color") for pr in self._roster if pr.get("id") == peer_id), None)
+        if adapt_color(color, False) is None:
+            return "info"
+        self._chat_name_tags[peer_id] = color
+        light = syntax.brightness(self.theme["console_bg"]) >= 0.5
+        self.console.tag_configure(f"chat_name_{peer_id}", foreground=adapt_color(color, light))
+        return f"chat_name_{peer_id}"
+
+    def _chat_ref_tag(self, file, line):
+        self._chat_link_n += 1
+        tag = f"chat_ref_{self._chat_link_n}"
+        self.console.tag_bind(tag, "<Button-1>", lambda e, f=file, n=line: self._follow_chat_ref(f, n))
+        return tag
+
+    def _chat_body_segments(self, text):
+        """The message text, with `:42` / `file.py:42` tokens turned into
+        clickable links (see _follow_chat_ref)."""
+        segs, pos = [], 0
+        for start, end, file, line in find_code_refs(text):
+            if start > pos:
+                segs.append((text[pos:start], None))
+            segs.append((text[start:end], ("chat_link", self._chat_ref_tag(file, line))))
+            pos = end
+        if pos < len(text):
+            segs.append((text[pos:], None))
+        return segs
+
+    def _chat_segments(self, msg, force_time=False):
+        """[(text, tag)] for one incoming message line: `[name] text` or
+        `[name -> you] text`, optionally prefixed with HH:MM."""
+        segs = []
+        if (force_time or self._chat_cfg()["show_timestamps"]) and msg.get("ts"):
+            segs.append((time.strftime("%H:%M ", time.localtime(msg["ts"])), "chat_time"))
+        segs.append(("[", "info"))
+        segs.append((sanitize_name(msg.get("name")), self._chat_name_tag(msg.get("from"))))
+        if msg.get("private"):
+            me = getattr(self.client, "username", None)
+            to = [("you" if n == me else sanitize_name(n)) for n in msg.get("to", [])] or ["you"]
+            segs.append((" -> " + ", ".join(to) + "] ", "info"))
+        else:
+            segs.append(("] ", "info"))
+        segs += self._chat_body_segments(sanitize_text(msg.get("text", "")))
+        segs.append(("\n", None))
+        return segs
+
+    def _console_insert_segments(self, segs):
+        """Prints plain-text segments *above* the live input line: the
+        process's partial output / the $ prompt and anything typed after it
+        stay exactly as they were, just pushed down, and input_start stays
+        glued to them. Used for everything that can arrive at any moment
+        (chat, join/leave lines), so it never lands in the middle of what
+        the person is typing or of a streaming process's output. Bypasses
+        AnsiConsole entirely: no escape sequence can be interpreted, and a
+        half-received sequence pending in AnsiConsole is left alone."""
+        c = self.console
+        line_start = c.index("input_start linestart")
+        at_line_start = c.compare(line_start, "==", "input_start")
+        c.mark_set("chat_ins", line_start)
+        c.mark_gravity("chat_ins", "right")
+        for text, tag in segs:
+            # Through the raw command: the delete guard would clamp an
+            # insert before input_start up to input_start.
+            c.tk.call(self._console_raw_cmd, "insert", "chat_ins", text, self._tags_arg(tag))
+        if at_line_start:
+            # Nothing before input_start on its line: it (left gravity) would
+            # otherwise stay in front of what was just inserted.
+            c.mark_set("input_start", "chat_ins")
+        c.mark_unset("chat_ins")
+        c.see("end")
+
+    def _console_plain_write(self, segs):
+        """Like _console_write but for plain segments, at the very end
+        (right after the line the person just submitted)."""
+        c = self.console
+        for text, tag in segs:
+            c.insert("end-1c", text, self._tags_arg(tag))
+        c.mark_set("input_start", "end-1c")
+        c.see("end")
+
+    # -- receiving -----------------------------------------------------
+
+    def _chat_muted(self, name, cfg=None):
+        cfg = cfg or self._chat_cfg()
+        low = (name or "").lower()
+        return any(m.lower() == low for m in cfg["muted"])
+
+    def _show_chat(self, payload):
+        cfg = self._chat_cfg()
+        if not cfg["enabled"] or not isinstance(payload, dict):
+            return
+        if "error" in payload:
+            text = sanitize_text(payload["error"], 300)
+            self._console_insert_segments([(text + "\n", "stderr")])
+            if not self._console_visible:
+                self._set_status(text)
+            return
+        if "history" in payload:
+            msgs = [m for m in payload["history"] if not self._chat_muted(m.get("name"), cfg)]
+            if msgs:
+                segs = [(f"-- chat history ({len(msgs)}) --\n", "info")]
+                for m in msgs:
+                    segs += self._chat_segments(m, force_time=True)
+                segs.append(("-- end of history --\n", "info"))
+                self._console_insert_segments(segs)   # history never notifies
+            return
+        if self._chat_muted(payload.get("name"), cfg):
+            return
+        if payload.get("private"):
+            self._last_private = (payload.get("from"), sanitize_name(payload.get("name")))
+        self._console_insert_segments(self._chat_segments(payload))
+        if not self._console_visible:
+            self._chat_note_unread(cfg)
+
+    # -- unread counter ------------------------------------------------
+
+    def _chat_note_unread(self, cfg):
+        self._chat_unread += 1
+        self._update_unread_label()
+        if cfg["notify"] and not cfg["do_not_disturb"]:
+            self._flash_unread()
+            if cfg["notify_bell"]:
+                try:
+                    self.bell()
+                except tk.TclError:
+                    pass
+
+    def _update_unread_label(self):
+        if self._chat_unread > 0:
+            self.unread_label.configure(text=f"Chat: {self._chat_unread} unread")
+            self.unread_label.pack(side="right", padx=(16, 0), after=self.peers_label)
+        else:
+            self.unread_label.pack_forget()
+
+    def _flash_unread(self, steps=6):
+        if self._chat_flash_job is not None:
+            self.after_cancel(self._chat_flash_job)
+            self._chat_flash_job = None
+        t = self.theme
+
+        def step(i):
+            self._chat_flash_job = None
+            if i >= steps or self._chat_unread == 0:
+                self.unread_label.configure(bg=t["bg"], fg=t["fg"])
+                return
+            on = i % 2 == 0
+            self.unread_label.configure(bg="#c9a227" if on else t["bg"], fg="black" if on else t["fg"])
+            self._chat_flash_job = self.after(250, lambda: step(i + 1))
+        step(0)
+
+    def _chat_clear_unread(self):
+        self._chat_unread = 0
+        self._update_unread_label()
+
+    def _on_unread_click(self):
+        if self._console_visible:
+            self._chat_clear_unread()
+        else:
+            self.toggle_console()
+
+    # -- sending / commands ---------------------------------------------
+
+    def _chat_label_for(self, token):
+        if token.startswith("#") and token[1:].isdigit():
+            for pr in self._roster:
+                if pr.get("id") == int(token[1:]):
+                    return pr["name"]
+        return sanitize_text(token, 40)
+
+    def _handle_chat_command(self, cmd):
+        if cmd.kind == "list":
+            self._chat_list_users()
+        elif cmd.kind in ("mute", "unmute"):
+            self._chat_set_muted(cmd.text, cmd.kind == "mute")
+        else:
+            self._chat_send(cmd)
+
+    def _chat_error(self, text):
+        self._console_plain_write([(text + "\n", "stderr")])
+
+    def _chat_send(self, cmd):
+        text = sanitize_text(cmd.text)
+        to = list(cmd.to)
+        if cmd.reply:
+            if not self._last_private:
+                self._chat_error("No private message to reply to yet.")
+                return
+            to = [f"#{self._last_private[0]}"]
+        if not text:
+            self._chat_error(chat_usage(self._chat_cfg()["trigger"]))
+            return
+        if not self.client.send_chat(text, to or None):
+            self._chat_error("Not connected to a session.")
+            return
+        label = "you"
+        if to:
+            label = "you -> " + ", ".join(self._chat_label_for(t) for t in to)
+        segs = []
+        if self._chat_cfg()["show_timestamps"]:
+            segs.append((time.strftime("%H:%M "), "chat_time"))
+        segs.append((f"[{label}] ", "info"))
+        segs += self._chat_body_segments(text)
+        segs.append(("\n", None))
+        self._console_plain_write(segs)
+
+    def _chat_list_users(self):
+        peers = sorted(self._roster, key=lambda pr: pr.get("id", 0))
+        if not peers:
+            self._console_plain_write([("Nobody is connected.\n", "info")])
+            return
+        segs = [(f"{len(peers)} connected:\n", "info")]
+        for pr in peers:
+            segs.append((f"  #{pr['id']} ", "info"))
+            segs.append((pr["name"], self._chat_name_tag(pr["id"])))
+            if pr["id"] == self.client.client_id:
+                segs.append((" (you)", "info"))
+            segs.append(("\n", None))
+        self._console_plain_write(segs)
+
+    def _chat_set_muted(self, user, mute):
+        name = self._chat_label_for(user)
+        for pr in self._roster:  # canonical spelling if they're connected
+            if pr["name"].lower() == name.lower():
+                name = pr["name"]
+        section = self.cfg.get("chat")
+        if not isinstance(section, dict):
+            section = self.cfg["chat"] = dict(config.DEFAULTS["chat"])
+        muted = list(self._chat_cfg()["muted"])
+        already = any(m.lower() == name.lower() for m in muted)
+        if mute and not already:
+            muted.append(name)
+        elif not mute:
+            muted = [m for m in muted if m.lower() != name.lower()]
+        section["muted"] = muted
+        try:
+            config.save_config(self.cfg)
+        except Exception:
+            pass
+        if mute:
+            self._console_plain_write([(f"Muted {name}: their messages are hidden "
+                                        f"({self._chat_cfg()['trigger']} -u to undo).\n", "info")])
+        else:
+            self._console_plain_write([(f"Unmuted {name}.\n", "info")])
+
+    # -- links in messages ------------------------------------------------
+
+    def _follow_chat_ref(self, file, line):
+        """Click on `:42` / `file.py:42`: jump to that line. Only ever moves
+        the caret in a tab that's already open; nothing from the message is
+        opened, executed or looked up on disk."""
+        tab, note = None, ""
+        if file:
+            base = os.path.basename(file).lower()
+            tab = next((t for t in self.visible_tabs if self._tab_base_title(t).lower() == base), None)
+            if tab is None:
+                note = f" ('{sanitize_text(file, 60)}' isn't open; showing the shared buffer)"
+        if tab is None:
+            tab = self.shared_tab
+        if not tab.visible:
+            self._set_status("The shared buffer is closed.")
+            return
+        if tab is not self._active:
+            self._switch_to(tab)
+        last = int(self.text.index("end-1c").split(".")[0])
+        n = min(max(int(line), 1), last)
+        self.text.mark_set("insert", f"{n}.0")
+        self.text.see("insert")
+        self.text.focus_set()
+        self._set_status(f"Jumped to line {n}{note}")
+
+    # -- Tab completion ---------------------------------------------------
+
+    def _complete_chat_user(self, line):
+        """Tab after `m -p `: completes user names (or #ids) from the roster.
+        Returns "break" when the line is in that context (so path completion
+        stays out of it) and None otherwise."""
+        cfg = self._chat_cfg()
+        if not cfg["enabled"]:
+            return None
+        ctx = completion_context(line, cfg["trigger"])
+        if ctx is None:
+            return None
+        _prefix, fragment, quote = ctx
+        me = self.client.client_id
+        names = [pr["name"] for pr in self._roster if pr.get("id") != me]
+        if fragment.startswith("#"):
+            names = [f"#{pr['id']}" for pr in self._roster if pr.get("id") != me]
+        low = fragment.lower()
+        cands = sorted((n for n in names if n.lower().startswith(low)), key=str.lower)
+        if not cands:
+            return "break"
+        region = f"insert-{len(fragment) + len(quote)}c"
+        if len(cands) == 1:
+            new = format_name_for_command(cands[0], quote, close=True) + " "
+        else:
+            common = os.path.commonprefix([n.lower() for n in cands])
+            if len(common) > len(fragment):
+                new = format_name_for_command(cands[0][:len(common)], quote, close=False)
+            else:
+                self._console_insert_segments([("   ".join(cands) + "\n", "info")])
+                return "break"
+        self.console.delete(region, "insert")
+        self.console.insert("insert", new)
+        return "break"
+
+    # ------------------------------------------------------------------
+    # Shared run output (phase 2)
+    #
+    # Strictly opt-in by the person running: `share on` at the prompt (or
+    # `/share on` mid-run), or Settings > Chat. It is never saved to the
+    # config, so it is off at every launch. While on, the *output* of runs
+    # started afterwards (stdout/stderr only - never stdin, never the
+    # environment, never the command's arguments) is batched on the existing
+    # 80 ms _poll_output tick and relayed to the others, who see it in a
+    # separate read-only window (shared_output_view). Nothing a viewer does
+    # can reach the runner. See share_util for the wire format and limits.
+    # ------------------------------------------------------------------
+
+    def set_share_output(self, on, confirm=False):
+        """Turns sharing on/off; returns the resulting state. With confirm=True
+        (the Settings checkbox) turning it on asks first, showing the warning."""
+        on = bool(on)
+        if on == self._share_on:
+            return on
+        if on:
+            if not self.client.server_addr:
+                self._console_insert_segments([("Can't share output: not connected to a session.\n", "stderr")])
+                return False
+            if confirm and not messagebox.askyesno("Share run output", SHARE_WARNING + "\\n\\nShare the output of my runs?",
+                                                   parent=self.winfo_toplevel()):
+                return False
+            self._share_on = True
+            self.share_label.pack(side="right", padx=(16, 0), after=self.peers_label)
+            self._console_insert_segments([
+                ("WARNING: " + SHARE_WARNING + "\\n", "stderr"),
+                ("Sharing is ON for runs you start from now on (a run already in progress is not shared). "
+                 "Type 'share off' to stop.\\n", "info")])
+        else:
+            self._share_on = False
+            self.share_label.pack_forget()
+            self._share_stop("sharing turned off")
+            self._console_insert_segments([("Sharing is OFF.\\n", "info")])
+        return self._share_on
+
+    def _share_command(self, action):
+        if action == "on":
+            self.set_share_output(True)
+        elif action == "off":
+            self.set_share_output(False) if self._share_on else self._console_insert_segments(
+                [("Sharing is already off.\\n", "info")])
+        elif action == "view":
+            self._share_window(show=True)
+        else:
+            cfg = self._chat_cfg()
+            self._console_insert_segments([(
+                f"Sharing your run output: {'ON' if self._share_on else 'off'}.  "
+                f"Showing others' shared output: {'on' if cfg['view_shared'] else 'off'} "
+                f"(share view opens the read-only window).\\n", "info")])
+
+    def _share_window(self, show=False):
+        win = self._share_win
+        try:
+            alive = win is not None and win.winfo_exists()
+        except tk.TclError:
+            alive = False
+        if not alive:
+            win = self._share_win = SharedOutputWindow(self)
+            if not show:
+                win.withdraw()
+        if show:
+            win.deiconify()
+            win.lift()
+        return win
+
+    # -- runner side -------------------------------------------------------
+
+    def _share_begin(self, args, shell):
+        """Called right after a process started. Announces the run (title =
+        program name only) if sharing is on."""
+        self._share = None
+        if not self._share_on or not self.client.server_addr:
+            return
+        self._share_run_counter += 1
+        title = share_title(args, shell)
+        self._share = {"run": self._share_run_counter, "streamer": ShareStreamer(self._share_run_counter, title)}
+        self.client.send_share_start(self._share_run_counter, title)
+        self._console_write("[sharing this run's output with the session - 'share off' to stop]\\n", "info")
+
+    def _share_output(self, pairs):
+        """One call per poll tick with everything read in that tick."""
+        share = self._share
+        if not share or not pairs:
+            return
+        for seq, segs, truncated in share["streamer"].add(pairs):
+            self.client.send_share_output(share["run"], seq, segs, truncated=truncated)
+
+    def _share_stop(self, reason, code=None):
+        share, self._share = self._share, None
+        if share:
+            self.client.send_share_end(share["run"], share["streamer"].end_seq(), code=code, reason=reason)
+
+    # -- viewer side -------------------------------------------------------
+
+    def _on_share(self, name, msg):
+        self.after(0, lambda: self._show_share(name, msg))
+
+    def _show_share(self, name, msg):
+        cfg = self._chat_cfg()
+        if not cfg["view_shared"] or msg.get("from") == self.client.client_id:
+            return
+        if self._chat_muted(msg.get("name"), cfg):
+            return
+        sender = msg["from"]
+        st = self._share_runs.get(sender)
+        if name == "start":
+            win = self._share_window()
+            st = {"run": msg["run"], "title": msg["title"], "name": msg["name"], "asm": RunAssembler(msg["from_seq"])}
+            self._share_runs[sender] = st
+            win.start_run(sender, msg["name"], msg["title"])
+            if msg["from_seq"] > 1:
+                win.note(sender, msg["name"], "[earlier output of this run is no longer available]")
+            if not msg["replay"]:
+                self._console_insert_segments([(
+                    f"{msg['name']} is sharing the output of a run ({msg['title']}). "
+                    f"Type 'share view' to watch it (read-only).\\n", "info")])
+            for early_name, early in self._share_early.pop((sender, msg["run"]), []):
+                self._share_feed(sender, st, early_name, early)
+            return
+        if st is None or st["run"] != msg["run"]:
+            if st is None or msg["run"] > st["run"]:    # START not here yet: keep a little
+                key = (sender, msg["run"])
+                if key not in self._share_early and len(self._share_early) >= 16:
+                    self._share_early.pop(next(iter(self._share_early)))
+                bucket = self._share_early.setdefault(key, [])
+                if len(bucket) < SHARE_PENDING_MAX:
+                    bucket.append((name, msg))
+            return
+        self._share_feed(sender, st, name, msg)
+
+    def _share_feed(self, sender, st, name, msg):
+        item = {"kind": name, "msg": msg, "end": name == "end",
+                "truncated": name == "output" and bool(msg.get("truncated"))}
+        self._share_apply(sender, st, st["asm"].feed(msg["seq"], item))
+
+    def _share_apply(self, sender, st, items):
+        if not items:
+            return
+        win = self._share_window()
+        who = st["name"]
+        for item in items:
+            if item.get("gap"):
+                win.note(sender, who, "[some output was lost in transit]")
+                continue
+            msg = item["msg"]
+            if item["kind"] == "output":
+                if item["truncated"]:
+                    win.note(sender, who, "[output limit reached - the rest of this run is not shared]")
+                elif msg.get("skipped"):
+                    win.note(sender, who, f"[{msg['skipped']} bytes of output omitted: sender rate limit]")
+                for stream, text in msg.get("segs", []):
+                    # render_sgr honours only plain colour codes; this is a second sanitize pass.
+                    runs, st["asm"].sgr_state = render_sgr(sanitize_output(text), st["asm"].sgr_state)
+                    win.append(sender, who, runs, stream)
+            elif item["kind"] == "end":
+                code = msg.get("code")
+                if msg.get("reason"):
+                    status, line = "ended", f"[ended: {msg['reason']}]"
+                elif code in (None, 0):
+                    status, line = "finished", "[finished]"
+                else:
+                    status, line = "finished", f"[finished: exit code {code}]"
+                win.set_status(sender, who, st["title"], status)
+                win.note(sender, who, line)
+
+    def _share_tick(self):
+        for sender, st in list(self._share_runs.items()):
+            self._share_apply(sender, st, st["asm"].release_stalled())
 
     def _on_cursor_msg(self, payload):
         self.after(0, lambda: self.cursor_layer.update_cursor(payload))
@@ -1364,6 +1940,10 @@ class EditorApp(ttk.Frame):
         self.cursor_layer.clear()
         self.cursor_layer.set_self_id(new_client.client_id)
         self._known_peer_names = {}
+        self._roster = []
+        self._last_private = None
+        self._share_runs, self._share_early = {}, {}
+        self._note_assigned_name()
         note = "you're now the sequencer" if new_server is not None else "reconnected to the new sequencer"
         self._set_status(f"Back online: {note}")
         self._console_write(f"Reconnected ({note})\n", "info")
@@ -1806,8 +2386,8 @@ class EditorApp(ttk.Frame):
         if by == self.client.client_id:
             return
         who = next((n for pid, n in self._known_peer_names.items() if pid == by), "someone")
-        label = filename or "a blank buffer"
-        self._console_write(f"{who} loaded {label} into the shared buffer\n", "info")
+        label = sanitize_text(filename, 200) if filename else "a blank buffer"
+        self._console_insert_segments([(f"{sanitize_name(who)} loaded {label} into the shared buffer\n", "info")])
 
     # ------------------------------------------------------------------
     # Buffer tabs
@@ -2264,6 +2844,32 @@ class EditorApp(ttk.Frame):
         whole app for as long as the command runs and couldn't be
         interrupted or show output as it happens - the opposite of
         "behave like a terminal"."""
+        try:
+            share = parse_share_command(command)
+        except ValueError as err:
+            self._console_plain_write([(f"{err}\n", "stderr")])
+            self._show_prompt()
+            return
+        if share is not None:
+            self._share_command(share)
+            self._show_prompt()
+            return
+        if command.startswith("\\share") and command[6:7] in ("", " "):
+            command = command[1:]       # `\share ...` runs a program really named share
+        cfg = self._chat_cfg()
+        if cfg["enabled"]:
+            try:
+                chat = parse_chat_command(command, cfg["trigger"])
+            except ValueError as err:
+                self._console_plain_write([(f"{err}\n", "stderr")])
+                self._show_prompt()
+                return
+            if chat is not None:
+                if chat.kind != "shell":
+                    self._handle_chat_command(chat)
+                    self._show_prompt()
+                    return
+                command = chat.text  # `\\m ...`: really run the shell command named m
         self.ansi_console.flush()
         self.ansi_console.state.reset()
         self._launch_process(command, shell=True)
@@ -2321,6 +2927,7 @@ class EditorApp(ttk.Frame):
         threading.Thread(target=self._pump_stream, args=(self.run_proc.stdout, False), daemon=True).start()
         threading.Thread(target=self._pump_stream, args=(self.run_proc.stderr, True), daemon=True).start()
         threading.Thread(target=self._watch_run_proc, args=(self.run_proc, cleanup_path), daemon=True).start()
+        self._share_begin(args, shell)
 
     def _watch_run_proc(self, proc, cleanup_path=None):
         """Waits (off the main thread - proc.wait() blocks) for this run
@@ -2421,11 +3028,30 @@ class EditorApp(ttk.Frame):
         stream.close()
 
     def _poll_output(self):
+        self._drain_out_queue()
+        try:
+            while True:
+                returncode = self._exit_queue.get_nowait()
+                # The pump threads may still have the run's last bytes in
+                # flight when the exit is noticed: take whatever is queued so
+                # output always precedes the [finished] line (and the end of
+                # a shared run).
+                self._drain_out_queue()
+                self._share_stop("", code=returncode)
+                self._report_proc_exit(returncode)
+        except queue.Empty:
+            pass
+        self._share_tick()
+        self._poll_job = self.after(80, self._poll_output)
+
+    def _drain_out_queue(self):
         buf = []
         cur_tag = None
+        shared = []
         try:
             while True:
                 ch, is_err = self.out_queue.get_nowait()
+                shared.append((is_err, ch))
                 tag = "stderr" if is_err else None
                 if buf and tag != cur_tag:
                     self._console_write("".join(buf), cur_tag)
@@ -2436,13 +3062,7 @@ class EditorApp(ttk.Frame):
             pass
         if buf:
             self._console_write("".join(buf), cur_tag)
-        try:
-            while True:
-                returncode = self._exit_queue.get_nowait()
-                self._report_proc_exit(returncode)
-        except queue.Empty:
-            pass
-        self._poll_job = self.after(80, self._poll_output)
+        self._share_output(shared)      # one batch per tick, in arrival order
 
     def _on_console_resize(self, _event=None):
         if self._console_resize_job:
@@ -2523,6 +3143,9 @@ class EditorApp(ttk.Frame):
         if self.console.compare(cursor, "<", "input_start"):
             return None
         line = self.console.get("input_start", cursor)
+        chat_result = self._complete_chat_user(line)
+        if chat_result is not None:
+            return chat_result
         word = re.search(r"\S*$", line).group()
         quote = ""
         if word[:1] in ("'", '"'):
@@ -2625,6 +3248,26 @@ class EditorApp(ttk.Frame):
         self.console.mark_set("input_start", "end-1c")
         self.console.see("end")
         if running:
+            try:
+                share = parse_share_command(text, running=True)
+            except ValueError as err:
+                self._console_plain_write([(f"{err}\n", "stderr")])
+                return
+            if share is not None:
+                self._share_command(share)
+                return
+            cfg = self._chat_cfg()
+            if cfg["enabled"]:
+                # While a process runs every line is its stdin - except the
+                # explicit `/m ...` form, which is chat.
+                try:
+                    chat = parse_chat_command(text, cfg["trigger"], running=True)
+                except ValueError as err:
+                    self._console_plain_write([(f"{err}\n", "stderr")])
+                    return
+                if chat is not None:
+                    self._handle_chat_command(chat)
+                    return
             if not self.run_proc.stdin:
                 return
             try:
@@ -2982,7 +3625,13 @@ class EditorApp(ttk.Frame):
         Connect, or on quit - and since the underlying widgets are gone by
         then, Tk logs an "invalid command name" error to the console for
         every tick until the process exits."""
-        for attr in ("_poll_job", "_cursor_send_job", "_highlight_job", "_console_resize_job"):
+        win, self._share_win = self._share_win, None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        for attr in ("_poll_job", "_cursor_send_job", "_highlight_job", "_console_resize_job", "_chat_flash_job"):
             job = getattr(self, attr, None)
             if job:
                 try:
