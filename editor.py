@@ -20,8 +20,8 @@ import syntax
 import config
 import theme
 import ansi
-from chat_util import (parse_chat_command, chat_settings, chat_usage, sanitize_text, sanitize_name,
-                       find_code_refs, adapt_color, completion_context, format_name_for_command)
+from chat_util import (parse_chat_input, chat_settings, sanitize_text, sanitize_name, find_code_refs,
+                       adapt_color, completion_context, format_name_for_command, CHAT_HELP)
 from share_util import (parse_share_command, share_title, ShareStreamer, RunAssembler, render_sgr,
                         sanitize_output, SHARE_WARNING, SHARE_PENDING_MAX)
 from shared_output_view import SharedOutputWindow
@@ -29,6 +29,7 @@ import dnd_support
 import undo_history
 from text_proxy import install_proxy, install_delete_guard, char_offset
 from file_explorer import FileExplorer
+from dock import DockManager
 from peer_cursors import PeerCursorLayer
 from tab_bar import TabBar
 from settings_window import SettingsWindow
@@ -102,6 +103,7 @@ SHORTCUT_SPECS = [
     ("undo_peer", "Undo Others' Last Change", "<Alt-z>", "action_undo_peer"),
     ("toggle_explorer", "Toggle Explorer", "<Control-b>", "toggle_explorer"),
     ("toggle_output", "Toggle Terminal", "<Control-grave>", "toggle_console"),
+    ("toggle_chat", "Toggle Chat", "<Control-Shift-M>", "toggle_chat"),
     ("close_tab", "Close Tab", "<Control-w>", "action_close_active_tab"),
     ("next_tab", "Next Tab", "<Control-Next>", "action_next_tab"),
     ("prev_tab", "Previous Tab", "<Control-Prior>", "action_prev_tab"),
@@ -226,13 +228,17 @@ class EditorApp(ttk.Frame):
         self._poll_job = None
         self._console_resize_job = None
         self._known_peer_names = {}
-        # Terminal chat state (see the "Terminal chat" section below).
+        # Chat panel state (see the "Chat" section below).
         self._roster = []              # last roster from the server: [{"id", "name", "color", ...}]
-        self._last_private = None      # (client id, name) of the last private sender, for `m -r`
+        self._last_private = None      # (client id, name) of the last private sender, for `/r`
         self._chat_unread = 0
         self._chat_flash_job = None
         self._chat_name_tags = {}      # peer id -> color its name tag was last configured with
         self._chat_link_n = 0
+        self._chat_input_history = []  # lines sent from the Chat input, for Up/Down recall
+        self._chat_input_pos = None
+        self._chat_input_stash = ""
+        self._chat_was_enabled = None
         # Shared run output (see the "Shared run output" section below).
         self._share_on = False         # session-only, never saved: opt-in each launch
         self._share = None             # the run currently being shared: {"run", "streamer"}
@@ -444,6 +450,8 @@ class EditorApp(ttk.Frame):
         m_view = add_menu("View")
         m_view.add_command(label="Toggle Explorer", accelerator=a("toggle_explorer"), command=self.toggle_explorer)
         m_view.add_command(label="Toggle Terminal", accelerator=a("toggle_output"), command=self.toggle_console)
+        m_view.add_command(label="Toggle Chat", accelerator=a("toggle_chat"), command=self.toggle_chat)
+        m_view.add_command(label="Reset Panel Layout", command=self.reset_panel_layout)
         m_view.add_separator()
         m_view.add_command(label="Next Tab", accelerator=a("next_tab"), command=self.action_next_tab)
         m_view.add_command(label="Previous Tab", accelerator=a("prev_tab"), command=self.action_prev_tab)
@@ -540,6 +548,7 @@ class EditorApp(ttk.Frame):
         if "chat" in changed:
             self._refresh_chat_tags(self.theme["console_bg"])
             self._update_unread_label()
+            self._refresh_chat_state()
         if "editor" in changed:
             editor_cfg = self.cfg.setdefault("editor", {})
             self._default_new_file_language = editor_cfg.get("default_new_file_language", "python")
@@ -567,8 +576,9 @@ class EditorApp(ttk.Frame):
         theme.apply_classic_widget_defaults(toplevel, t)
 
         for frame in (self.toolbar, self.body, self.center, self.edit_outer, self.edit_area, self.text_frame,
-                      self.console_frame, self.console_body):
+                      self.console_body, self.chat_body, self.chat_input_row):
             frame.configure(bg=t["bg"])
+        self.dock.set_theme(t)
         self.tabbar.set_theme(t)
         self.interp_label.configure(bg=t["bg"], fg=t["fg"])
         self.peers_label.configure(bg=t["bg"], fg=t["fg"])
@@ -581,7 +591,10 @@ class EditorApp(ttk.Frame):
         self.yscroll.configure(**theme.classic_scrollbar_options(t))
         self.xscroll.configure(**theme.classic_scrollbar_options(t))
         self.console_yscroll.configure(**theme.classic_scrollbar_options(t))
-        self.console_label.configure(bg=t["bg"], fg=t["muted_fg"])
+        self.chat_yscroll.configure(**theme.classic_scrollbar_options(t))
+        self.chat_text.configure(bg=t["console_bg"], fg=t["fg"])
+        self.chat_entry.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"],
+                                  disabledbackground=t["edit_bg"], disabledforeground=t["muted_fg"])
         self.status_frame.configure(bg=t["status_bg"])
         self.status_right.configure(bg=t["status_bg"], fg=t["status_fg"])
         self.status_left.configure(bg=t["status_bg"], fg=t["status_fg"])
@@ -625,8 +638,8 @@ class EditorApp(ttk.Frame):
         self.disconnect_btn.pack(side="right", padx=(0, 6), pady=4)
         self.peers_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.peers_label.pack(side="right", padx=(16, 6))
-        # Unread terminal-chat counter, shown just left of the peers label
-        # only while chat arrived with the Terminal panel hidden.
+        # Unread chat counter, shown just left of the peers label only while
+        # chat arrived with the Chat panel hidden.
         self.unread_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["fg"], cursor="hand2")
         self.unread_label.bind("<Button-1>", lambda e: self._on_unread_click())
         # Shown for as long as run-output sharing is on; click to turn it off.
@@ -677,7 +690,25 @@ class EditorApp(ttk.Frame):
         body.pack(fill="both", expand=True)
         self.body = body
 
-        self.explorer = FileExplorer(body, self.working_dir, self._open_file_from_explorer, width=220)
+        center = tk.PanedWindow(body, orient="vertical", bg=t["bg"], sashwidth=4, bd=0)
+        body.add(center, minsize=260, stretch="always")
+        self.center = center
+
+        edit_outer = tk.Frame(center, bg=t["bg"])
+        center.add(edit_outer, minsize=30, stretch="always")
+        self.edit_outer = edit_outer
+
+        # Explorer, Terminal and Chat are dockable panels (see dock.py): each
+        # can sit on the left, right or bottom of the editor, or float in a
+        # window of its own, and the layout is remembered between launches.
+        self.dock = DockManager(self, body, center, edit_outer, t, on_visibility=self._on_panel_visibility)
+        self.explorer_panel = self.dock.add_panel("explorer")
+        self.terminal_panel = self.dock.add_panel("terminal")
+        self.chat_panel = self.dock.add_panel("chat")
+        self.dock.load(self.cfg)
+
+        self.explorer = FileExplorer(self.explorer_panel.content, self.working_dir, self._open_file_from_explorer)
+        self.explorer.pack(fill="both", expand=True)
         # A plain sans-serif face reads better for a file tree than
         # whatever the ttk theme's own default happens to be, and a
         # touch smaller than the editor/Terminal's own default size
@@ -691,18 +722,6 @@ class EditorApp(ttk.Frame):
         dnd_support.register_drop(self.explorer.tree, self._on_explorer_drop)
         if self._opened_single_file:
             self.explorer.show_whole_computer()
-        self._explorer_visible = ui_prefs.get("explorer_visible", True)
-        if self._explorer_visible:
-            body.add(self.explorer, minsize=60, stretch="never",
-                     width=ui_prefs.get("explorer_width", 220))
-
-        center = tk.PanedWindow(body, orient="vertical", bg=t["bg"], sashwidth=4, bd=0)
-        body.add(center, minsize=260, stretch="always")
-        self.center = center
-
-        edit_outer = tk.Frame(center, bg=t["bg"])
-        center.add(edit_outer, minsize=30, stretch="always")
-        self.edit_outer = edit_outer
 
         self.tabbar = TabBar(edit_outer, t, on_select=self._on_tab_select,
                               on_close=self._on_tab_close_request, on_context=self._show_tab_menu,
@@ -743,19 +762,7 @@ class EditorApp(ttk.Frame):
         install_proxy(self.text, self._on_local_insert, self._on_local_delete)
         self.cursor_layer = PeerCursorLayer(self.text, t["edit_bg"], self.client.client_id)
 
-        console_frame = tk.Frame(center, bg=t["bg"])
-        self._console_visible = ui_prefs.get("console_visible", True)
-        if self._console_visible:
-            kwargs = {"minsize": 70, "stretch": "never"}
-            if "console_height" in ui_prefs:
-                kwargs["height"] = ui_prefs["console_height"]
-            center.add(console_frame, **kwargs)
-        self.console_frame = console_frame
-        self.console_label = tk.Label(console_frame, text="TERMINAL", bg=t["bg"], fg=t["muted_fg"], font=("Segoe UI", 9, "bold"),
-                  anchor="w")
-        self.console_label.pack(fill="x", padx=6, pady=(4, 0))
-
-        console_body = tk.Frame(console_frame, bg=t["bg"])
+        console_body = tk.Frame(self.terminal_panel.content, bg=t["bg"])
         console_body.pack(fill="both", expand=True, padx=2, pady=2)
         self.console_body = console_body
 
@@ -773,7 +780,6 @@ class EditorApp(ttk.Frame):
         self.console.tag_configure("info", foreground=console_tag_colors["info"])
         self.console.tag_configure("prompt", foreground=console_tag_colors["prompt"])
         self.ansi_console = ansi.AnsiConsole(self.console, base_tag_colors=console_tag_colors)
-        self._refresh_chat_tags(t["console_bg"])
 
         # A run's prompt (e.g. input(">> ")) is shown right in this same
         # pane, and the person types their reply directly after it -
@@ -808,7 +814,9 @@ class EditorApp(ttk.Frame):
 
         self._console_resize_job = None
         self.console.bind("<Configure>", self._on_console_resize)
-        console_frame.bind("<Configure>", self._on_console_resize)
+        self.terminal_panel.frame.bind("<Configure>", self._on_console_resize)
+
+        self._build_chat_panel(self.chat_panel.content)
 
         self._update_language_status()
         self._refresh_tabs()
@@ -820,6 +828,7 @@ class EditorApp(ttk.Frame):
         self.text.bind("<Control-y>", self.action_redo)
         self.text.bind("<<Paste>>", self._on_text_paste)
         self._bind_zoom_gestures()
+        self.dock.present_all()
 
     def _on_yscroll(self, *args):
         self.text.yview(*args)
@@ -843,13 +852,24 @@ class EditorApp(ttk.Frame):
         self._redraw_linenumbers()
 
     def toggle_explorer(self):
-        if self._explorer_visible:
-            self.body.forget(self.explorer)
-        else:
-            width = self.cfg.get("ui", {}).get("explorer_width", 220)
-            self.body.add(self.explorer, before=str(self.center), minsize=60,
-                           stretch="never", width=width)
-        self._explorer_visible = not self._explorer_visible
+        self.explorer_panel.toggle()
+
+    def toggle_console(self):
+        self.terminal_panel.toggle()
+
+    def toggle_chat(self):
+        self.chat_panel.toggle()
+        if self.chat_panel.visible:
+            self.chat_entry.focus_set()
+
+    def reset_panel_layout(self):
+        self.dock.reset()
+        self._set_status("Panel layout reset.")
+
+    def _on_panel_visibility(self, panel):
+        """Called by the dock after a panel is shown or hidden."""
+        if panel is getattr(self, "chat_panel", None) and panel.visible:
+            self._chat_clear_unread()
 
     def _switch_working_dir(self, new_dir):
         """Points the Explorer panel (and Run/Save As dialogs) at a
@@ -866,19 +886,6 @@ class EditorApp(ttk.Frame):
                 self._switch_working_dir(path)
             elif os.path.isfile(path):
                 self._load_file(path)
-
-    def toggle_console(self):
-        if self._console_visible:
-            self.center.forget(self.console_frame)
-        else:
-            ui_prefs = self.cfg.get("ui", {})
-            kwargs = {"minsize": 70, "stretch": "never"}
-            if "console_height" in ui_prefs:
-                kwargs["height"] = ui_prefs["console_height"]
-            self.center.add(self.console_frame, **kwargs)
-        self._console_visible = not self._console_visible
-        if self._console_visible:
-            self._chat_clear_unread()
 
     def _redraw_linenumbers(self, *_):
         self.linenumbers.delete("all")
@@ -925,7 +932,8 @@ class EditorApp(ttk.Frame):
                          lambda steps: self._set_font_size(self._font_size + steps))
         self._bind_zoom((self.explorer.tree,),
                          lambda steps: self._set_explorer_font_size(self._explorer_font_size + steps))
-        self._bind_zoom((self.console,),
+        # Chat shares the Terminal's font, so zooming either one zooms both.
+        self._bind_zoom((self.console, self.chat_text, self.chat_entry),
                          lambda steps: self._set_console_font_size(self._console_font_size + steps))
 
     def _bind_zoom(self, widgets, zoom_by):
@@ -1011,6 +1019,7 @@ class EditorApp(ttk.Frame):
         self._console_font_size = size
         self.console.configure(font=(self._console_font_family, size))
         self.ansi_console.rescale_fonts(size=size)
+        self._apply_chat_font()
 
     def _set_console_font_family(self, family):
         if not family or family == self._console_font_family:
@@ -1018,6 +1027,12 @@ class EditorApp(ttk.Frame):
         self._console_font_family = family
         self.console.configure(font=(family, self._console_font_size))
         self.ansi_console.rescale_fonts(family=family)
+        self._apply_chat_font()
+
+    def _apply_chat_font(self):
+        font = (self._console_font_family, self._console_font_size)
+        self.chat_text.configure(font=font)
+        self.chat_entry.configure(font=font)
 
     def _on_key_release(self, event):
         self._redraw_linenumbers()
@@ -1356,7 +1371,7 @@ class EditorApp(ttk.Frame):
 
     def _render_peers(self, peers, note_failover=True):
         # Names come from other machines: sanitize before they reach the
-        # console, the peers label, cursor labels or the chat roster.
+        # chat, the peers label, cursor labels or the chat roster.
         peers = [dict(pr, name=sanitize_name(pr.get("name"))) for pr in peers]
         self._roster = peers
         others = [pr for pr in peers if pr["id"] != self.client.client_id]
@@ -1364,10 +1379,10 @@ class EditorApp(ttk.Frame):
         if self._chat_cfg()["show_join_leave"]:
             for pid, name in current.items():
                 if pid not in self._known_peer_names:
-                    self._console_insert_segments([(f"{name} joined the session\n", "info")])
+                    self._chat_append([(f"{name} joined the session\n", "info")])
             for pid, name in self._known_peer_names.items():
                 if pid not in current:
-                    self._console_insert_segments([(f"{name} disconnected\n", "info")])
+                    self._chat_append([(f"{name} disconnected\n", "info")])
         self._known_peer_names = current
         self._author_names.update(current)
         names = ", ".join(current.values())
@@ -1376,15 +1391,100 @@ class EditorApp(ttk.Frame):
         if note_failover and self._failover is not None:
             self._failover.note_roster(peers)
 
+    # -- Terminal helpers ----------------------------------------------
+
+    def _console_insert_segments(self, segs):
+        """Prints plain-text segments *above* the live input line: the
+        process's partial output / the $ prompt and anything typed after it
+        stay exactly as they were, just pushed down, and input_start stays
+        glued to them. Used for everything that can arrive at any moment
+        (shared-run notices and the like), so it never lands in the middle of what
+        the person is typing or of a streaming process's output. Bypasses
+        AnsiConsole entirely: no escape sequence can be interpreted, and a
+        half-received sequence pending in AnsiConsole is left alone."""
+        c = self.console
+        line_start = c.index("input_start linestart")
+        at_line_start = c.compare(line_start, "==", "input_start")
+        c.mark_set("chat_ins", line_start)
+        c.mark_gravity("chat_ins", "right")
+        for text, tag in segs:
+            # Through the raw command: the delete guard would clamp an
+            # insert before input_start up to input_start.
+            c.tk.call(self._console_raw_cmd, "insert", "chat_ins", text, self._tags_arg(tag))
+        if at_line_start:
+            # Nothing before input_start on its line: it (left gravity) would
+            # otherwise stay in front of what was just inserted.
+            c.mark_set("input_start", "chat_ins")
+        c.mark_unset("chat_ins")
+        c.see("end")
+
+    def _console_plain_write(self, segs):
+        """Like _console_write but for plain segments, at the very end
+        (right after the line the person just submitted)."""
+        c = self.console
+        for text, tag in segs:
+            c.insert("end-1c", text, self._tags_arg(tag))
+        c.mark_set("input_start", "end-1c")
+        c.see("end")
+
     # ------------------------------------------------------------------
-    # Terminal chat
+    # Chat
     #
-    # `m [-p <user>] <message>` at the Terminal's $ prompt (or `/m ...`
-    # while a process is running) talks to the other people in the session.
+    # The Chat panel - a dockable window like the Explorer and the Terminal
+    # - talks to the other people in the session: type a message and press
+    # Enter, or use /p, /r, /who, /mute, /unmute and /help (see chat_util).
     # Everything a peer sends is sanitized again here (chat_util) and is
-    # drawn with plain Text.insert - never through AnsiConsole - so nothing
-    # a peer types can be interpreted as a terminal escape sequence.
+    # drawn with plain Text.insert into a read-only Text widget - never
+    # through AnsiConsole - so nothing a peer types can be interpreted as a
+    # terminal escape sequence.
     # ------------------------------------------------------------------
+
+    CHAT_MAX_LINES = 5000
+
+    def _build_chat_panel(self, parent):
+        t = self.theme
+        # The input row is packed first so it keeps its room when the panel
+        # gets short.
+        self.chat_input_row = tk.Frame(parent, bg=t["bg"])
+        self.chat_input_row.pack(side="bottom", fill="x", padx=2, pady=(0, 2))
+        self.chat_body = tk.Frame(parent, bg=t["bg"])
+        self.chat_body.pack(side="top", fill="both", expand=True, padx=2, pady=2)
+
+        self.chat_yscroll = tk.Scrollbar(self.chat_body, orient="vertical", **theme.classic_scrollbar_options(t))
+        self.chat_yscroll.pack(side="right", fill="y")
+        font = (self._console_font_family, self._console_font_size)
+        self.chat_text = tk.Text(self.chat_body, height=4, wrap="word", state="disabled", bg=t["console_bg"],
+                                  fg=t["fg"], relief="flat", font=font, padx=4, pady=2,
+                                  yscrollcommand=self.chat_yscroll.set)
+        self.chat_text.pack(side="left", fill="both", expand=True)
+        self.chat_yscroll.config(command=self.chat_text.yview)
+        # A disabled Text doesn't take focus on click, which would leave
+        # Ctrl+C with nothing to copy from.
+        self.chat_text.bind("<Button-1>", lambda e: self.chat_text.focus_set(), add="+")
+
+        self.chat_entry = tk.Entry(self.chat_input_row, bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"],
+                                    disabledbackground=t["edit_bg"], disabledforeground=t["muted_fg"],
+                                    relief="flat", font=font)
+        self.chat_entry.pack(fill="x", expand=True, ipady=3)
+        for seq in ("<Return>", "<KP_Enter>"):
+            self.chat_entry.bind(seq, self._chat_submit)
+        self.chat_entry.bind("<Tab>", self._on_chat_tab)
+        self.chat_entry.bind("<Up>", self._on_chat_history)
+        self.chat_entry.bind("<Down>", self._on_chat_history)
+
+        self._refresh_chat_tags(t["console_bg"])
+        self._chat_append([("Type a message and press Enter. /help lists the chat commands.\n", "info")])
+        self._refresh_chat_state()
+
+    def _refresh_chat_state(self):
+        """Input enabled/disabled to match Settings > Chat > Enable chat."""
+        enabled = self._chat_cfg()["enabled"]
+        self.chat_entry.configure(state="normal" if enabled else "disabled")
+        if self._chat_was_enabled is not None and enabled != self._chat_was_enabled:
+            self._chat_append([("Chat turned on.\n" if enabled else
+                                "Chat turned off: nothing is shown or sent until it is turned back on "
+                                "(Settings > Chat).\n", "info")], force_scroll=True)
+        self._chat_was_enabled = enabled
 
     def _chat_cfg(self):
         return chat_settings(self.cfg)
@@ -1397,7 +1497,7 @@ class EditorApp(ttk.Frame):
         got = getattr(self.client, "username", None)
         want = getattr(self.client, "requested_username", None)
         if got and want and got != want:
-            self._console_insert_segments(
+            self._chat_append(
                 [(f"The name '{sanitize_text(want, 40)}' was already taken here; you appear as '{got}'.\n", "info")])
 
     # -- drawing -------------------------------------------------------
@@ -1415,7 +1515,9 @@ class EditorApp(ttk.Frame):
         peer's assigned color, darkened on a light background."""
         light = syntax.brightness(console_bg) >= 0.5
         colors = _console_tag_colors(console_bg)
-        c = self.console
+        c = self.chat_text
+        c.tag_configure("info", foreground=colors["info"])
+        c.tag_configure("stderr", foreground=colors["stderr"])
         c.tag_configure("chat_time", foreground=colors["info"])
         c.tag_configure("chat_link", foreground="#0b5cad" if light else "#6cb6ff", underline=True)
         c.tag_bind("chat_link", "<Enter>", lambda e: c.configure(cursor="hand2"))
@@ -1433,13 +1535,13 @@ class EditorApp(ttk.Frame):
             return "info"
         self._chat_name_tags[peer_id] = color
         light = syntax.brightness(self.theme["console_bg"]) >= 0.5
-        self.console.tag_configure(f"chat_name_{peer_id}", foreground=adapt_color(color, light))
+        self.chat_text.tag_configure(f"chat_name_{peer_id}", foreground=adapt_color(color, light))
         return f"chat_name_{peer_id}"
 
     def _chat_ref_tag(self, file, line):
         self._chat_link_n += 1
         tag = f"chat_ref_{self._chat_link_n}"
-        self.console.tag_bind(tag, "<Button-1>", lambda e, f=file, n=line: self._follow_chat_ref(f, n))
+        self.chat_text.tag_bind(tag, "<Button-1>", lambda e, f=file, n=line: self._follow_chat_ref(f, n))
         return tag
 
     def _chat_body_segments(self, text):
@@ -1473,39 +1575,24 @@ class EditorApp(ttk.Frame):
         segs.append(("\n", None))
         return segs
 
-    def _console_insert_segments(self, segs):
-        """Prints plain-text segments *above* the live input line: the
-        process's partial output / the $ prompt and anything typed after it
-        stay exactly as they were, just pushed down, and input_start stays
-        glued to them. Used for everything that can arrive at any moment
-        (chat, join/leave lines), so it never lands in the middle of what
-        the person is typing or of a streaming process's output. Bypasses
-        AnsiConsole entirely: no escape sequence can be interpreted, and a
-        half-received sequence pending in AnsiConsole is left alone."""
-        c = self.console
-        line_start = c.index("input_start linestart")
-        at_line_start = c.compare(line_start, "==", "input_start")
-        c.mark_set("chat_ins", line_start)
-        c.mark_gravity("chat_ins", "right")
-        for text, tag in segs:
-            # Through the raw command: the delete guard would clamp an
-            # insert before input_start up to input_start.
-            c.tk.call(self._console_raw_cmd, "insert", "chat_ins", text, self._tags_arg(tag))
-        if at_line_start:
-            # Nothing before input_start on its line: it (left gravity) would
-            # otherwise stay in front of what was just inserted.
-            c.mark_set("input_start", "chat_ins")
-        c.mark_unset("chat_ins")
-        c.see("end")
-
-    def _console_plain_write(self, segs):
-        """Like _console_write but for plain segments, at the very end
-        (right after the line the person just submitted)."""
-        c = self.console
-        for text, tag in segs:
-            c.insert("end-1c", text, self._tags_arg(tag))
-        c.mark_set("input_start", "end-1c")
-        c.see("end")
+    def _chat_append(self, segs, force_scroll=False):
+        """Adds [(text, tag)] segments at the end of the Chat panel. The view
+        only follows the new text when it was already at the bottom (or
+        force_scroll, for the person's own messages and command output) so
+        scrolling back through history isn't yanked away by an arrival."""
+        c = self.chat_text
+        at_bottom = c.yview()[1] >= 0.999
+        c.configure(state="normal")
+        try:
+            for text, tag in segs:
+                c.insert("end", text, self._tags_arg(tag))
+            lines = int(c.index("end-1c").split(".")[0])
+            if lines > self.CHAT_MAX_LINES:
+                c.delete("1.0", f"{lines - self.CHAT_MAX_LINES}.0")
+        finally:
+            c.configure(state="disabled")
+        if force_scroll or at_bottom:
+            c.see("end")
 
     # -- receiving -----------------------------------------------------
 
@@ -1520,8 +1607,8 @@ class EditorApp(ttk.Frame):
             return
         if "error" in payload:
             text = sanitize_text(payload["error"], 300)
-            self._console_insert_segments([(text + "\n", "stderr")])
-            if not self._console_visible:
+            self._chat_append([(text + "\n", "stderr")])
+            if not self.chat_panel.visible:
                 self._set_status(text)
             return
         if "history" in payload:
@@ -1531,14 +1618,14 @@ class EditorApp(ttk.Frame):
                 for m in msgs:
                     segs += self._chat_segments(m, force_time=True)
                 segs.append(("-- end of history --\n", "info"))
-                self._console_insert_segments(segs)   # history never notifies
+                self._chat_append(segs)   # history never notifies
             return
         if self._chat_muted(payload.get("name"), cfg):
             return
         if payload.get("private"):
             self._last_private = (payload.get("from"), sanitize_name(payload.get("name")))
-        self._console_insert_segments(self._chat_segments(payload))
-        if not self._console_visible:
+        self._chat_append(self._chat_segments(payload))
+        if not self.chat_panel.visible:
             self._chat_note_unread(cfg)
 
     # -- unread counter ------------------------------------------------
@@ -1582,10 +1669,10 @@ class EditorApp(ttk.Frame):
         self._update_unread_label()
 
     def _on_unread_click(self):
-        if self._console_visible:
+        if self.chat_panel.visible:
             self._chat_clear_unread()
         else:
-            self.toggle_console()
+            self.toggle_chat()
 
     # -- sending / commands ---------------------------------------------
 
@@ -1596,16 +1683,41 @@ class EditorApp(ttk.Frame):
                     return pr["name"]
         return sanitize_text(token, 40)
 
+    def _chat_submit(self, _event=None):
+        """Enter in the Chat input: a plain line is a message to everyone,
+        `/...` is a command (see chat_util.parse_chat_input)."""
+        line = self.chat_entry.get()
+        self.chat_entry.delete(0, "end")
+        if not line.strip():
+            return "break"
+        hist = self._chat_input_history
+        if not hist or hist[-1] != line:
+            hist.append(line)
+        self._chat_input_pos = None
+        if not self._chat_cfg()["enabled"]:
+            self._chat_error("Chat is turned off (Settings > Chat).")
+            return "break"
+        try:
+            cmd = parse_chat_input(line)
+        except ValueError as err:
+            self._chat_error(str(err))
+            return "break"
+        if cmd is not None:
+            self._handle_chat_command(cmd)
+        return "break"
+
     def _handle_chat_command(self, cmd):
         if cmd.kind == "list":
             self._chat_list_users()
         elif cmd.kind in ("mute", "unmute"):
             self._chat_set_muted(cmd.text, cmd.kind == "mute")
+        elif cmd.kind == "help":
+            self._chat_append([(line + "\n", "info") for line in CHAT_HELP], force_scroll=True)
         else:
             self._chat_send(cmd)
 
     def _chat_error(self, text):
-        self._console_plain_write([(text + "\n", "stderr")])
+        self._chat_append([(text + "\n", "stderr")], force_scroll=True)
 
     def _chat_send(self, cmd):
         text = sanitize_text(cmd.text)
@@ -1616,7 +1728,7 @@ class EditorApp(ttk.Frame):
                 return
             to = [f"#{self._last_private[0]}"]
         if not text:
-            self._chat_error(chat_usage(self._chat_cfg()["trigger"]))
+            self._chat_error("Nothing to send. Type /help for the chat commands.")
             return
         if not self.client.send_chat(text, to or None):
             self._chat_error("Not connected to a session.")
@@ -1630,12 +1742,12 @@ class EditorApp(ttk.Frame):
         segs.append((f"[{label}] ", "info"))
         segs += self._chat_body_segments(text)
         segs.append(("\n", None))
-        self._console_plain_write(segs)
+        self._chat_append(segs, force_scroll=True)
 
     def _chat_list_users(self):
         peers = sorted(self._roster, key=lambda pr: pr.get("id", 0))
         if not peers:
-            self._console_plain_write([("Nobody is connected.\n", "info")])
+            self._chat_append([("Nobody is connected.\n", "info")], force_scroll=True)
             return
         segs = [(f"{len(peers)} connected:\n", "info")]
         for pr in peers:
@@ -1644,7 +1756,7 @@ class EditorApp(ttk.Frame):
             if pr["id"] == self.client.client_id:
                 segs.append((" (you)", "info"))
             segs.append(("\n", None))
-        self._console_plain_write(segs)
+        self._chat_append(segs, force_scroll=True)
 
     def _chat_set_muted(self, user, mute):
         name = self._chat_label_for(user)
@@ -1666,10 +1778,10 @@ class EditorApp(ttk.Frame):
         except Exception:
             pass
         if mute:
-            self._console_plain_write([(f"Muted {name}: their messages are hidden "
-                                        f"({self._chat_cfg()['trigger']} -u to undo).\n", "info")])
+            self._chat_append([(f"Muted {name}: their messages are hidden (/unmute {name} to undo).\n", "info")],
+                              force_scroll=True)
         else:
-            self._console_plain_write([(f"Unmuted {name}.\n", "info")])
+            self._chat_append([(f"Unmuted {name}.\n", "info")], force_scroll=True)
 
     # -- links in messages ------------------------------------------------
 
@@ -1697,16 +1809,17 @@ class EditorApp(ttk.Frame):
         self.text.focus_set()
         self._set_status(f"Jumped to line {n}{note}")
 
-    # -- Tab completion ---------------------------------------------------
+    # -- Tab completion / input history ---------------------------------------
 
-    def _complete_chat_user(self, line):
-        """Tab after `m -p `: completes user names (or #ids) from the roster.
-        Returns "break" when the line is in that context (so path completion
-        stays out of it) and None otherwise."""
-        cfg = self._chat_cfg()
-        if not cfg["enabled"]:
+    def _on_chat_tab(self, _event=None):
+        """Tab after `/p `: completes user names (or #ids) from the roster.
+        Returns "break" when the line is in that context and None otherwise
+        (so Tab moves focus on as usual)."""
+        entry = self.chat_entry
+        if not self._chat_cfg()["enabled"]:
             return None
-        ctx = completion_context(line, cfg["trigger"])
+        pos = entry.index("insert")
+        ctx = completion_context(entry.get()[:pos])
         if ctx is None:
             return None
         _prefix, fragment, quote = ctx
@@ -1718,7 +1831,6 @@ class EditorApp(ttk.Frame):
         cands = sorted((n for n in names if n.lower().startswith(low)), key=str.lower)
         if not cands:
             return "break"
-        region = f"insert-{len(fragment) + len(quote)}c"
         if len(cands) == 1:
             new = format_name_for_command(cands[0], quote, close=True) + " "
         else:
@@ -1726,10 +1838,34 @@ class EditorApp(ttk.Frame):
             if len(common) > len(fragment):
                 new = format_name_for_command(cands[0][:len(common)], quote, close=False)
             else:
-                self._console_insert_segments([("   ".join(cands) + "\n", "info")])
+                self._chat_append([("   ".join(cands) + "\n", "info")], force_scroll=True)
                 return "break"
-        self.console.delete(region, "insert")
-        self.console.insert("insert", new)
+        start = pos - len(fragment) - len(quote)
+        entry.delete(start, pos)
+        entry.insert(start, new)
+        return "break"
+
+    def _on_chat_history(self, event):
+        """Up/Down in the Chat input: recall what was sent before."""
+        hist = self._chat_input_history
+        if not hist:
+            return "break"
+        if self._chat_input_pos is None:
+            if event.keysym != "Up":
+                return "break"
+            self._chat_input_stash = self.chat_entry.get()
+            self._chat_input_pos = len(hist) - 1
+        else:
+            self._chat_input_pos += -1 if event.keysym == "Up" else 1
+        self._chat_input_pos = max(self._chat_input_pos, 0)
+        if self._chat_input_pos >= len(hist):
+            self._chat_input_pos = None
+            text = self._chat_input_stash
+        else:
+            text = hist[self._chat_input_pos]
+        self.chat_entry.delete(0, "end")
+        self.chat_entry.insert(0, text)
+        self.chat_entry.icursor("end")
         return "break"
 
     # ------------------------------------------------------------------
@@ -1956,13 +2092,12 @@ class EditorApp(ttk.Frame):
         self.status_left.configure(text=text)
 
     def _persist_ui_state(self):
-        """Remembers panel visibility, their manually-adjusted sizes,
+        """Remembers the panel layout (which panels are showing, where each
+        is docked or floating, and its size - see dock.DockManager.save),
         which Connect-screen tab this session started from, and the
         editor's zoomed-in/out font size, so all of it comes back the
         same way next time."""
         ui = self.cfg.setdefault("ui", {})
-        ui["explorer_visible"] = self._explorer_visible
-        ui["console_visible"] = self._console_visible
         ui["last_tab"] = {"solo": "Open", "p2p": "Peer to Peer"}.get(self.mode, "Connect")
         ui["editor_font_size"] = self._font_size
         ui["explorer_font_size"] = self._explorer_font_size
@@ -1971,10 +2106,7 @@ class EditorApp(ttk.Frame):
         ui["console_font_family"] = self._console_font_family
         ui["explorer_sort_key"] = self.explorer._sort_key
         ui["explorer_sort_reverse"] = self.explorer._sort_reverse
-        if self._explorer_visible:
-            ui["explorer_width"] = self.explorer.winfo_width()
-        if self._console_visible:
-            ui["console_height"] = self.console_frame.winfo_height()
+        self.dock.save(self.cfg)
         for dialog in list(FindDialog._instances):
             dialog._store_state()
         config.save_config(self.cfg)
@@ -2387,7 +2519,7 @@ class EditorApp(ttk.Frame):
             return
         who = next((n for pid, n in self._known_peer_names.items() if pid == by), "someone")
         label = sanitize_text(filename, 200) if filename else "a blank buffer"
-        self._console_insert_segments([(f"{sanitize_name(who)} loaded {label} into the shared buffer\n", "info")])
+        self._chat_append([(f"{sanitize_name(who)} loaded {label} into the shared buffer\n", "info")])
 
     # ------------------------------------------------------------------
     # Buffer tabs
@@ -2856,20 +2988,6 @@ class EditorApp(ttk.Frame):
             return
         if command.startswith("\\share") and command[6:7] in ("", " "):
             command = command[1:]       # `\share ...` runs a program really named share
-        cfg = self._chat_cfg()
-        if cfg["enabled"]:
-            try:
-                chat = parse_chat_command(command, cfg["trigger"])
-            except ValueError as err:
-                self._console_plain_write([(f"{err}\n", "stderr")])
-                self._show_prompt()
-                return
-            if chat is not None:
-                if chat.kind != "shell":
-                    self._handle_chat_command(chat)
-                    self._show_prompt()
-                    return
-                command = chat.text  # `\\m ...`: really run the shell command named m
         self.ansi_console.flush()
         self.ansi_console.state.reset()
         self._launch_process(command, shell=True)
@@ -3143,9 +3261,6 @@ class EditorApp(ttk.Frame):
         if self.console.compare(cursor, "<", "input_start"):
             return None
         line = self.console.get("input_start", cursor)
-        chat_result = self._complete_chat_user(line)
-        if chat_result is not None:
-            return chat_result
         word = re.search(r"\S*$", line).group()
         quote = ""
         if word[:1] in ("'", '"'):
@@ -3256,18 +3371,6 @@ class EditorApp(ttk.Frame):
             if share is not None:
                 self._share_command(share)
                 return
-            cfg = self._chat_cfg()
-            if cfg["enabled"]:
-                # While a process runs every line is its stdin - except the
-                # explicit `/m ...` form, which is chat.
-                try:
-                    chat = parse_chat_command(text, cfg["trigger"], running=True)
-                except ValueError as err:
-                    self._console_plain_write([(f"{err}\n", "stderr")])
-                    return
-                if chat is not None:
-                    self._handle_chat_command(chat)
-                    return
             if not self.run_proc.stdin:
                 return
             try:

@@ -18,8 +18,20 @@ DEFAULTS = {
         "p2p_join_address": "",
     },
     "ui": {
+        # Which panels are showing. Where each one is (docked left/right/
+        # bottom or floating in its own window) and how big lives in the
+        # separate "layout" section below.
         "explorer_visible": True,
         "console_visible": True,
+        "chat_visible": True,
+        # Which parts of the panel layout are remembered between launches
+        # (Settings > General > Window): the side each panel is docked on /
+        # whether it floats, its size, and where its floating window sits.
+        # Same rule as the window options above - turning one off deletes it
+        # from the config on close, so that part starts from the defaults.
+        "save_panel_layout": True,
+        "save_panel_size": True,
+        "save_panel_position": True,
         "last_tab": "Open",
         "window_size": "",
         "window_position": "",
@@ -70,12 +82,18 @@ DEFAULTS = {
             "interrupted": True,
         },
     },
-    # Terminal chat (the `m` command). See chat_util.CHAT_DEFAULTS for the
-    # meaning of each key; editor.py reads this section through
-    # chat_util.chat_settings(), which tolerates missing or garbled values.
+    # Where each dockable panel ("explorer", "terminal", "chat") sits - see
+    # dock.DockManager.save/load for the keys: dock ("left"/"right"/
+    # "bottom"), floating, w/h (docked size), float_size ("WxH") and
+    # float_pos ("+X+Y"). Left empty here on purpose: a missing entry means
+    # "use the panel's default", which also migrates configs from before
+    # panels could move (ui.explorer_width / ui.console_height).
+    "layout": {},
+    # The Chat panel. See chat_util.CHAT_DEFAULTS for the meaning of each
+    # key; editor.py reads this section through chat_util.chat_settings(),
+    # which tolerates missing or garbled values.
     "chat": {
         "enabled": True,
-        "trigger": "m",
         "show_timestamps": False,
         "notify": True,
         "notify_bell": False,
@@ -202,6 +220,9 @@ def load_config():
         data = {}
     cfg = _deep_merge(DEFAULTS, data)
     _migrate_window_geometry(cfg)
+    # The Terminal's chat trigger word is gone (chat has its own panel now).
+    if isinstance(cfg.get("chat"), dict):
+        cfg["chat"].pop("trigger", None)
     return cfg
 
 

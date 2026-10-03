@@ -69,10 +69,12 @@ class FileExplorer(ttk.Frame):
         header.pack(fill="x")
         ttk.Button(header, text="Refresh", width=8, style="Toolbar.TButton",
                    command=self.refresh).pack(side="right", padx=2)
+        # Collapse All sits at the left edge, Refresh at the right. (The
+        # "EXPLORER" title lives in the dockable panel's own header - see
+        # dock.DockPanel - so the spacer below just keeps them apart.)
         ttk.Button(header, text="Collapse All", style="Toolbar.Thin.TButton",
-                   command=self.collapse_all).pack(side="right", padx=2)
-        ttk.Label(header, text="EXPLORER", font=("Segoe UI", 9, "bold")).pack(
-            side="left", fill="x", expand=True, padx=6, pady=4)
+                   command=self.collapse_all).pack(side="left", padx=2)
+        ttk.Frame(header).pack(side="left", fill="x", expand=True, pady=4)
 
         tree_frame = ttk.Frame(self)
         tree_frame.pack(fill="both", expand=True)

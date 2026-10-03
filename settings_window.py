@@ -4,7 +4,7 @@ from tkinter import ttk, messagebox, simpledialog, font as tkfont
 import color_picker
 import config
 import copy
-from chat_util import chat_settings, normalize_trigger, sanitize_name
+from chat_util import chat_settings, sanitize_name
 import file_explorer
 import scrollutil
 
@@ -309,6 +309,9 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg["save_window_size"] = self.save_window_size_var.get()
             ui_cfg["save_find_window_position"] = self.save_find_window_position_var.get()
             ui_cfg["save_find_window_size"] = self.save_find_window_size_var.get()
+            ui_cfg["save_panel_layout"] = self.save_panel_layout_var.get()
+            ui_cfg["save_panel_size"] = self.save_panel_size_var.get()
+            ui_cfg["save_panel_position"] = self.save_panel_position_var.get()
         if self.on_apply:
             try:
                 self.on_apply(set(sections))
@@ -398,6 +401,12 @@ class SettingsWindow(tk.Toplevel):
         self._orig_save_find_window_size = ui_cfg.get("save_find_window_size", True)
         self.save_find_window_position_var = tk.BooleanVar(value=self._orig_save_find_window_position)
         self.save_find_window_size_var = tk.BooleanVar(value=self._orig_save_find_window_size)
+        self._orig_save_panel_layout = ui_cfg.get("save_panel_layout", True)
+        self._orig_save_panel_size = ui_cfg.get("save_panel_size", True)
+        self._orig_save_panel_position = ui_cfg.get("save_panel_position", True)
+        self.save_panel_layout_var = tk.BooleanVar(value=self._orig_save_panel_layout)
+        self.save_panel_size_var = tk.BooleanVar(value=self._orig_save_panel_size)
+        self.save_panel_position_var = tk.BooleanVar(value=self._orig_save_panel_position)
 
         section_header(row, "Run")
         row += 1
@@ -441,9 +450,23 @@ class SettingsWindow(tk.Toplevel):
         ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
            activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(2, 4))
         row += 1
+        for var, text in (
+                (self.save_panel_layout_var, "Remember panel layout (which side the Explorer, Terminal and Chat "
+                                             "are docked on, or whether they float)"),
+                (self.save_panel_size_var, "Remember panel sizes (docked and floating)"),
+                (self.save_panel_position_var, "Remember where detached panel windows sit")):
+            self._reg(tk.Checkbutton(
+                rows, text=text, variable=var, bg=t["panel_bg"], fg=t["fg"],
+                selectcolor=t["edit_bg"], activebackground=t["panel_bg"], activeforeground=t["fg"],
+                highlightthickness=0, anchor="w", justify="left", command=lambda: self._preview({"ui"}),
+            ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
+               activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
+            row += 1
         window_desc_label = self._reg(tk.Label(
             rows, text="Unchecking one deletes it from the config file on close, so next time "
-                       "that window opens with that part placed/sized automatically. "
+                       "that window or panel opens with that part placed/sized automatically. "
+                       "Drag a panel's title bar to dock it on another side or drop it outside the "
+                       "window to detach it; View > Reset Panel Layout restores the defaults. "
                        "(The Find/Replace window's checkboxes - Match case, Whole word, "
                        "Wrap around - are always remembered.)",
             bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left"),
@@ -740,9 +763,9 @@ class SettingsWindow(tk.Toplevel):
         scrollutil.bind_wheel(_canvas, rows)
 
     def _build_chat_tab(self, parent):
-        """Settings > Chat: the Terminal chat (`m` command) options. Like the
-        General page, every change is applied to the running app right away
-        (via _preview) and only reverted by Cancel or kept by Save."""
+        """Settings > Chat: the Chat panel's options. Like the General page,
+        every change is applied to the running app right away (via
+        _preview) and only reverted by Cancel or kept by Save."""
         t = self.app.theme
         _canvas, rows = self._make_scrollable_rows(parent, t)
         rows.columnconfigure(0, weight=1)
@@ -762,40 +785,29 @@ class SettingsWindow(tk.Toplevel):
             self._reg(tk.Checkbutton(
                 rows, text=text, variable=var, bg=t["panel_bg"], fg=t["fg"], selectcolor=t["edit_bg"],
                 activebackground=t["panel_bg"], activeforeground=t["fg"], highlightthickness=0, anchor="w",
-                command=lambda k=key: self._on_chat_toggled(k),
+                justify="left", command=lambda k=key: self._on_chat_toggled(k),
             ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
                activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
 
         self.chat_vars = {}
         row = 0
-        label(row, "Terminal chat", pady=(4, 2)).configure(font=("Segoe UI", 9, "bold"))
+        label(row, "Chat", pady=(4, 2)).configure(font=("Segoe UI", 9, "bold"))
         row += 1
-        label(row, "Talk to the other people in the session from the Terminal's $ prompt: "
-                   "m <message>, m -p <user> <message>, m -r <reply>, m -l (who's here), "
-                   "m -m / -u <user> (mute / unmute). While a program runs, use /m instead.",
+        label(row, "The Chat panel sits next to the Terminal by default. Drag its title bar to dock it "
+                   "elsewhere or drop it outside the window to detach it (View > Toggle Chat shows or "
+                   "hides it). Type a message and press Enter to send it to everyone; /p <user> <message> "
+                   "is private, /r replies, /who lists who is here, /mute and /unmute <user> hide or show "
+                   "someone, /help lists them all.",
               fg="muted_fg", pady=(0, 8))
         row += 1
-        check(row, "enabled", "Enable terminal chat (show incoming messages, and treat the trigger word as chat)")
-        row += 1
-
-        label(row, "Command trigger word", pady=(10, 2))
-        row += 1
-        self.chat_trigger_var = tk.StringVar(value=chat.get("trigger", "m"))
-        entry = self._reg(tk.Entry(rows, textvariable=self.chat_trigger_var, width=12, bg=t["edit_bg"], fg=t["fg"],
-                                   insertbackground=t["fg"], relief="flat"),
-                          bg="edit_bg", fg="fg", insertbackground="fg")
-        entry.grid(row=row, column=0, sticky="w", padx=4, pady=2)
-        self.chat_trigger_note = self._reg(tk.Label(rows, text="", bg=t["panel_bg"], fg=t["muted_fg"], anchor="w"),
-                                           bg="panel_bg")
-        self.chat_trigger_note.grid(row=row, column=1, sticky="we", padx=4)
-        self.chat_trigger_var.trace_add("write", lambda *_: self._on_chat_trigger_edited())
+        check(row, "enabled", "Enable chat (show incoming messages and allow sending)")
         row += 1
 
         label(row, "Notifications", pady=(14, 2)).configure(font=("Segoe UI", 9, "bold"))
         row += 1
         check(row, "show_timestamps", "Show a timestamp before each message")
         row += 1
-        check(row, "notify", "Flash the unread counter when a message arrives while the Terminal is hidden")
+        check(row, "notify", "Flash the unread counter when a message arrives while the Chat panel is hidden")
         row += 1
         check(row, "notify_bell", "Also ring the system bell")
         row += 1
@@ -804,7 +816,7 @@ class SettingsWindow(tk.Toplevel):
 
         label(row, "Display", pady=(14, 2)).configure(font=("Segoe UI", 9, "bold"))
         row += 1
-        check(row, "show_join_leave", "Show join / leave lines in the Terminal")
+        check(row, "show_join_leave", "Show join / leave lines in the Chat panel")
         row += 1
         check(row, "color_names", "Color names with each person's assigned color")
         row += 1
@@ -818,7 +830,7 @@ class SettingsWindow(tk.Toplevel):
             rows, text="Share the output of MY runs with everyone in the session (off at every launch)",
             variable=self.share_output_var, bg=t["panel_bg"], fg=t["fg"], selectcolor=t["edit_bg"],
             activebackground=t["panel_bg"], activeforeground=t["fg"], highlightthickness=0, anchor="w",
-            command=self._on_share_output_toggled,
+            justify="left", command=self._on_share_output_toggled,
         ), bg="panel_bg", fg="fg", selectcolor="edit_bg", activebackground="panel_bg",
            activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
         row += 1
@@ -839,23 +851,18 @@ class SettingsWindow(tk.Toplevel):
         row += 1
         label(row, "Reset to Defaults on this page also clears the muted list.", fg="muted_fg", pady=(8, 2))
 
+        # Every widget above exists by now, so bind_wheel's recursive walk
+        # reaches all of them. This call was missing here, which is why
+        # wheel/touchpad scrolling worked on every other tab but went dead
+        # over this one - see _make_scrollable_rows's docstring.
+        scrollutil.bind_wheel(_canvas, rows)
+
     def _on_chat_toggled(self, key):
         self.cfg["chat"][key] = bool(self.chat_vars[key].get())
         self._preview({"chat"})
 
     def _on_share_output_toggled(self):
         self.share_output_var.set(self.app.set_share_output(self.share_output_var.get(), confirm=True))
-
-    def _on_chat_trigger_edited(self):
-        if self._suspend_preview:
-            return
-        value = normalize_trigger(self.chat_trigger_var.get())
-        if value is None:
-            self.chat_trigger_note.configure(text="1-16 characters, no spaces (keeps the current word)")
-            return
-        self.chat_trigger_note.configure(text="")
-        self.cfg["chat"]["trigger"] = value
-        self._preview({"chat"})
 
     def _on_chat_muted_edited(self):
         if self._suspend_preview:
@@ -870,8 +877,6 @@ class SettingsWindow(tk.Toplevel):
         try:
             for key, var in self.chat_vars.items():
                 var.set(bool(chat[key]))
-            self.chat_trigger_var.set(chat["trigger"])
-            self.chat_trigger_note.configure(text="")
             self.chat_muted_var.set(", ".join(chat["muted"]))
             self.share_output_var.set(self.app._share_on)
         finally:
@@ -1626,6 +1631,7 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["output_shortcuts"] = dict(config.DEFAULTS["output_shortcuts"])
         self.cfg["theme"] = dict(config.DEFAULTS["theme"])
         self.cfg["ui"] = dict(config.DEFAULTS["ui"])
+        self.cfg["layout"] = dict(config.DEFAULTS["layout"])
         self.cfg["theme_presets"] = dict(config.DEFAULTS["theme_presets"])
         self.cfg["editor"] = {
             "default_new_file_language": config.DEFAULTS["editor"]["default_new_file_language"],
@@ -1660,6 +1666,12 @@ class SettingsWindow(tk.Toplevel):
         self._orig_save_find_window_size = self.cfg["ui"]["save_find_window_size"]
         self.save_find_window_position_var.set(self._orig_save_find_window_position)
         self.save_find_window_size_var.set(self._orig_save_find_window_size)
+        self._orig_save_panel_layout = self.cfg["ui"]["save_panel_layout"]
+        self._orig_save_panel_size = self.cfg["ui"]["save_panel_size"]
+        self._orig_save_panel_position = self.cfg["ui"]["save_panel_position"]
+        self.save_panel_layout_var.set(self._orig_save_panel_layout)
+        self.save_panel_size_var.set(self._orig_save_panel_size)
+        self.save_panel_position_var.set(self._orig_save_panel_position)
         base_font_size = int(self.cfg["theme"].get("font_size", 11))
         base_font_family = self.cfg["theme"].get("font_family", CODE_FONT)
         self.cfg["ui"]["explorer_font_size"] = 9
@@ -1745,6 +1757,9 @@ class SettingsWindow(tk.Toplevel):
             var.set(term_cfg.get(key, True))
         self.word_wrap_var.set(self.cfg.get("editor", {}).get("word_wrap", config.DEFAULTS["editor"]["word_wrap"]))
         ui_cfg = self.cfg.get("ui", {})
+        self.save_panel_layout_var.set(ui_cfg.get("save_panel_layout", True))
+        self.save_panel_size_var.set(ui_cfg.get("save_panel_size", True))
+        self.save_panel_position_var.set(ui_cfg.get("save_panel_position", True))
         sort_key = ui_cfg.get("explorer_sort_key", config.DEFAULTS["ui"]["explorer_sort_key"])
         self.explorer_sort_key_var.set(dict(self._sort_key_choices).get(sort_key, "Name"))
         self.explorer_sort_reverse_var.set(
@@ -1803,6 +1818,8 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg = self.cfg.setdefault("ui", {})
             ui_cfg["explorer_sort_key"] = config.DEFAULTS["ui"]["explorer_sort_key"]
             ui_cfg["explorer_sort_reverse"] = config.DEFAULTS["ui"]["explorer_sort_reverse"]
+            for key in ("save_panel_layout", "save_panel_size", "save_panel_position"):
+                ui_cfg[key] = config.DEFAULTS["ui"][key]
             self._refresh_general_ui()
             self._preview({"editor", "ui"})
 
@@ -1843,6 +1860,10 @@ class SettingsWindow(tk.Toplevel):
             changed.add("ui")
         if self.save_find_window_size_var.get() != self._orig_save_find_window_size:
             changed.add("ui")
+        if (self.save_panel_layout_var.get() != self._orig_save_panel_layout
+                or self.save_panel_size_var.get() != self._orig_save_panel_size
+                or self.save_panel_position_var.get() != self._orig_save_panel_position):
+            changed.add("ui")
         if self.cfg.get("ui", {}).get("explorer_font_size", self._orig_explorer_font_size) \
                 != self._orig_explorer_font_size:
             changed.add("ui")
@@ -1878,6 +1899,9 @@ class SettingsWindow(tk.Toplevel):
         ui_cfg["save_window_size"] = self.save_window_size_var.get()
         ui_cfg["save_find_window_position"] = self.save_find_window_position_var.get()
         ui_cfg["save_find_window_size"] = self.save_find_window_size_var.get()
+        ui_cfg["save_panel_layout"] = self.save_panel_layout_var.get()
+        ui_cfg["save_panel_size"] = self.save_panel_size_var.get()
+        ui_cfg["save_panel_position"] = self.save_panel_position_var.get()
         config.save_config(self.cfg)
 
         self.destroy()
@@ -1931,6 +1955,13 @@ class SettingsWindow(tk.Toplevel):
                 or ui_cfg.get("save_find_window_size", True) != self._orig_save_find_window_size):
             ui_cfg["save_find_window_position"] = self._orig_save_find_window_position
             ui_cfg["save_find_window_size"] = self._orig_save_find_window_size
+            reverted.add("ui")
+        if (ui_cfg.get("save_panel_layout", True) != self._orig_save_panel_layout
+                or ui_cfg.get("save_panel_size", True) != self._orig_save_panel_size
+                or ui_cfg.get("save_panel_position", True) != self._orig_save_panel_position):
+            ui_cfg["save_panel_layout"] = self._orig_save_panel_layout
+            ui_cfg["save_panel_size"] = self._orig_save_panel_size
+            ui_cfg["save_panel_position"] = self._orig_save_panel_position
             reverted.add("ui")
         if ui_cfg.get("explorer_font_size", self._orig_explorer_font_size) != self._orig_explorer_font_size:
             ui_cfg["explorer_font_size"] = self._orig_explorer_font_size
