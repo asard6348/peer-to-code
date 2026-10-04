@@ -2601,8 +2601,8 @@ class EditorApp(ttk.Frame):
         next new/blank tab instead of jumping straight to 3."""
         used = set()
         for tab in self._tabs:
-            if tab.untitled_no is None:
-                continue
+            if tab.untitled_no is None or not tab.visible:
+                continue  # hidden (closed) tabs don't hold a number
             if tab.current_file or (tab.shared and tab.filename_hint):
                 continue  # no longer displayed as Untitled-N; number is free
             used.add(tab.untitled_no)
@@ -2737,6 +2737,9 @@ class EditorApp(ttk.Frame):
             tab.loaded_mtime = None
             tab.local_edited = False
             tab.saved_doc = tab.doc
+            # Give up its "Untitled-N" number; it gets a fresh one if the
+            # tab is shown again.
+            tab.untitled_no = None
         else:
             self._tabs.remove(tab)
         if tab is self._active:
