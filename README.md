@@ -1,52 +1,61 @@
-# PEER TO CODE
+# Peer to Code
 
-Peer to Code is a lightweight desktop text/code editor built with Python's
-Tkinter GUI toolkit. Alongside standard editing features (syntax
-highlighting for Python, Shell, C/C++, C#, Lua, and Rust, a file explorer,
-theming, drag-and-drop file opening, and running scripts from within the
-editor), it adds real-time collaboration: multiple people can connect to
-the same session (client/server or peer-to-peer) and edit the same file
-together, with changes synchronized live using operational transformation.
+A lightweight text and code editor with real-time collaboration.
+Edit the same file together with other people, live, over a server or peer-to-peer.
 
-## DOWNLOAD
+## Features
 
-Prebuilt executables are available on the
-[Releases page](https://github.com/asard6348/peer-to-code/releases/latest).
-Download the file for your OS and run it.
+- **Live collaboration** – host or join a session and edit together, with
+  everyone's cursors visible
+- **Two ways to connect** – a host/client session, or a decentralized
+  peer-to-peer mesh
+- **Chat** – talk to your session without leaving the editor
+- **Tabs** – work on several files at once
+- **Syntax highlighting** for 30+ languages
+- **Run your code** from the editor, with output in a built-in terminal
+- **File explorer**, drag-and-drop file opening, and themes
+- **Dockable panels** – move the Explorer, Terminal and Chat around, or
+  detach them into their own windows
 
-> Note: unsigned executables may trigger a SmartScreen/Gatekeeper warning.
+## Download
 
-## RUN FROM SOURCE
+Grab the file for your OS from the
+[Releases page](https://github.com/asard6348/peer-to-code/releases/latest)
+and run it.
 
-1. Make sure Python 3 is installed on your system.
-2. Clone or download the repository:
-       git clone https://github.com/asard6348/peer-to-code.git
-       cd peer-to-code
-3. (Optional but recommended) Install the optional dependency for
-   drag-and-drop support:
-       pip install tkinterdnd2
-4. Run the program:
-       python main.py
-   Optional arguments:
-       python main.py --config /path/to/config.json   (use a custom config file)
-       python main.py /path/to/file_or_folder          (open a file/folder on start)
-5. When the app opens, use the "Connect" screen to either host a new
-   collaborative session or join an existing one (via server address or
-   peer-to-peer), then start editing together.
+> Unsigned executables may trigger a SmartScreen or Gatekeeper warning.
 
+## Run from source
 
-## DEPENDENCIES
+You need Python 3 with Tkinter (on Linux: `sudo apt install python3-tk`).
 
-- Python 3.x
-- Tkinter (usually included with Python; on Linux you may need to install
-  it separately, e.g. `sudo apt install python3-tk`)
-- tkinterdnd2 (optional - enables drag-and-drop file opening; the app runs
-  fine without it, just without that feature)
-  
-## CREDITS
+```bash
+git clone https://github.com/asard6348/peer-to-code.git
+cd peer-to-code
+pip install tkinterdnd2   # optional, enables drag-and-drop
+python main.py
+```
 
-Code implementation:
-- Claude Sonnet
+Optional arguments:
 
-Icon:
-- [@le-jacob](https://github.com/le-jacob)
+```bash
+python main.py /path/to/file_or_folder     # open a file or folder on start
+python main.py --config /path/to/config.json   # use a custom config file
+```
+
+## Getting started
+
+When the app opens, pick a tab on the start screen:
+
+- **Open** – just edit locally, no networking
+- **Connect** – host a session, or join one by address (`host:port`)
+- **Peer to Peer** – start a new mesh, or join one through any member
+
+## License
+
+[GPL-3.0](LICENSE.txt)
+
+## Credits
+
+- Code: Claude Sonnet
+- Icon: [@le-jacob](https://github.com/le-jacob)
