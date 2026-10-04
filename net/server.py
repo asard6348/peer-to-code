@@ -182,11 +182,29 @@ class Server:
             self.history.append(op)
             applied_at = self.revision
             self.revision += 1
+            self._shift_cursors(op, client_id)
 
         message = {"base_rev": applied_at, "ops": op.to_json(), "from": client_id}
         if swap is not None:
             message["swap"] = swap
         self._broadcast(p.OP, message, reliable=True)
+
+    def _shift_cursors(self, op, author_id):
+        """Moves every stored cursor along with an applied op, so the
+        positions handed to someone joining (the roster) still point at the
+        same text instead of the offsets last reported before the edit."""
+        for rec in self.clients.values():
+            cur = rec.cursor
+            if not isinstance(cur, dict):
+                continue
+            moved = dict(cur)
+            mine = rec.client_id == author_id
+            if isinstance(cur.get("index"), int):
+                moved["index"] = ot.transform_position(op.ops, cur["index"], stick_right=mine)
+            if cur.get("sel") and isinstance(cur.get("start"), int) and isinstance(cur.get("end"), int):
+                moved["start"] = ot.transform_position(op.ops, cur["start"], stick_right=True)
+                moved["end"] = ot.transform_position(op.ops, cur["end"], stick_right=False)
+            rec.cursor = moved
 
     def _resend_full_sync(self, addr):
         with self._lock:

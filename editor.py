@@ -349,7 +349,15 @@ class EditorApp(ttk.Frame):
         # the native Mac menu bar for no benefit), and Linux/X11 already
         # draws tk.Menu itself and honors these colors - see _theme_menus -
         # so both keep the native menu bar as before.
-        self._use_custom_menubar = sys.platform.startswith("win")
+        #
+        # Linux/X11 gets the in-window bar too, for a different reason: a
+        # native X11 menu bar is stacked *on top of* the window rather than
+        # drawn inside it, so attaching it made the whole window one
+        # menubar-height taller (and its contents that much lower) the moment
+        # a session opened, compared with the Connect screen. An in-window
+        # bar can't change the window's size: the status bar and everything
+        # else stays inside the geometry the window was given.
+        self._use_custom_menubar = sys.platform.startswith(("win", "linux"))
 
         old_bar = getattr(self, "_custom_menubar", None)
         if old_bar is not None:
@@ -448,6 +456,7 @@ class EditorApp(ttk.Frame):
         m_run.add_command(label="Stop", accelerator=a("stop"), command=self.action_stop)
 
         m_view = add_menu("View")
+        self._view_menu = m_view
         m_view.add_command(label="Toggle Explorer", accelerator=a("toggle_explorer"), command=self.toggle_explorer)
         m_view.add_command(label="Toggle Terminal", accelerator=a("toggle_output"), command=self.toggle_console)
         m_view.add_command(label="Toggle Chat", accelerator=a("toggle_chat"), command=self.toggle_chat)
@@ -523,6 +532,7 @@ class EditorApp(ttk.Frame):
             self.shortcuts = dict(self.cfg["shortcuts"])
             self._apply_shortcuts()
             self._build_menu()
+            self._apply_chat_availability()
         if "output_shortcuts" in changed:
             self.output_shortcuts = dict(self.cfg["output_shortcuts"])
             self._apply_output_shortcuts()
@@ -547,6 +557,7 @@ class EditorApp(ttk.Frame):
                                         ui_cfg.get("explorer_sort_reverse", self.explorer._sort_reverse))
         if "chat" in changed:
             self._refresh_chat_tags(self.theme["console_bg"])
+            self._apply_chat_availability()
             self._update_unread_label()
             self._refresh_chat_state()
         if "editor" in changed:
@@ -828,6 +839,7 @@ class EditorApp(ttk.Frame):
         self.text.bind("<Control-y>", self.action_redo)
         self.text.bind("<<Paste>>", self._on_text_paste)
         self._bind_zoom_gestures()
+        self._apply_chat_availability()
         self.dock.present_all()
 
     def _on_yscroll(self, *args):
@@ -858,9 +870,30 @@ class EditorApp(ttk.Frame):
         self.terminal_panel.toggle()
 
     def toggle_chat(self):
+        if not self._chat_available():
+            self._set_status("Chat is hidden in unshared sessions (Settings > Chat).")
+            return
         self.chat_panel.toggle()
         if self.chat_panel.visible:
             self.chat_entry.focus_set()
+
+    def _chat_available(self):
+        """False for the Chat panel in an unshared session (opened from the
+        Open tab - nobody else can join it) when Settings > Chat > "Show the
+        Chat panel also in an unshared session" is off."""
+        return self.mode != "solo" or self._chat_cfg()["show_in_solo"]
+
+    def _apply_chat_availability(self):
+        """Shows or hides the Chat panel to match _chat_available(), without
+        touching whether the person last had it open or closed."""
+        available = self._chat_available()
+        self.dock.set_disabled(self.chat_panel, not available)
+        try:
+            self._view_menu.entryconfigure("Toggle Chat", state="normal" if available else "disabled")
+        except (tk.TclError, AttributeError):
+            pass
+        if not available:
+            self._chat_clear_unread()
 
     def reset_panel_layout(self):
         self.dock.reset()
@@ -1204,7 +1237,15 @@ class EditorApp(ttk.Frame):
         self._refresh_dirty()
         self._update_cursor_status()
         if self._active.shared:
+            self._shift_peer_cursors(op)
             self.client.local_edit(op)
+
+    def _shift_peer_cursors(self, op, author=None):
+        """Keeps the other people's carets on the same text when the shared
+        document changes under them (see PeerCursorLayer.apply_op)."""
+        layer = getattr(self, "cursor_layer", None)
+        if layer is not None:
+            layer.apply_op(op.ops, author)
 
     def _on_local_delete(self, off_start, off_end):
         self._redraw_linenumbers()
@@ -1221,6 +1262,7 @@ class EditorApp(ttk.Frame):
         self._refresh_dirty()
         self._update_cursor_status()
         if self._active.shared:
+            self._shift_peer_cursors(op)
             self.client.local_edit(op)
 
     def _on_full_sync(self, text):
@@ -1302,6 +1344,9 @@ class EditorApp(ttk.Frame):
             tab.history.record(author_key, op, before)
             if tab.dirty != was_dirty:
                 self._refresh_tabs()
+        # Their carets are offsets into the shared document, so they follow
+        # this edit whether or not that document is the buffer on screen.
+        self._shift_peer_cursors(op, author)
         if swap is not None:
             # The peer's buffer is a clean starting point, not "our edits".
             tab.saved_doc = tab.doc
@@ -1319,6 +1364,7 @@ class EditorApp(ttk.Frame):
         self._apply_op_to_widget(op)
         self.doc = op.apply(before)
         if self._active.shared:
+            self._shift_peer_cursors(op)
             self.client.local_edit(op)
         self._place_caret_after(op)
         self._refresh_dirty()
@@ -1603,7 +1649,7 @@ class EditorApp(ttk.Frame):
 
     def _show_chat(self, payload):
         cfg = self._chat_cfg()
-        if not cfg["enabled"] or not isinstance(payload, dict):
+        if not cfg["enabled"] or not isinstance(payload, dict) or not self._chat_available():
             return
         if "error" in payload:
             text = sanitize_text(payload["error"], 300)
@@ -3630,6 +3676,10 @@ class EditorApp(ttk.Frame):
         left alone rather than guessed at)."""
         text = self.text
         if text.tag_ranges("sel"):
+            return None
+        if event is not None and getattr(event, "state", 0) & 0x4:
+            # Ctrl+Backspace is "delete the previous word" (see word_nav),
+            # not "back out one indent level".
             return None
         line_no, col = (int(p) for p in text.index("insert").split("."))
         if col == 0:

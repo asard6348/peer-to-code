@@ -94,6 +94,10 @@ class DockPanel:
         t = mgr.theme
 
         self.visible = True
+        # Unavailable right now (e.g. Chat in an unshared session): kept off
+        # screen whatever `visible` says, and `visible` - the person's own
+        # preference, which is what gets saved - is left alone.
+        self.disabled = False
         self.floating = False
         self.dock = spec["dock"]            # side used when docked (kept while floating)
         self.size = tuple(spec["size"])     # last known docked (width, height)
@@ -149,6 +153,8 @@ class DockPanel:
         self.mgr.set_visible(self, False)
 
     def toggle(self):
+        if self.disabled:
+            return
         self.mgr.set_visible(self, not self.visible)
 
     @property
@@ -251,6 +257,15 @@ class DockManager:
         if self.on_visibility:
             self.on_visibility(panel)
 
+    def set_disabled(self, panel, disabled):
+        """Takes `panel` out of (or back into) the layout without touching
+        its `visible` preference, so it comes back exactly as it was."""
+        disabled = bool(disabled)
+        if panel.disabled == disabled:
+            return
+        panel.disabled = disabled
+        self.refresh(panel)
+
     def raise_panel(self, panel):
         if panel._shown == FLOAT:
             try:
@@ -298,7 +313,7 @@ class DockManager:
     def refresh(self, panel):
         """Makes the screen match the panel's (visible, floating, dock)."""
         want = None
-        if panel.visible:
+        if panel.visible and not panel.disabled:
             want = FLOAT if panel.floating else panel.dock
         old = panel._shown
         if want == old:

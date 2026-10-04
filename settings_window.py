@@ -820,6 +820,8 @@ class SettingsWindow(tk.Toplevel):
         row += 1
         check(row, "color_names", "Color names with each person's assigned color")
         row += 1
+        check(row, "show_in_solo", "Show the Chat panel also in an unshared session (opened with just the Open tab)")
+        row += 1
 
         label(row, "Shared run output", pady=(14, 2)).configure(font=("Segoe UI", 9, "bold"))
         row += 1

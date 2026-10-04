@@ -102,6 +102,7 @@ DEFAULTS = {
         "show_join_leave": True,
         "color_names": True,
         "view_shared": True,
+        "show_in_solo": True,
     },
     "shortcuts": {
         "new_file": "<Control-n>",

@@ -87,7 +87,7 @@ BUILTIN_THEME_PRESETS = {
             "bg": "#fafafa",
             "panel_bg": "#eeeeee",
             "edit_bg": "#ffffff",
-            "gutter_bg": "#f5f5f5",
+            "gutter_bg": "#ffffff",
             "gutter_fg": "#6e7781",
             "fg": "#24292e",
             "muted_fg": "#57606a",

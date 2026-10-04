@@ -8,6 +8,7 @@ import config
 import theme
 import dnd_support
 import entry_paste
+import word_nav
 from connect_window import ConnectWindow
 from editor import EditorApp
 
@@ -39,6 +40,7 @@ class App:
         self._set_app_id()
         self.root = dnd_support.make_root()
         entry_paste.install(self.root)
+        word_nav.install(self.root)
         self.root.title("Peer to Code")
         self._set_window_icon()
         self._apply_saved_geometry()
@@ -231,10 +233,60 @@ class App:
         ui = self.cfg.get("ui", {})
         size = self._sanitize_size(ui.get("window_size", "")) or "1100x700"
         position = self._sanitize_position(ui.get("window_position", ""), size) or ""
+        self._want_pos = self._request_pos = None
+        if position:
+            m = re.match(r"^\+(\d+)\+(\d+)$", position)
+            if m:
+                self._want_pos = (int(m.group(1)), int(m.group(2)))
+                dx, dy = self._saved_placement_offset()
+                self._request_pos = (max(0, self._want_pos[0] - dx), max(0, self._want_pos[1] - dy))
+                position = f"+{self._request_pos[0]}+{self._request_pos[1]}"
         try:
             self.root.geometry(size + position)
         except tk.TclError:
             self.root.geometry("1100x700")
+            self._want_pos = None
+        if self._want_pos is not None:
+            self.root.after(300, self._verify_placement)
+
+    def _saved_placement_offset(self):
+        m = re.match(r"^(-?\d+),(-?\d+)$", self.cfg.get("ui", {}).get("window_placement_offset", "") or "")
+        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+    def _verify_placement(self):
+        """Some window managers (KDE under XWayland, for one) place a window
+        a title bar lower than the position it was asked for, while Tk then
+        reports the window's *actual* position. Saving that and asking for it
+        again at the next launch moves the window down by the title bar every
+        time. So: see where the window really landed, and if it isn't where
+        it was supposed to be, ask for the position minus that difference
+        (once) and remember the difference for the next launch."""
+        if self._want_pos is None:
+            return
+        try:
+            if self.root.state() != "normal":
+                return
+            self.root.update_idletasks()
+            pos = self._current_position()
+        except tk.TclError:
+            return
+        if pos is None:
+            return
+        want, req = self._want_pos, self._request_pos
+        dx, dy = pos[0] - req[0], pos[1] - req[1]
+        if not (abs(dx) <= 150 and abs(dy) <= 150):
+            return          # moved by hand or tiled, not a decoration offset
+        ui = self.cfg.setdefault("ui", {})
+        ui["window_placement_offset"] = f"{dx},{dy}"
+        if pos != want and (dx or dy):
+            try:
+                self.root.geometry(f"+{max(0, want[0] - dx)}+{max(0, want[1] - dy)}")
+            except tk.TclError:
+                pass
+
+    def _current_position(self):
+        m = re.match(r"^\d+x\d+([+-]\d+)([+-]\d+)$", self.root.geometry())
+        return (int(m.group(1)), int(m.group(2))) if m else None
 
     def _sanitize_size(self, value):
         """Parses a "WxH" string and clamps it to at least minsize and no
@@ -340,7 +392,13 @@ class App:
                 pass
             self._destroy_tree(editor)
         self.root.title("Peer to Code")
-        self.root.config(menu=tk.Menu(self.root))
+        if sys.platform == "darwin":
+            self.root.config(menu=tk.Menu(self.root))
+        else:
+            # No menu bar at all here. Elsewhere an (empty) native one still
+            # takes up room above the window, which the editor's own bar then
+            # changes - the window would resize when a session opens.
+            self.root.config(menu="")
         self.connect_frame = ConnectWindow(self.root, self.cfg, self._on_ready, initial_path=self._initial_path)
         self._initial_path = None
         self.connect_frame.pack(fill="both", expand=True)
@@ -428,6 +486,7 @@ class App:
                 ui["window_position"] = position
             else:
                 ui.pop("window_position", None)
+                ui.pop("window_placement_offset", None)
         config.save_config(self.cfg)
         client = self.editor.client if self.editor else self.client
         server = self.editor.server if self.editor else self.server

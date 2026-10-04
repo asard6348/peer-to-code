@@ -304,3 +304,33 @@ def diff_to_op(old: str, new: str) -> Op:
     op.insert(new[prefix:len(new) - suffix])
     op.retain(suffix)
     return op
+
+
+def transform_position(op_components, pos, stick_right=False):
+    """Where character offset `pos` of the document an op was built against
+    ends up once the op has been applied - how a caret (or either end of a
+    selection) rides along with someone else's edit.
+
+    `op_components` is Op.ops (or an equivalent list). Text inserted before
+    `pos` pushes it right and text deleted before it pulls it left; a
+    position inside a deleted run collapses to where that run was. For an
+    insert exactly at `pos` the position stays in front of the new text,
+    unless `stick_right` is set (the caret of whoever typed it, or the start
+    of a selection, which must not swallow text typed at its edge)."""
+    old = new = 0
+    for c in op_components:
+        if isinstance(c, str):
+            if old == pos and not stick_right:
+                return new
+            new += len(c)
+        elif c > 0:
+            if pos < old + c:
+                return new + (pos - old)
+            old += c
+            new += c
+        else:
+            n = -c
+            if pos < old + n:
+                return new
+            old += n
+    return new + (pos - old)

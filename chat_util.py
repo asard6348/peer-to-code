@@ -99,6 +99,9 @@ CHAT_DEFAULTS = {
     "show_join_leave": True,
     "color_names": True,
     "view_shared": True,
+    # Whether the Chat panel exists at all in an unshared session, i.e. one
+    # started from the Open tab (nobody else can ever be in it).
+    "show_in_solo": True,
 }
 
 
