@@ -302,6 +302,29 @@ class App:
         self.root.update_idletasks()
         return max(0, self.root.winfo_rooty() - before_rooty)
 
+    @staticmethod
+    def _destroy_tree(widget):
+        """Destroys a widget and everything below it. A stale Python callback
+        name (Tkinter raises "can't delete Tcl command" for one that is
+        already gone) must never abort the teardown, or the window is left
+        empty with no Connect screen; so on failure fall back to destroying
+        the children one by one and forgetting the bookkeeping."""
+        try:
+            widget.destroy()
+            return
+        except tk.TclError:
+            pass
+        for child in list(widget.children.values()):
+            App._destroy_tree(child)
+        widget._tclCommands = []
+        try:
+            widget.destroy()
+        except tk.TclError:
+            try:
+                widget.tk.call("destroy", widget._w)
+            except tk.TclError:
+                pass
+
     def _show_connect_screen(self):
         self.client = None
         self.server = None
@@ -310,9 +333,12 @@ class App:
             self.editor._unbind_shortcuts()
             self.editor._unbind_output_shortcuts()
             self.editor._cancel_pending_jobs()
-            self.editor.pack_forget()
-            self.editor.destroy()
-            self.editor = None
+            editor, self.editor = self.editor, None
+            try:
+                editor.pack_forget()
+            except tk.TclError:
+                pass
+            self._destroy_tree(editor)
         self.root.title("Peer to Code")
         self.root.config(menu=tk.Menu(self.root))
         self.connect_frame = ConnectWindow(self.root, self.cfg, self._on_ready, initial_path=self._initial_path)
