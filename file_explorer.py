@@ -391,7 +391,8 @@ class FileExplorer(ttk.Frame):
         if node:
             self.tree.selection_set(node)
             self.tree.focus(node)
-        self.menu.tk_popup(event.x_root, event.y_root)
+        # Offset so the pointer starts outside the menu (see dock.py).
+        self.menu.tk_popup(event.x_root + 4, event.y_root + 4)
 
     def _target_dir(self):
         node = self.tree.focus()

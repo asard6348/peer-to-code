@@ -191,11 +191,14 @@ class DockPanel:
         m.add_command(label="Hide", command=self.hide)
 
     def _popup_menu(self, event):
-        """Right-click on the title bar: the same menu, at the pointer."""
-        try:
-            self._menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self._menu.grab_release()
+        """Right-click on the title bar: the same menu, right at the press.
+        It is placed a few pixels right/down of the pointer so the pointer
+        starts *outside* it: releasing the button without moving then picks
+        nothing (the menu stays up), while dragging onto an entry and
+        releasing there picks that entry. No grab_release() afterwards - it
+        cancels the menu's own grab, which is what dismisses it again on
+        the next click elsewhere (without the grab it stays up forever)."""
+        self._menu.tk_popup(event.x_root + 4, event.y_root + 4)
 
 
 class DockManager:

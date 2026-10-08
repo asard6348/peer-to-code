@@ -1357,8 +1357,15 @@ class SettingsWindow(tk.Toplevel):
 
         if not hasattr(self, "tiles_frame"):
             return
-        for child in self.tiles_frame.winfo_children():
-            child.destroy()
+        # Reuse the existing tiles whenever the set of presets is unchanged
+        # and repaint them in place: destroying and recreating every tile on
+        # each pick blanked the whole row for a frame. The tiles are only
+        # rebuilt if the preset list itself changed.
+        tiles = getattr(self, "_preset_tiles", None)
+        if tiles is None or set(tiles) != set(self._preset_key_to_label):
+            for child in self.tiles_frame.winfo_children():
+                child.destroy()
+            tiles = self._preset_tiles = {}
 
         t = self.theme_working
         current_key = self._current_preset_key() if hasattr(self, "theme_preset_var") else theme.SYSTEM_PRESET
@@ -1376,12 +1383,24 @@ class SettingsWindow(tk.Toplevel):
 
             selected = key == current_key
             border = t["accent"] if selected else t["panel_bg"]
-            cell = tk.Frame(self.tiles_frame, bg=t["panel_bg"], highlightthickness=2,
-                             highlightbackground=border, highlightcolor=border, cursor="hand2")
-            cell.pack(side="left", padx=4, pady=2)
-
-            canvas = tk.Canvas(cell, width=88, height=56, highlightthickness=0, bg=colors["bg"], cursor="hand2")
-            canvas.pack(padx=3, pady=(3, 0))
+            existing = tiles.get(key)
+            if existing is not None:
+                cell, canvas, name_label = existing
+                cell.configure(bg=t["panel_bg"], highlightbackground=border, highlightcolor=border)
+                canvas.configure(bg=colors["bg"])
+                canvas.delete("all")
+                name_label.configure(text=label, bg=t["panel_bg"], fg=t["fg"])
+            else:
+                cell = tk.Frame(self.tiles_frame, bg=t["panel_bg"], highlightthickness=2,
+                                 highlightbackground=border, highlightcolor=border, cursor="hand2")
+                cell.pack(side="left", padx=4, pady=2)
+                canvas = tk.Canvas(cell, width=88, height=56, highlightthickness=0, bg=colors["bg"], cursor="hand2")
+                canvas.pack(padx=3, pady=(3, 0))
+                name_label = tk.Label(cell, text=label, bg=t["panel_bg"], fg=t["fg"], font=("Segoe UI", 8), cursor="hand2")
+                name_label.pack(pady=(2, 3))
+                for widget in (cell, canvas, name_label):
+                    widget.bind("<Button-1>", lambda _e, k=key: self._select_preset_tile(k))
+                tiles[key] = (cell, canvas, name_label)
             canvas.create_rectangle(6, 6, 82, 50, fill=colors["panel_bg"], outline="")
             canvas.create_rectangle(12, 14, 76, 44, fill=colors["edit_bg"], outline="")
             kw = palette.get("keyword", {}).get("foreground") or colors["fg"]
@@ -1391,12 +1410,6 @@ class SettingsWindow(tk.Toplevel):
             canvas.create_line(16, 28, 60, 28, fill=st, width=3)
             canvas.create_line(16, 36, 34, 36, fill=cm, width=3)
             canvas.create_rectangle(66, 34, 72, 40, fill=colors["accent"], outline="")
-
-            name_label = tk.Label(cell, text=label, bg=t["panel_bg"], fg=t["fg"], font=("Segoe UI", 8), cursor="hand2")
-            name_label.pack(pady=(2, 3))
-
-            for widget in (cell, canvas, name_label):
-                widget.bind("<Button-1>", lambda _e, k=key: self._select_preset_tile(k))
 
     def _select_preset_tile(self, key):
         self.theme_preset_var.set(self._preset_key_to_label.get(key, key))

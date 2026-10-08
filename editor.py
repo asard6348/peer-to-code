@@ -224,6 +224,7 @@ class EditorApp(ttk.Frame):
         self.out_queue = queue.Queue()
         self._exit_queue = queue.Queue()
         self._proc_exit_expected = False
+        self._interrupt_sent = False
         self._cursor_send_job = None
         self._poll_job = None
         self._console_resize_job = None
@@ -2852,7 +2853,7 @@ class EditorApp(ttk.Frame):
         menu.bind("<FocusOut>", lambda _e: menu.unpost())
         menu.bind("<Unmap>", lambda _e: self.after_idle(self._destroy_tab_menu, menu))
         try:
-            menu.tk_popup(x_root, y_root)
+            menu.tk_popup(x_root + 4, y_root + 4)
         finally:
             menu.grab_release()
 
@@ -3008,10 +3009,36 @@ class EditorApp(ttk.Frame):
             return
         cmd, target, is_temp = prepared
         self.ansi_console.state.reset()
+        self._drop_idle_prompt()
         self._ensure_newline()
         self._console_write(f"$ {cmd} {os.path.basename(target)}\n", "info")
         self._launch_process(interpreters.split_command(cmd) + [target],
                              cleanup_path=(target if is_temp else None))
+
+    def _drop_idle_prompt(self):
+        """If the console is sitting on a bare "$ " prompt nothing has been
+        typed after, removes it, so the echo of a Run-button command takes
+        its place ("$ interpreter script") instead of stacking under it
+        ("$" on one line, "$ interpreter script" on the next). That prompt
+        is only a placeholder for the next command; once something else
+        takes the line it has no job left. Anything typed after the
+        prompt is the user's own and is left alone."""
+        self.ansi_console.flush()
+        try:
+            if self.console.get("input_start", "end-1c") != "":
+                return
+            start = self.console.index("input_start-2c")
+            if self.console.get(start, "input_start") != "$ ":
+                return
+            if self.console.index(f"{start} linestart") != start:
+                return
+            # The delete guard refuses to touch anything before input_start,
+            # so move the mark back over the prompt first.
+            self.console.mark_set("input_start", start)
+            self.console.delete(start, "end-1c")
+            self.console.mark_set("input_start", "end-1c")
+        except tk.TclError:
+            pass
 
     def _run_terminal_command(self, command):
         """Runs a line typed straight at the Terminal's own $ prompt as a
@@ -3091,6 +3118,7 @@ class EditorApp(ttk.Frame):
                     pass
             return
         self._proc_exit_expected = False
+        self._interrupt_sent = False
         threading.Thread(target=self._pump_stream, args=(self.run_proc.stdout, False), daemon=True).start()
         threading.Thread(target=self._pump_stream, args=(self.run_proc.stderr, True), daemon=True).start()
         threading.Thread(target=self._watch_run_proc, args=(self.run_proc, cleanup_path), daemon=True).start()
@@ -3132,7 +3160,13 @@ class EditorApp(ttk.Frame):
         quiet with no explanation. Either way, a fresh $ prompt follows -
         every run ends back at the prompt, the same as any terminal,
         whether it was launched from the Run button or typed here."""
-        if not self._proc_exit_expected:
+        # An interrupt only explains the exit if the script actually died of
+        # it (killed by SIGINT, shell-style 130, Windows' Ctrl+C status). A
+        # script that caught the interrupt and then finished on its own
+        # still gets its normal [finished].
+        died_of_interrupt = self._interrupt_sent and (
+            returncode < 0 or returncode in (130, 3221225786))
+        if not (self._proc_exit_expected or died_of_interrupt):
             if returncode < 0 and not sys.platform.startswith("win"):
                 # An external, unexplained kill - always reported
                 # regardless of the [finished] toggle below, since it's
@@ -3924,7 +3958,12 @@ class EditorApp(ttk.Frame):
         if self.console.tag_ranges("sel"):
             return False
         if not (self.run_proc and self.run_proc.poll() is None):
-            return False
+            # Idle, at a $ prompt: like a shell, abandon whatever is typed
+            # on the line and start a fresh prompt, so Ctrl+C always does
+            # something instead of silently doing nothing.
+            self._console_write("^C\n", "info")
+            self._show_prompt()
+            return True
         self._interrupt_run_proc()
         return True
 
@@ -3942,10 +3981,21 @@ class EditorApp(ttk.Frame):
         Ctrl+C - e.g. both the console's own key binding and app.py's
         terminal-level SIGINT forwarder firing for one keypress, which
         does happen in some environments - can't send the signal or
-        print "[interrupted]" a second time."""
-        if self._proc_exit_expected:
+        print "[interrupted]" a second time (a short time window, not a
+        permanent flag, so a script that catches the interrupt and keeps
+        going can still be interrupted again)."""
+        if not (self.run_proc and self.run_proc.poll() is None):
             return
-        self._proc_exit_expected = True
+        # Only a *near-simultaneous* duplicate is dropped (the key binding
+        # and app.py's SIGINT forwarder can both fire for one keypress).
+        # Gating on _proc_exit_expected instead - which stays set after the
+        # first interrupt - made every later Ctrl+C a silent no-op when the
+        # script caught the first SIGINT and kept running.
+        now = time.monotonic()
+        if now - getattr(self, "_last_interrupt_at", 0.0) < 0.25:
+            return
+        self._last_interrupt_at = now
+        self._interrupt_sent = True
         try:
             if sys.platform.startswith("win"):
                 self.run_proc.send_signal(signal.CTRL_C_EVENT)

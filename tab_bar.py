@@ -26,6 +26,7 @@ class TabBar(tk.Frame):
         self._tabs = []
         self._active_id = None
         self._cells = {}
+        self._cell_keys = {}
 
         self.canvas = tk.Canvas(self, height=28, bg=theme["bg"], highlightthickness=0, bd=0)
         self.canvas.pack(fill="x", expand=True)
@@ -43,6 +44,7 @@ class TabBar(tk.Frame):
         self.configure(bg=theme["bg"])
         self.canvas.configure(bg=theme["bg"])
         self.inner.configure(bg=theme["bg"])
+        self._cell_keys = {}            # colors changed: rebuild every cell
         self.render(self._tabs, self._active_id)
 
     def render(self, tabs, active_id):
@@ -50,11 +52,33 @@ class TabBar(tk.Frame):
         self._tabs = list(tabs)
         self._active_id = active_id
         self._end_drag()
-        for child in self.inner.winfo_children():
-            child.destroy()
-        self._cells = {}
+        # Update in place: a cell whose tab is unchanged (same title,
+        # shared/dirty state and active-ness) is kept as it is, and only
+        # cells that actually differ are rebuilt. Destroying and recreating
+        # every cell on each refresh blanked the whole strip for a frame
+        # whenever anything about any tab changed.
+        wanted = {}
         for tab in self._tabs:
-            self._cells[tab["id"]] = self._make_cell(tab, tab["id"] == active_id)
+            wanted[tab["id"]] = (tab["title"], bool(tab["shared"]), bool(tab["dirty"]),
+                                 tab["id"] == active_id)
+        for tab_id in list(self._cells):
+            if tab_id not in wanted or self._cell_keys.get(tab_id) != wanted[tab_id]:
+                try:
+                    self._cells[tab_id].destroy()
+                except tk.TclError:
+                    pass
+                del self._cells[tab_id]
+                self._cell_keys.pop(tab_id, None)
+        for tab in self._tabs:
+            if tab["id"] not in self._cells:
+                self._cells[tab["id"]] = self._make_cell(tab, tab["id"] == active_id)
+                self._cell_keys[tab["id"]] = wanted[tab["id"]]
+        # Re-pack in order (cheap, no redraw in between) so moved and newly
+        # created cells land where they belong.
+        for tab in self._tabs:
+            cell = self._cells[tab["id"]]
+            cell.pack_forget()
+            cell.pack(side="left", fill="y", padx=(0, 1))
         self.after_idle(self._on_inner_configure)
         self.after_idle(lambda: self.reveal(active_id))
 

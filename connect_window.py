@@ -275,17 +275,27 @@ class ConnectWindow(ttk.Frame):
                 fg=t["fg"] if selected else t["muted_fg"],
             )
             underline.configure(bg=t["accent"] if selected else t["bg"])
+        # Everything below runs in this one callback, in an order that never
+        # shows an in-between frame: scroll back to the top *before* the
+        # swap (not in an after_idle afterwards, which painted the new page
+        # at the old scroll offset first), and show the new page before
+        # hiding the old one so the container never collapses to nothing.
+        self._page_canvas.yview_moveto(0)
+        self._pages[name].pack(fill="both", expand=True)
         for n, page in self._pages.items():
-            if n == name:
-                page.pack(fill="both", expand=True)
-            else:
+            if n != name:
                 page.pack_forget()
         self.status.configure(text="")
         if name == "Open":
             self._refresh_recent_projects()
         elif name == "Peer to Peer":
             self._refresh_p2p_addr_placeholder()
-        self.after_idle(self._reset_scroll)
+        self._sync_scroll_region()
+
+    def _sync_scroll_region(self):
+        canvas = self._page_canvas
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        self._update_scrollbar()
 
     def _reset_scroll(self):
         self._page_canvas.yview_moveto(0)
@@ -480,11 +490,18 @@ class ConnectWindow(ttk.Frame):
         return page
 
     def _refresh_recent_projects(self):
+        t = self.theme
+        recents = self.cfg["connection"].get("recent_projects") or []
+        # Nothing changed since the rows were last built (same list, same
+        # theme): keep them. Rebuilding on every switch to the Open tab
+        # briefly emptied the list.
+        signature = (tuple(recents), t["panel_bg"], t["fg"])
+        if self._recent_row_widgets and getattr(self, "_recent_signature", None) == signature:
+            return
+        self._recent_signature = signature
         for w in self._recent_row_widgets:
             w.destroy()
         self._recent_row_widgets = []
-        t = self.theme
-        recents = self.cfg["connection"].get("recent_projects") or []
         if not recents:
             lbl = ttk.Label(self.recent_list, text="No recent projects yet.", style="Muted.TLabel")
             lbl.pack(anchor="w")
@@ -518,7 +535,7 @@ class ConnectWindow(ttk.Frame):
                 # the user gets a chance to click anything, leaving the
                 # menu stuck open forever. file_explorer.py's tree
                 # context menu relies on the same built-in behavior.
-                m.tk_popup(e.x_root, e.y_root)
+                m.tk_popup(e.x_root + 4, e.y_root + 4)
 
             for widget in (row, label):
                 widget.bind("<Enter>", on_enter)
