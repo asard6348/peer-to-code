@@ -464,11 +464,7 @@ class SettingsWindow(tk.Toplevel):
             row += 1
         window_desc_label = self._reg(tk.Label(
             rows, text="Unchecking one deletes it from the config file on close, so next time "
-                       "that window or panel opens with that part placed/sized automatically. "
-                       "Drag a panel's title bar to dock it on another side or drop it outside the "
-                       "window to detach it; View > Reset Panel Layout restores the defaults. "
-                       "(The Find/Replace window's checkboxes - Match case, Whole word, "
-                       "Wrap around - are always remembered.)",
+                       "that window or panel opens with that part placed/sized automatically.",
             bg=t["panel_bg"], fg=t["muted_fg"], anchor="w", justify="left"),
             bg="panel_bg", fg="muted_fg")
         window_desc_label.grid(row=row, column=0, columnspan=2, sticky="we", padx=4, pady=(0, 10))
@@ -792,13 +788,6 @@ class SettingsWindow(tk.Toplevel):
         self.chat_vars = {}
         row = 0
         label(row, "Chat", pady=(4, 2)).configure(font=("Segoe UI", 9, "bold"))
-        row += 1
-        label(row, "The Chat panel sits next to the Terminal by default. Drag its title bar to dock it "
-                   "elsewhere or drop it outside the window to detach it (View > Toggle Chat shows or "
-                   "hides it). Type a message and press Enter to send it to everyone; /p <user> <message> "
-                   "is private, /r replies, /who lists who is here, /mute and /unmute <user> hide or show "
-                   "someone, /help lists them all.",
-              fg="muted_fg", pady=(0, 8))
         row += 1
         check(row, "enabled", "Enable chat (show incoming messages and allow sending)")
         row += 1
