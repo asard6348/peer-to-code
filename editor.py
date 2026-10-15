@@ -34,6 +34,7 @@ from peer_cursors import PeerCursorLayer
 from tab_bar import TabBar
 from settings_window import SettingsWindow
 from net.client import FailoverController
+from net.transport import MAIN_DOC
 
 # The Terminal console's stdout/stderr/prompt colors, tuned as two fixed
 # pairs rather than one - the "dark" set is bright, saturated color meant
@@ -154,21 +155,24 @@ def _active_tab_attr(name):
 class BufferTab:
     """Everything that belongs to one open buffer.
 
-    Exactly one tab at a time is the *shared* tab: it mirrors the
-    collaborative document every peer edits, and only its edits are sent
-    over the network. All other tabs are local - plain single-user buffers
-    that peers never see. EditorApp shows one tab at a time in its single
+    A tab is either *shared* - it mirrors one of the collaborative documents
+    the session carries (`doc_id`), and only its edits are sent over the
+    network - or local: a plain single-user buffer that peers never see.
+    Any number of tabs can be shared, each bound to its own document. EditorApp shows one tab at a time in its single
     Text widget and keeps the others' state here, so the rest of the
     editor (undo, run, save, ...) only ever deals with "the active tab".
     """
 
     _ids = itertools.count(1)
 
-    def __init__(self, shared=False, doc=""):
+    def __init__(self, doc_id=None, doc=""):
         self.id = next(BufferTab._ids)
-        self.shared = shared
-        # Only the shared tab can be hidden (closing it just stops
-        # displaying it - the session's document has to keep being tracked).
+        self.doc_id = doc_id
+        # Set while this tab's content has been sent to the session as a new
+        # document and the server hasn't yet answered with the document's id.
+        self.pending_ref = None
+        # Only a shared tab can be hidden (closing it just stops displaying
+        # it - the session's document has to keep being tracked).
         self.visible = True
         self.doc = doc
         self.saved_doc = doc
@@ -185,6 +189,10 @@ class BufferTab:
         # Restored when the tab is switched back to.
         self.caret = 0
         self.yview = 0.0
+
+    @property
+    def shared(self):
+        return self.doc_id is not None
 
     @property
     def dirty(self):
@@ -211,10 +219,14 @@ class EditorApp(ttk.Frame):
         # per-buffer state below (doc, history, current_file, ...) is exposed
         # as properties that read/write the active tab, so everything that
         # works on "the current buffer" keeps working unchanged.
-        first_tab = BufferTab(shared=True)
+        first_tab = BufferTab(doc_id=MAIN_DOC)
         self._tabs = [first_tab]
         self._active = first_tab
-        self.shared_tab = first_tab
+        # Every document the session carries -> the tab tracking it (a hidden
+        # one if nobody is looking at it).
+        self._docs = {MAIN_DOC: first_tab}
+        self._pending_shares = {}      # request ref -> the tab whose content was sent as a new document
+        self._share_refs = itertools.count(1)
         self._author_names = {}
         self._dirty = False
         self.dirty = False
@@ -269,7 +281,7 @@ class EditorApp(ttk.Frame):
             host, port = p2p_advertise
             self._failover = FailoverController(
                 username=self.username, advertise_host=host, advertise_port=port,
-                get_doc_text=lambda: self.shared_tab.doc,
+                get_docs=self._shared_docs_snapshot,
                 on_reconnected=self._on_failover_reconnected,
                 on_failed=self._on_failover_failed,
                 advertise_socket=p2p_advertise_socket,
@@ -281,14 +293,15 @@ class EditorApp(ttk.Frame):
         self._apply_shortcuts()
         self._apply_output_shortcuts()
 
+        # Both set before the client is bound: binding delivers whatever the
+        # client already received (the documents' texts), right away.
+        self._pending_initial_file = initial_file
+        if self.mode != "solo":
+            self._set_status("Waiting for document sync...")
         self._bind_client(self.client)
         self._note_assigned_name()
 
-        self._pending_initial_file = initial_file
-
         self._poll_job = self.after(100, self._poll_output)
-        if self.mode != "solo":
-            self._set_status("Waiting for document sync...")
 
     @property
     def dirty(self):
@@ -323,8 +336,12 @@ class EditorApp(ttk.Frame):
     def _bind_client(self, client):
         """Wire up all of a Client's callbacks. Used at startup, and again
         after a P2P failover promotes/reconnects to a brand-new Client."""
-        client.on_full_sync = self._on_full_sync
-        client.on_remote_op = self._on_remote_op
+        # Documents' texts and ops are handled on the Tk thread itself (see
+        # Client.dispatcher), so they can never interleave with typing.
+        client.dispatcher = lambda fn: self.after(0, fn)
+        client.on_full_sync = self._apply_full_sync
+        client.on_remote_op = self._apply_remote_op
+        client.on_doc_rejected = self._on_doc_rejected
         client.on_peers = self._on_peers
         client.on_cursor = self._on_cursor_msg
         client.on_disconnected = self._on_disconnected
@@ -466,7 +483,9 @@ class EditorApp(ttk.Frame):
         m_view.add_command(label="Next Tab", accelerator=a("next_tab"), command=self.action_next_tab)
         m_view.add_command(label="Previous Tab", accelerator=a("prev_tab"), command=self.action_prev_tab)
         if self.mode != "solo":
-            m_view.add_command(label="Show Shared Buffer", command=self.action_show_shared)
+            self._shared_menu = tk.Menu(m_view, tearoff=0, postcommand=self._fill_shared_menu)
+            m_view.add_cascade(label="Shared Buffers", menu=self._shared_menu)
+            self._menus.append(self._shared_menu)
 
         self.menubar = self._custom_menubar if self._use_custom_menubar else menubar
         self._theme_menus(t)
@@ -515,6 +534,19 @@ class EditorApp(ttk.Frame):
             else:
                 menu.entryconfigure(2, label=f"Undo {self._author_display(author)}'s Last Change", state="normal")
             menu.entryconfigure(3, state="normal" if self.history.peer_authors() else "disabled")
+
+    def _fill_shared_menu(self):
+        """Lists every document the session carries, so one that has been
+        closed locally (it keeps syncing in the background) can be brought
+        back, and any of them jumped to."""
+        menu = self._shared_menu
+        menu.delete(0, "end")
+        tabs = sorted((t for t in self._docs.values()), key=lambda t: t.doc_id)
+        if not tabs:
+            menu.add_command(label="(none)", state="disabled")
+        for tab in tabs:
+            label = self._tab_base_title(tab) + ("" if tab.visible else "  (closed)")
+            menu.add_command(label=label, command=lambda t=tab: self.action_show_shared(t))
 
     def _fill_peer_undo_menu(self):
         menu = self._peer_undo_menu
@@ -1098,7 +1130,7 @@ class EditorApp(ttk.Frame):
                     end = char_offset(self.text, "sel.last")
                 except tk.TclError:
                     has_sel = False
-            self.client.send_cursor(offset, has_sel, start, end)
+            self.client.send_cursor(offset, has_sel, start, end, doc=self._active.doc_id)
 
         self._cursor_send_job = self.after(30, fire)
 
@@ -1238,15 +1270,15 @@ class EditorApp(ttk.Frame):
         self._refresh_dirty()
         self._update_cursor_status()
         if self._active.shared:
-            self._shift_peer_cursors(op)
-            self.client.local_edit(op)
+            self._shift_peer_cursors(op, doc_id=self._active.doc_id)
+            self.client.local_edit(op, self._active.doc_id)
 
-    def _shift_peer_cursors(self, op, author=None):
-        """Keeps the other people's carets on the same text when the shared
+    def _shift_peer_cursors(self, op, author=None, doc_id=None):
+        """Keeps the other people's carets on the same text when a shared
         document changes under them (see PeerCursorLayer.apply_op)."""
         layer = getattr(self, "cursor_layer", None)
         if layer is not None:
-            layer.apply_op(op.ops, author)
+            layer.apply_op(op.ops, author, doc_id)
 
     def _on_local_delete(self, off_start, off_end):
         self._redraw_linenumbers()
@@ -1263,20 +1295,27 @@ class EditorApp(ttk.Frame):
         self._refresh_dirty()
         self._update_cursor_status()
         if self._active.shared:
-            self._shift_peer_cursors(op)
-            self.client.local_edit(op)
-
-    def _on_full_sync(self, text):
-        self.after(0, lambda: self._apply_full_sync(text))
+            self._shift_peer_cursors(op, doc_id=self._active.doc_id)
+            self.client.local_edit(op, self._active.doc_id)
 
     def _reset_history(self):
         self.history.reset()
         self._saved_doc = self.doc
         self._refresh_dirty()
 
-    def _apply_full_sync(self, text):
-        tab = self.shared_tab
-        if tab is self._active:
+    def _apply_full_sync(self, doc_id, text, meta=None):
+        """A shared document's complete text arrived: at join, after a
+        failover or resync (the tab for it already exists - its content is
+        replaced), when someone shares a new document, or as the answer to
+        our own share (the tab we sent already holds this content)."""
+        meta = meta or {}
+        mine = meta.get("by") == self.client.client_id
+        tab = self._docs.get(doc_id)
+        if tab is None and mine and meta.get("ref") in self._pending_shares:
+            tab = self._bind_pending_share(doc_id, text, meta["ref"])
+        elif tab is None:
+            tab = self._open_remote_document(doc_id, text, meta)
+        elif tab is self._active:
             self._suppress_capture = True
             try:
                 self.text.delete("1.0", "end")
@@ -1287,14 +1326,15 @@ class EditorApp(ttk.Frame):
             self._reset_history()
             self._redraw_linenumbers()
             self._do_highlight()
+            tab.local_edited = False
         else:
-            # A local tab is showing: only the shared tab's stored copy
-            # needs to follow along.
+            # A different tab is showing: only this tab's stored copy needs
+            # to follow along.
             tab.doc = text
             tab.history.reset()
             tab.saved_doc = text
+            tab.local_edited = False
             self._refresh_tabs()
-        tab.local_edited = False
         if self.mode != "solo":
             self._set_status("Connected and synced with host")
         if self._pending_initial_file:
@@ -1303,8 +1343,66 @@ class EditorApp(ttk.Frame):
         else:
             self._update_file_path_label()
 
-    def _on_remote_op(self, op, author=None, swap=None):
-        self.after(0, lambda: self._apply_remote_op(op, author, swap))
+    def _bind_pending_share(self, doc_id, text, ref):
+        """The server answered our share with the new document's id: the tab
+        we sent becomes that document's tab. Anything typed into it since
+        we sent it follows as an ordinary edit."""
+        tab = self._pending_shares.pop(ref)
+        tab.pending_ref = None
+        tab.doc_id = doc_id
+        self._docs[doc_id] = tab
+        if tab not in self._tabs:
+            # Closed while the request was in flight: the document exists
+            # now, so it is tracked like any other, just not shown.
+            self._tabs.append(tab)
+            tab.visible = False
+        if tab.doc != text:
+            self.client.local_edit(ot.diff_to_op(text, tab.doc), doc_id)
+        if tab is self._active:
+            self._after_role_change()
+        else:
+            self._refresh_tabs()
+        return tab
+
+    def _open_remote_document(self, doc_id, text, meta):
+        """A document we have no tab for yet. If we already have the very
+        same file open, unshared, with identical content, that tab simply
+        joins the document; otherwise it gets a tab of its own, opened next
+        to the others without taking focus away from what is being typed."""
+        filename = meta.get("filename")
+        same = next((t for t in self._tabs
+                     if not t.shared and t.pending_ref is None and t.current_file is not None
+                     and filename and self._hint_for_tab(t) == filename and t.doc == text), None)
+        if same is not None:
+            tab = same
+            tab.doc_id = doc_id
+            tab.filename_hint = filename
+            tab.visible = True
+        else:
+            tab = BufferTab(doc_id=doc_id, doc=text)
+            tab.filename_hint = filename
+            self._tabs.append(tab)
+        self._docs[doc_id] = tab
+        if tab is self._active:
+            self._after_role_change()
+        else:
+            self._refresh_tabs()
+        if meta.get("fresh") and meta.get("by") != self.client.client_id:
+            who = self._known_peer_names.get(meta.get("by"), "someone")
+            label = sanitize_text(filename, 200) if filename else "a new buffer"
+            self._chat_append([(f"{sanitize_name(who)} shared {label}\n", "info")])
+            self._set_status(f"{sanitize_name(who)} shared {label}")
+        return tab
+
+    def _on_doc_rejected(self, ref, reason):
+        self.after(0, lambda: self._handle_doc_rejected(ref, reason))
+
+    def _handle_doc_rejected(self, ref, reason):
+        tab = self._pending_shares.pop(ref, None)
+        if tab is not None:
+            tab.pending_ref = None
+        self._set_status(reason)
+        messagebox.showwarning("Share", reason)
 
     def _apply_op_to_widget(self, op):
         self._suppress_capture = True
@@ -1322,10 +1420,12 @@ class EditorApp(ttk.Frame):
         finally:
             self._suppress_capture = False
 
-    def _apply_remote_op(self, op, author=None, swap=None):
+    def _apply_remote_op(self, doc_id, op, author=None, swap=None):
+        if doc_id not in self._docs:
+            return
         if swap is not None:
-            self._begin_remote_swap(swap, author)
-        tab = self.shared_tab
+            self._begin_remote_swap(doc_id, swap, author)
+        tab = self._docs[doc_id]
         author_key = "remote" if author is None else author
         if tab is self._active:
             before = self.doc
@@ -1347,7 +1447,7 @@ class EditorApp(ttk.Frame):
                 self._refresh_tabs()
         # Their carets are offsets into the shared document, so they follow
         # this edit whether or not that document is the buffer on screen.
-        self._shift_peer_cursors(op, author)
+        self._shift_peer_cursors(op, author, doc_id)
         if swap is not None:
             # The peer's buffer is a clean starting point, not "our edits".
             tab.saved_doc = tab.doc
@@ -1365,8 +1465,8 @@ class EditorApp(ttk.Frame):
         self._apply_op_to_widget(op)
         self.doc = op.apply(before)
         if self._active.shared:
-            self._shift_peer_cursors(op)
-            self.client.local_edit(op)
+            self._shift_peer_cursors(op, doc_id=self._active.doc_id)
+            self.client.local_edit(op, self._active.doc_id)
         self._place_caret_after(op)
         self._refresh_dirty()
         self._redraw_linenumbers()
@@ -1843,7 +1943,8 @@ class EditorApp(ttk.Frame):
             if tab is None:
                 note = f" ('{sanitize_text(file, 60)}' isn't open; showing the shared buffer)"
         if tab is None:
-            tab = self.shared_tab
+            tab = self._active if self._active.shared else next(
+                (t for t in self._docs.values() if t.visible), next(iter(self._docs.values())))
         if not tab.visible:
             self._set_status("The shared buffer is closed.")
             return
@@ -2126,6 +2227,9 @@ class EditorApp(ttk.Frame):
         self._roster = []
         self._last_private = None
         self._share_runs, self._share_early = {}, {}
+        for tab in self._pending_shares.values():
+            tab.pending_ref = None      # that request went to the old sequencer; share again if needed
+        self._pending_shares = {}
         self._note_assigned_name()
         note = "you're now the sequencer" if new_server is not None else "reconnected to the new sequencer"
         self._set_status(f"Back online: {note}")
@@ -2453,10 +2557,9 @@ class EditorApp(ttk.Frame):
         if blank is not None:
             self._tabs.remove(tab)
             self._tabs.insert(self._tabs.index(blank), tab)
-        old = self.shared_tab
+        placeholder = self._pristine_shared_tab()
         others = [t for t in self.visible_tabs if t is not tab and t is not blank]
-        pristine_shared = (old.visible and others == [old]
-                            and old.current_file is None and not old.local_edited and old.doc == "")
+        pristine_shared = placeholder is not None and others == [placeholder]
         if into_shared or pristine_shared:
             self._make_shared(tab)
         else:
@@ -2481,7 +2584,7 @@ class EditorApp(ttk.Frame):
         self.explorer.refresh()
         self.active_filename_hint = self._share_hint_for(path)
         if self._active.shared:
-            self.client.send_buffer_context(self.active_filename_hint)
+            self.client.send_buffer_context(self.active_filename_hint, self._active.doc_id)
         self._update_language_status()
         self._update_file_path_label()
         self._do_highlight()
@@ -2555,7 +2658,9 @@ class EditorApp(ttk.Frame):
         order with the edits."""
         filename = payload.get("filename")
         by = payload.get("by")
-        tab = self.shared_tab
+        tab = self._docs.get(payload.get("doc", MAIN_DOC))
+        if tab is None:
+            return
         tab.filename_hint = filename
         if tab is self._active:
             self._update_language_status()
@@ -2566,7 +2671,7 @@ class EditorApp(ttk.Frame):
             return
         who = next((n for pid, n in self._known_peer_names.items() if pid == by), "someone")
         label = sanitize_text(filename, 200) if filename else "a blank buffer"
-        self._chat_append([(f"{sanitize_name(who)} loaded {label} into the shared buffer\n", "info")])
+        self._chat_append([(f"{sanitize_name(who)} loaded {label} into a shared buffer\n", "info")])
 
     # ------------------------------------------------------------------
     # Buffer tabs
@@ -2685,7 +2790,7 @@ class EditorApp(ttk.Frame):
             self._suppress_capture = False
         self.text.update_idletasks()
         self.text.yview_moveto(tab.yview)
-        self.cursor_layer.set_visible(tab.shared)
+        self.cursor_layer.set_doc(tab.doc_id)
         self.dirty = tab.dirty  # also refreshes the window title and tab strip
         self._update_language_status()
         self._update_file_path_label()
@@ -2696,7 +2801,7 @@ class EditorApp(ttk.Frame):
 
     def _after_role_change(self):
         """The active tab just became shared / stopped being shared."""
-        self.cursor_layer.set_visible(self._active.shared)
+        self.cursor_layer.set_doc(self._active.doc_id)
         self._update_language_status()
         self._update_file_path_label()
         self._update_cursor_status()
@@ -2713,26 +2818,40 @@ class EditorApp(ttk.Frame):
     def action_prev_tab(self):
         self._cycle_tab(-1)
 
-    def action_show_shared(self):
-        self._switch_to(self.shared_tab)
+    def action_show_shared(self, tab=None):
+        """Brings a shared buffer to the front (showing it again if it was
+        closed): the given one, else the first one there is."""
+        if tab is None:
+            tab = next(iter(self._docs.values()), None)
+        if tab is not None:
+            self._switch_to(tab)
+
+    def _shared_docs_snapshot(self):
+        """{doc id: (text, filename)} for every document this peer tracks.
+        Called from the failover thread, hence the copy."""
+        return {doc_id: (tab.doc, tab.filename_hint) for doc_id, tab in list(self._docs.items())}
+
+    def _pristine_shared_tab(self):
+        """A shared tab nobody has put anything in - no file, no text, from
+        us or from a peer. It is only a placeholder, so sharing something
+        else just takes it over instead of leaving it sitting there empty."""
+        return next((t for t in self._tabs
+                     if t.shared and t.visible and t.current_file is None and not t.local_edited
+                     and t.doc == "" and t.saved_doc == "" and t.filename_hint is None), None)
 
     def action_close_active_tab(self):
         self.close_tab(self._active)
 
     def close_tab(self, tab):
-        if tab.shared and self.mode != "solo":
-            # The shared tab can't be closed - it is the session's document.
-            # Closing it offers to clear it instead.
-            return self._clear_shared_tab(tab)
         if not self._confirm_discard_tab(tab):
             return False
         tabs = self.visible_tabs
         index = tabs.index(tab) if tab in tabs else 0
         if tab.shared:
-            # The session's document has to keep being tracked, so the
-            # shared tab can't really go away - it's just hidden (bring it
-            # back with View > Show Shared Buffer, or when a peer shares a
-            # new buffer). Closing it also ends any file association.
+            # The session's document has to keep being tracked, so a shared
+            # tab can't really go away - it's just hidden (bring it back
+            # with View > Shared Buffers, or when a peer replaces its
+            # content). Closing it also ends any file association.
             tab.visible = False
             tab.current_file = None
             tab.loaded_mtime = None
@@ -2756,7 +2875,7 @@ class EditorApp(ttk.Frame):
         return True
 
     def _clear_shared_tab(self, tab):
-        """Asks whether to really clear the shared buffer (for everyone in
+        """Asks whether to really clear this shared buffer (for everyone in
         the session); if so, empties it and renames the tab to Untitled.
         Returns True if it was cleared."""
         if tab.doc == "" and tab.current_file is None and not tab.filename_hint:
@@ -2789,8 +2908,8 @@ class EditorApp(ttk.Frame):
                 self._suppress_capture = False
         # Sent as a buffer swap so peers with their own edits/files in the
         # shared tab keep them as local tabs, like any other replacement.
-        self.client.local_edit(ot.diff_to_op(old_doc, ""), {"filename": None})
-        self.client.send_buffer_context(None)
+        self.client.local_edit(ot.diff_to_op(old_doc, ""), tab.doc_id, {"filename": None})
+        self.client.send_buffer_context(None, tab.doc_id)
         if tab is self._active:
             self._display_active()
         else:
@@ -2835,9 +2954,8 @@ class EditorApp(ttk.Frame):
                              command=lambda: self._copy_text(self._tab_base_title(tab), "name"))
         menu.add_separator()
         if tab.shared and self.mode != "solo":
-            menu.add_command(label="Clear Shared Buffer...", command=lambda: self.close_tab(tab))
-        else:
-            menu.add_command(label="Close", command=lambda: self.close_tab(tab))
+            menu.add_command(label="Clear Shared Buffer...", command=lambda: self._clear_shared_tab(tab))
+        menu.add_command(label="Close", command=lambda: self.close_tab(tab))
         # tk_popup()'s own local grab is enough to dismiss the menu on a
         # click inside this window, but it doesn't reliably catch the
         # pointer leaving the app entirely (clicking another window,
@@ -2869,32 +2987,42 @@ class EditorApp(ttk.Frame):
         self._set_status(f"Copied {what}: {text}")
 
     def share_tab(self, tab):
-        if self.mode == "solo" or tab.shared:
+        if self.mode == "solo" or tab.shared or tab.pending_ref is not None:
             return
         self._make_shared(tab)
 
     def _make_shared(self, tab):
-        """Makes `tab` the shared tab: its content replaces the shared
-        document for everyone (sent as one op flagged as a buffer swap, so
-        peers keep their own file open as a local tab instead of losing
-        it). The tab that was shared until now stays on as a local tab if
-        there's something of ours in it, and is dropped otherwise."""
-        old = self.shared_tab
-        if old is tab:
-            return
-        base_doc = old.doc
-        if old.visible and self._worth_keeping(old):
-            old.shared = False
-            old.filename_hint = self._hint_for_tab(old)
-        elif old in self._tabs:
-            self._tabs.remove(old)
-        tab.shared = True
-        tab.visible = True
-        self.shared_tab = tab
+        """Shares `tab` with the session as a document of its own. Every
+        peer gets a tab for it - or, where they already have the same file
+        open with identical content, that tab joins in - and the buffers
+        already being shared stay exactly as they are.
+
+        The one exception is a still-untouched placeholder shared tab (the
+        blank buffer a session starts with): instead of leaving that empty
+        tab sitting around next to the new one, `tab` takes its document
+        over, sent as a buffer swap so a peer who did put something in the
+        placeholder keeps it as a local tab."""
         hint = self._hint_for_tab(tab)
-        tab.filename_hint = hint
-        self.client.local_edit(ot.diff_to_op(base_doc, tab.doc), {"filename": hint})
-        self.client.send_buffer_context(hint)
+        placeholder = self._pristine_shared_tab()
+        if placeholder is not None and placeholder is not tab:
+            doc_id = placeholder.doc_id
+            base_doc = placeholder.doc
+            if placeholder in self._tabs:
+                self._tabs.remove(placeholder)
+            tab.doc_id = doc_id
+            tab.visible = True
+            tab.filename_hint = hint
+            self._docs[doc_id] = tab
+            self.client.local_edit(ot.diff_to_op(base_doc, tab.doc), doc_id, {"filename": hint})
+            self.client.send_buffer_context(hint, doc_id)
+        else:
+            ref = next(self._share_refs)
+            tab.filename_hint = hint
+            if not self.client.open_doc(hint, tab.doc, ref):
+                self._set_status("Not connected - can't share right now")
+                return
+            tab.pending_ref = ref
+            self._pending_shares[ref] = tab
         if tab is self._active:
             self._after_role_change()
         else:
@@ -2902,57 +3030,57 @@ class EditorApp(ttk.Frame):
 
     def unshare_tab(self, tab):
         """Stops sharing `tab`: it becomes an ordinary local tab holding
-        what it holds now. The session itself carries on - the shared
-        document is tracked in a fresh, hidden shared tab (View > Show
-        Shared Buffer) so we keep receiving peers' changes."""
+        what it holds now. The document itself carries on in the session -
+        it is tracked in a fresh, hidden shared tab (View > Shared Buffers)
+        so we keep receiving peers' changes to it."""
         if self.mode == "solo" or not tab.shared:
             return
-        mirror = BufferTab(shared=True, doc=tab.doc)
+        doc_id = tab.doc_id
+        mirror = BufferTab(doc_id=doc_id, doc=tab.doc)
         mirror.filename_hint = tab.filename_hint
         mirror.visible = False
-        tab.shared = False
+        tab.doc_id = None
         tab.filename_hint = self._hint_for_tab(tab)
+        self._docs[doc_id] = mirror
         self._tabs.insert(self._tabs.index(tab) + 1, mirror)
-        self.shared_tab = mirror
         if tab is self._active:
             self._after_role_change()
         else:
             self._refresh_tabs()
-        self._set_status("Unshared - this tab is now local. The shared buffer is under View > Show Shared Buffer")
+        self._set_status("Unshared - this tab is now local. The shared buffer is under View > Shared Buffers")
 
-    def _begin_remote_swap(self, swap, author):
-        """A peer replaced the shared buffer with a different document (the
-        op that's about to be applied carries `swap`). If we had a file
-        open in the shared tab - or typed into it - keep that as a local
-        tab exactly as it is right now, and let a new shared tab take over
-        the session's document; the incoming op then turns that new tab
+    def _begin_remote_swap(self, doc_id, swap, author):
+        """A peer replaced the content of shared document `doc_id` with a
+        different document (the op that's about to be applied carries
+        `swap`). If we had a file open in its tab - or typed into it - keep
+        that as a local tab exactly as it is right now, and let a new shared
+        tab take over the document; the incoming op then turns that new tab
         into the peer's buffer. Runs *before* the op is applied, so the
         local tab really does keep our old content."""
-        old = self.shared_tab
+        old = self._docs[doc_id]
         new_hint = swap.get("filename")
         # Both of us have the same file open -> keep working on it here.
         same_file = old.current_file is not None and self._hint_for_tab(old) == new_hint
         if old.visible and self._worth_keeping(old) and not same_file:
-            fresh = BufferTab(shared=True, doc=old.doc)
+            fresh = BufferTab(doc_id=doc_id, doc=old.doc)
             fresh.filename_hint = new_hint
-            old.shared = False
+            old.doc_id = None
             old.filename_hint = self._hint_for_tab(old)
             self._tabs.insert(self._tabs.index(old), fresh)
-            self.shared_tab = fresh
+            self._docs[doc_id] = fresh
             self._console_write(f"  ({self._tab_base_title(old)} stays open as a local tab)\n", "info")
         else:
             old.visible = True
             old.filename_hint = new_hint
             old.local_edited = old.local_edited and same_file
-        # Peer cursors are offsets into the shared document, so whichever
-        # tab is on screen now, its visibility has to match whether *that*
-        # tab is still the shared one - not just the branch above, which
-        # only reassigns self.shared_tab in the "demoted" case. Recomputing
-        # it unconditionally from the active tab's current .shared flag
-        # (rather than only clearing it inside that one branch) is what
-        # keeps a peer's cursor from lingering, mispositioned, in a tab
-        # that just stopped being shared.
-        self.cursor_layer.set_visible(self._active.shared)
+        # Peer cursors are offsets into a shared document, so whichever
+        # tab is on screen now, the layer has to show the document *that*
+        # tab holds (or nothing, if it just stopped being shared) - not
+        # just in the branch above, which only reassigns the document's
+        # tab in the "demoted" case. Recomputing it unconditionally keeps a
+        # peer's cursor from lingering, mispositioned, in a tab that just
+        # stopped being shared.
+        self.cursor_layer.set_doc(self._active.doc_id)
 
     def _prepare_run_target(self):
         """Returns (cmd, target, is_temp) for the buffer to run, or None

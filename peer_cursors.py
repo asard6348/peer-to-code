@@ -25,10 +25,12 @@ class PeerCursorLayer:
     the top or bottom edge of the Text widget instead (their name with an
     up/down arrow); clicking it scrolls to them.
 
-    Positions are character offsets into the shared document, so they have to
+    Positions are character offsets into a shared document, so they have to
     be kept in step with every edit - ours and everyone else's - or a caret
     would drift by however much text was inserted or deleted before it. See
-    apply_op."""
+    apply_op. A session can share several documents at once, so each peer
+    has one position per document; only those in the document of the tab on
+    screen (set_doc) are drawn."""
 
     EDGE_MARGIN = 4
     EDGE_GAP = 4
@@ -41,18 +43,26 @@ class PeerCursorLayer:
         self.self_id = self_id
         self.pad_x = int(text_widget.cget("padx"))
         self.pad_y = int(text_widget.cget("pady"))
-        self.peers = {}
+        self.peers = {}     # peer id -> {"name", "color", "pos": {doc id: {"offset", "sel"}}}
         self.widgets = {}
-        self.visible = True
+        self.doc = None     # document on screen; None while a local (non-shared) tab is
         # One row per edge, anchored to its right-hand corner; the markers
         # are packed into it so Tk does the sizing.
         self._edge_rows = {side: tk.Frame(text_widget, bd=0, highlightthickness=0, bg=bg_color) for side in ("up", "down")}
 
-    def set_visible(self, visible):
-        """Peer cursors are offsets into the shared document, so they're
-        hidden while a local (non-shared) buffer is being shown."""
-        self.visible = bool(visible)
+    @property
+    def visible(self):
+        return self.doc is not None
+
+    def set_doc(self, doc_id):
+        """Which shared document is on screen (None for a local tab, where
+        peer cursors - offsets into a shared document - mean nothing and
+        are hidden)."""
+        self.doc = doc_id
         self.refresh()
+
+    def _pos(self, pid, doc_id):
+        return self.peers[pid]["pos"].setdefault(doc_id, {"offset": None, "sel": None})
 
     def set_self_id(self, self_id):
         """After a P2P failover promotion, a brand-new Server hands out
@@ -66,18 +76,22 @@ class PeerCursorLayer:
             if pid == self.self_id:
                 continue
             live_ids.add(pid)
-            info = self.peers.setdefault(pid, {"offset": None, "sel": None})
+            info = self.peers.setdefault(pid, {"pos": {}})
             info["name"] = pr["name"]
             info["color"] = pr["color"]
-            cursor = pr.get("cursor")
             # The roster only carries the last cursor the server heard from
-            # this peer, which can predate edits this side has already seen
-            # (and shifted the position for). Once a peer's position is
-            # known here it is kept current by update_cursor and apply_op, so
-            # the roster only fills in peers not heard from yet.
-            if cursor and info["offset"] is None:
-                info["offset"] = cursor.get("index")
-                info["sel"] = (cursor["start"], cursor["end"]) if cursor.get("sel") else None
+            # this peer in each document, which can predate edits this side
+            # has already seen (and shifted the position for). Once a
+            # peer's position is known here it is kept current by
+            # update_cursor and apply_op, so the roster only fills in
+            # positions not heard of yet.
+            for cursor in pr.get("cursors") or ():
+                if not isinstance(cursor, dict):
+                    continue
+                pos = self._pos(pid, cursor.get("doc"))
+                if pos["offset"] is None:
+                    pos["offset"] = cursor.get("index")
+                    pos["sel"] = (cursor["start"], cursor["end"]) if cursor.get("sel") else None
             self._ensure_widgets(pid)
         for pid in list(self.peers):
             if pid not in live_ids:
@@ -88,35 +102,40 @@ class PeerCursorLayer:
         pid = payload.get("from")
         if pid is None or pid not in self.peers:
             return
-        info = self.peers[pid]
-        info["offset"] = payload.get("index")
-        info["sel"] = (payload["start"], payload["end"]) if payload.get("sel") else None
+        pos = self._pos(pid, payload.get("doc"))
+        pos["offset"] = payload.get("index")
+        pos["sel"] = (payload["start"], payload["end"]) if payload.get("sel") else None
         self.refresh()
 
-    def apply_op(self, op_components, author=None):
-        """Moves every peer's caret and selection along with an edit to the
-        shared document (an ot.Op's components), so text inserted or deleted
-        before a caret shifts it instead of leaving it pointing at the same
-        offset - which is a different spot in the changed text. `author` is
-        the peer who made the edit, or None for an edit made here: their own
-        caret ends up after what they typed."""
+    def apply_op(self, op_components, author=None, doc_id=None):
+        """Moves every peer's caret and selection in document `doc_id` along
+        with an edit to it (an ot.Op's components), so text inserted or
+        deleted before a caret shifts it instead of leaving it pointing at
+        the same offset - which is a different spot in the changed text.
+        `author` is the peer who made the edit, or None for an edit made
+        here: their own caret ends up after what they typed."""
         for pid, info in self.peers.items():
+            pos = info["pos"].get(doc_id)
+            if pos is None:
+                continue
             mine = author is not None and pid == author
-            offset = info["offset"]
+            offset = pos["offset"]
             if isinstance(offset, int):
-                info["offset"] = ot.transform_position(op_components, offset, stick_right=mine)
-            sel = info["sel"]
+                pos["offset"] = ot.transform_position(op_components, offset, stick_right=mine)
+            sel = pos["sel"]
             if sel and isinstance(sel[0], int) and isinstance(sel[1], int):
                 # Text typed at either edge of a selection stays outside it.
-                info["sel"] = (ot.transform_position(op_components, sel[0], stick_right=True),
-                               ot.transform_position(op_components, sel[1], stick_right=False))
+                pos["sel"] = (ot.transform_position(op_components, sel[0], stick_right=True),
+                              ot.transform_position(op_components, sel[1], stick_right=False))
         self.refresh()
 
     def jump_to(self, pid):
         """Scrolls so that peer `pid`'s caret is on screen."""
         info = self.peers.get(pid)
-        if not info or not isinstance(info["offset"], int):
+        pos = info["pos"].get(self.doc) if info else None
+        if not pos or not isinstance(pos["offset"], int):
             return
+        info = pos
         try:
             self.text.see(f"1.0+{info['offset']}c")
         except tk.TclError:
@@ -175,14 +194,15 @@ class PeerCursorLayer:
             if not w:
                 continue
             self.text.tag_remove(w["sel_tag"], "1.0", "end")
-            if not self.visible:
+            pos = info["pos"].get(self.doc) if self.doc is not None else None
+            if pos is None:
                 self._hide(w)
                 continue
-            if info["sel"]:
-                a, b = info["sel"]
+            if pos["sel"]:
+                a, b = pos["sel"]
                 if isinstance(a, int) and isinstance(b, int) and b > a:
                     self.text.tag_add(w["sel_tag"], f"1.0+{a}c", f"1.0+{b}c")
-            offset = info["offset"]
+            offset = pos["offset"]
             index = f"1.0+{offset}c" if isinstance(offset, int) else None
             bbox = self.text.bbox(index) if index else None
             if not bbox:

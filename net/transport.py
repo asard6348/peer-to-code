@@ -38,8 +38,47 @@ import socket
 import struct
 import threading
 import time
+import traceback
 
-MAGIC = b"CE1"
+# Bumped when per-document sync was added (every document message now carries
+# a document id, and DOC_OPEN exists). Peers on a different version can't
+# understand each other, so each side recognises the other's packets (see
+# ReliableUDP.on_foreign_version) and says so, rather than leaving the person
+# at the other end to wait for a connection timeout.
+PROTOCOL_VERSION = 2
+MAGIC = b"CE%d" % PROTOCOL_VERSION
+
+# Versions older than this one that a connecting client probes for (see
+# Client.connect): their server answers a PING from anyone with a PONG, which
+# is what reveals that a host which stays silent to our HELLO is merely old.
+PROBE_VERSIONS = (1,)
+
+
+def version_of(magic: bytes):
+    """The protocol version a packet's magic stands for, or None if it isn't a
+    Peer to Code magic at all."""
+    if len(magic) == 3 and magic[:2] == b"CE" and magic[2:].isdigit():
+        return int(magic[2:])
+    return None
+
+
+def mismatch_message(theirs, host_is_theirs):
+    """What to tell a person whose version doesn't match the one they're
+    talking to. `host_is_theirs`: the other side is the host (we are joining
+    it) rather than a client joining us."""
+    if host_is_theirs:
+        if theirs < PROTOCOL_VERSION:
+            return (f"The host runs an older version of Peer to Code (protocol {theirs}) that this "
+                    f"version (protocol {PROTOCOL_VERSION}) can't talk to. Ask the host to update "
+                    f"to the latest version.")
+        return (f"The host runs a newer version of Peer to Code (protocol {theirs}) that this "
+                f"version (protocol {PROTOCOL_VERSION}) can't talk to. Please update to the latest "
+                f"version.")
+    if theirs < PROTOCOL_VERSION:
+        return (f"This host runs a newer version of Peer to Code (protocol {PROTOCOL_VERSION}) than "
+                f"yours (protocol {theirs}). Please update to the latest version and try again.")
+    return (f"This host runs an older version of Peer to Code (protocol {PROTOCOL_VERSION}) than "
+            f"yours (protocol {theirs}). Ask the host to update to the latest version.")
 
 HELLO = 1
 WELCOME = 2
@@ -58,6 +97,12 @@ CHAT = 14
 RUN_START = 15
 RUN_OUTPUT = 16
 RUN_END = 17
+DOC_OPEN = 18
+
+# A session can share several documents at once, each with its own id, its own
+# revision counter and its own op history. Id 1 always exists: it is the
+# document a fresh session starts out with.
+MAIN_DOC = 1
 
 HEADER = struct.Struct("!3sBIB")
 FRAG_HEADER = struct.Struct("!IHH")
@@ -136,6 +181,9 @@ class ReliableUDP:
         self.peers = {}
         self.on_message = None
         self.on_peer_timeout = None
+        # Called as (addr, version, kind, seq, flags) for a packet that is
+        # a Peer to Code packet of another protocol version.
+        self.on_foreign_version = None
         self._lock = threading.Lock()
         self._running = False
 
@@ -189,6 +237,16 @@ class ReliableUDP:
                 peer.pending[seq] = [raw, time.monotonic(), time.monotonic(), 0]
         return seq
 
+    def send_as_version(self, addr, version, kind, seq=0, payload=None):
+        """One unreliable packet framed in another protocol version's header
+        (the header layout has never changed, only the magic) - used to
+        answer a peer in the only dialect it will recognise."""
+        body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+        try:
+            self.sock.sendto(HEADER.pack(b"CE%d" % version, kind, seq, 0) + body, addr)
+        except OSError:
+            pass
+
     def _send_ack(self, addr, seq):
         raw = HEADER.pack(MAGIC, ACK, seq, 0)
         try:
@@ -209,6 +267,18 @@ class ReliableUDP:
             del peer.frag_buffers[frag_id]
         return b"".join(pieces)
 
+    def _note_foreign_packet(self, raw, addr):
+        if self.on_foreign_version is None or len(raw) < HEADER.size:
+            return
+        magic, kind, seq, flags = HEADER.unpack_from(raw, 0)
+        version = version_of(magic)
+        if version is None or version == PROTOCOL_VERSION:
+            return
+        try:
+            self.on_foreign_version(addr, version, kind, seq, flags)
+        except Exception:
+            traceback.print_exc()
+
     def _recv_loop(self):
         while self._running:
             try:
@@ -220,6 +290,7 @@ class ReliableUDP:
             try:
                 kind, seq, reliable, frag_info, body = parse_header(raw)
             except (ValueError, struct.error):
+                self._note_foreign_packet(raw, addr)
                 continue
             peer = self._get_peer(addr)
             peer.last_activity = time.monotonic()
@@ -247,7 +318,14 @@ class ReliableUDP:
             except (ValueError, UnicodeDecodeError):
                 continue
             if self.on_message:
-                self.on_message(kind, payload, addr)
+                # One bad packet (a missing field, an op that doesn't fit
+                # the document) must not kill the receive thread: it is
+                # the only thing delivering messages, so letting the
+                # exception escape silently ends networking for good.
+                try:
+                    self.on_message(kind, payload, addr)
+                except Exception:
+                    traceback.print_exc()
 
     def _retransmit_loop(self):
         while self._running:

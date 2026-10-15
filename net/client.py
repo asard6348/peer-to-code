@@ -4,6 +4,7 @@ import random
 import socket
 import threading
 import time
+import traceback
 
 import ot
 from chat_util import CHAT_MAX_LEN, NAME_MAX_LEN, sanitize_name, sanitize_text
@@ -22,9 +23,44 @@ class ConnectCancelled(ConnectError):
     pass
 
 
+class DocSync:
+    """The client-side OT state machine (the classic Synchronized /
+    AwaitingConfirm / AwaitingWithBuffer model) for ONE shared document.
+    A session can carry several documents, each numbered by its own server
+    revision counter, so each gets its own instance.
+
+    A document is `ready` once its full text has arrived; until then the
+    ops that show up are only buffered (they apply on top of that text),
+    and local edits are dropped (the incoming text replaces whatever the
+    editor holds for it anyway)."""
+
+    def __init__(self):
+        self.ready = False
+        self.state = "synced"
+        self.outstanding = None
+        self.buffer = None
+        # Optional "this op replaces the whole shared buffer" marker that
+        # travels with the op it belongs to (see Client.local_edit's `swap`).
+        # Tracked next to outstanding/buffer so it survives the same
+        # queueing/composition those go through.
+        self.outstanding_meta = None
+        self.buffer_meta = None
+        self.expected_rev = 0
+        self.rev_buffer = {}
+        self.chunks = {}
+        self.meta = {}
+
+    def reset_for_resync(self):
+        self.ready = False
+        self.state = "synced"
+        self.outstanding = self.buffer = None
+        self.outstanding_meta = self.buffer_meta = None
+        self.chunks = {}
+        self.meta = {}
+
+
 class Client:
-    """Wraps the transport + client-side OT state machine described by the
-    classic Synchronized / AwaitingConfirm / AwaitingWithBuffer model."""
+    """Wraps the transport and one DocSync per shared document."""
 
     def __init__(self):
         self.transport = ReliableUDP()
@@ -43,21 +79,17 @@ class Client:
         self._chat_timer = None
         self._heartbeat_stop = threading.Event()
 
-        self.state = "synced"
-        self.outstanding = None
-        self.buffer = None
-        # Optional "this op replaces the whole shared buffer" marker that
-        # travels with the op it belongs to (see local_edit's `swap`).
-        # Tracked next to outstanding/buffer so it survives the same
-        # queueing/composition those go through.
-        self.outstanding_meta = None
-        self.buffer_meta = None
-        self.expected_rev = 0
-        self.rev_buffer = {}
-        self._doc_chunks = {}
-        self._doc_total = None
-        self._pending_full_sync = None
+        self.docs = {}  # doc id -> DocSync
         self._lock = threading.RLock()
+        # Incoming document traffic (full texts and ops) is not handled on
+        # the network thread but handed to `dispatcher`, which runs it on
+        # the thread that also makes local edits (for the editor: the Tk
+        # thread, `lambda fn: root.after(0, fn)`). That is what keeps a
+        # peer's op from being transformed against one state of the
+        # document and then applied to a text the user has typed into in the
+        # meantime. None (the default) runs it right on the network thread.
+        self.dispatcher = None
+        self._inbox = collections.deque()
 
         self._on_remote_op = None
         self._on_full_sync = None
@@ -67,7 +99,8 @@ class Client:
         self._on_buffer_context = None
         self._on_chat = None
         self._on_share = None
-        self._pending = {"remote_op": [], "full_sync": [], "peers": [], "cursor": [], "disconnected": [], "buffer_context": [], "chat": [], "share": []}
+        self._on_doc_rejected = None
+        self._pending = {"remote_op": [], "full_sync": [], "peers": [], "cursor": [], "disconnected": [], "buffer_context": [], "chat": [], "share": [], "doc_rejected": []}
         self._connect_result = queue.Queue()
         self._cancelled = threading.Event()
 
@@ -96,6 +129,38 @@ class Client:
     on_buffer_context = _make_callback_prop("buffer_context")
     on_chat = _make_callback_prop("chat")
     on_share = _make_callback_prop("share")
+    on_doc_rejected = _make_callback_prop("doc_rejected")
+
+    def _doc(self, doc_id):
+        """The DocSync for `doc_id`, created on first mention (an op for a
+        document can overtake the document's own text). Caller holds the lock."""
+        sync = self.docs.get(doc_id)
+        if sync is None:
+            sync = self.docs[doc_id] = DocSync()
+        return sync
+
+    def _to_ui(self, fn, *args):
+        """Queues `fn(*args)` for the dispatcher's thread. A plain FIFO that
+        is drained in order, so the order messages were received in is the
+        order they run in whatever the dispatcher's scheduling does. No lock
+        is held here: the dispatcher may block this thread until the UI
+        thread has serviced it."""
+        self._inbox.append((fn, args))
+        if self.dispatcher is None:
+            self._run_inbox()
+        else:
+            self.dispatcher(self._run_inbox)
+
+    def _run_inbox(self):
+        while True:
+            try:
+                fn, args = self._inbox.popleft()
+            except IndexError:
+                return
+            try:
+                fn(*args)
+            except Exception:
+                traceback.print_exc()
 
     def _fire(self, name, *args):
         """Invoke a callback if set, else buffer the event so a callback
@@ -126,11 +191,29 @@ class Client:
             hello.update(extra_hello)
         self.transport.send(self.server_addr, p.HELLO, hello, reliable=True)
 
+        # A host on another protocol version can't read our HELLO and stays
+        # silent - which looks exactly like a wrong address or a firewall.
+        # So (1) anything that comes back from the host in another version's
+        # framing is reported as the version mismatch it is, and (2) an
+        # older host, which would never answer, is nudged with a PING in its
+        # own dialect, which its server answers from anyone.
+        server_addr = self.server_addr
+
+        def foreign(addr, version, kind, seq, flags):
+            if addr == server_addr:
+                self._connect_result.put(("version", version))
+        self.transport.on_foreign_version = foreign
+        next_probe = 0.0
+
         kind = payload = None
         while True:
             if self._cancelled.is_set():
                 self.transport.stop()
                 raise ConnectCancelled("Connection attempt cancelled.")
+            if time.monotonic() >= next_probe:
+                for version in p.PROBE_VERSIONS:
+                    self.transport.send_as_version(server_addr, version, p.PING)
+                next_probe = time.monotonic() + 1.0
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self.transport.stop()
@@ -141,6 +224,10 @@ class Client:
             except queue.Empty:
                 continue
 
+        self.transport.on_foreign_version = None
+        if kind == "version":
+            self.transport.stop()
+            raise ConnectError(p.mismatch_message(payload, host_is_theirs=True))
         if kind == p.HELLO_REJECT:
             self.transport.stop()
             raise ConnectError(payload.get("reason", "Connection refused by host."))
@@ -148,8 +235,6 @@ class Client:
         self.color = payload["color"]
         # The server may have renamed us to keep names unique (bob -> bob#2).
         self.username = sanitize_name(payload.get("username", username), NAME_MAX_LEN)
-        with self._lock:
-            self.expected_rev = payload["revision"]
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
     def _resolve_cancelable(self, host, port, deadline):
@@ -218,8 +303,8 @@ class Client:
         """Host connects to its own server as an ordinary client on localhost."""
         self.connect("127.0.0.1", port, username, extra_hello=extra_hello)
 
-    def local_edit(self, op: ot.Op, swap=None):
-        """Sends a local edit. `swap`, when given, is a small dict
+    def local_edit(self, op: ot.Op, doc=p.MAIN_DOC, swap=None):
+        """Sends a local edit to document `doc`. `swap`, when given, is a small dict
         ({"filename": hint-or-None}) marking this op as one that replaces
         the whole shared buffer with a different document rather than
         being an ordinary edit. It rides inside the op's own message, so
@@ -230,40 +315,53 @@ class Client:
         if op.is_noop():
             return
         with self._lock:
-            if self.state == "synced":
-                self.state = "awaiting"
-                self.outstanding = op
-                self.outstanding_meta = swap
-                base_rev = self.expected_rev
-                self._send_op(base_rev, op, swap)
-            elif self.state == "awaiting":
-                self.state = "awaiting_buffer"
-                self.buffer = op
-                self.buffer_meta = swap
+            sync = self._doc(doc)
+            if not sync.ready:
+                return      # its text hasn't arrived yet; that text replaces any edit made now
+            if sync.state == "synced":
+                sync.state = "awaiting"
+                sync.outstanding = op
+                sync.outstanding_meta = swap
+                self._send_op(doc, sync.expected_rev, op, swap)
+            elif sync.state == "awaiting":
+                sync.state = "awaiting_buffer"
+                sync.buffer = op
+                sync.buffer_meta = swap
             else:
-                self.buffer = ot.compose(self.buffer, op)
+                sync.buffer = ot.compose(sync.buffer, op)
                 if swap is not None:
-                    self.buffer_meta = swap
+                    sync.buffer_meta = swap
 
-    def _send_op(self, base_rev, op, swap=None):
-        payload = {"base_rev": base_rev, "ops": op.to_json()}
+    def _send_op(self, doc, base_rev, op, swap=None):
+        payload = {"doc": doc, "base_rev": base_rev, "ops": op.to_json()}
         if swap is not None:
             payload["swap"] = swap
         self.transport.send(self.server_addr, p.OP, payload, reliable=True)
 
-    def send_cursor(self, index, has_selection, sel_start=None, sel_end=None):
+    def send_cursor(self, index, has_selection, sel_start=None, sel_end=None, doc=p.MAIN_DOC):
         if not self.server_addr:
             return
-        payload = {"index": index, "sel": has_selection}
+        payload = {"doc": doc, "index": index, "sel": has_selection}
         if has_selection:
             payload["start"] = sel_start
             payload["end"] = sel_end
         self.transport.send(self.server_addr, p.CURSOR, payload, reliable=False)
 
-    def send_buffer_context(self, filename):
+    def send_buffer_context(self, filename, doc=p.MAIN_DOC):
         if not self.server_addr:
             return
-        self.transport.send(self.server_addr, p.BUFFER_CONTEXT, {"filename": filename}, reliable=True)
+        self.transport.send(self.server_addr, p.BUFFER_CONTEXT, {"doc": doc, "filename": filename}, reliable=True)
+
+    def open_doc(self, filename, text, ref):
+        """Shares `text` as a NEW document. The server picks its id and
+        sends it to everyone, us included, as a full document carrying our
+        `ref` (so the sender can tell which of its tabs it is). Returns
+        False if not connected; a refusal comes back via on_doc_rejected."""
+        if not self.server_addr:
+            return False
+        self.transport.send(self.server_addr, p.DOC_OPEN,
+                            {"ref": ref, "filename": filename, "text": text}, reliable=True)
+        return True
 
     def send_chat(self, text, to=None):
         """Sends a terminal chat message. `to` is None (everyone), a name /
@@ -411,23 +509,20 @@ class Client:
     def _on_message(self, kind, payload, addr):
         if kind == p.WELCOME:
             if payload.get("resync"):
-                with self._lock:
-                    self.expected_rev = payload["revision"]
-                    self.state = "synced"
-                    self.outstanding = None
-                    self.buffer = None
-                    self.outstanding_meta = None
-                    self.buffer_meta = None
-                    self._doc_chunks = {}
-                    self._doc_total = None
+                # The server gave up on one of our ops: that document's text
+                # is about to be resent in full, replacing our copy.
+                self._to_ui(self._handle_resync, payload)
             else:
                 self._connect_result.put((kind, payload))
         elif kind == p.HELLO_REJECT:
             self._connect_result.put((kind, payload))
         elif kind == p.DOC_CHUNK:
-            self._handle_doc_chunk(payload)
+            self._to_ui(self._handle_doc_chunk, payload)
+        elif kind == p.DOC_OPEN:
+            if isinstance(payload, dict) and payload.get("error"):
+                self._fire("doc_rejected", payload.get("ref"), sanitize_text(payload["error"], 300))
         elif kind == p.OP:
-            self._handle_remote_op(payload)
+            self._to_ui(self._handle_remote_op, payload)
         elif kind == p.PEERS:
             self._fire("peers", payload.get("peers", []))
         elif kind == p.CURSOR:
@@ -443,58 +538,101 @@ class Client:
         elif kind == p.PONG:
             pass
 
+    def _handle_resync(self, payload):
+        with self._lock:
+            self._doc(payload.get("doc", p.MAIN_DOC)).reset_for_resync()
+
     def _handle_doc_chunk(self, payload):
+        """Collects one document's chunks (they may arrive in any order);
+        once complete the document becomes ready at the revision it was
+        captured at, the editor is told the full text, and any ops that
+        arrived early are applied on top."""
+        doc_id = payload.get("doc", p.MAIN_DOC)
         idx, total, text = payload["index"], payload["total"], payload["text"]
-        self._doc_total = total
-        self._doc_chunks[idx] = text
-        if len(self._doc_chunks) == total:
-            full = "".join(self._doc_chunks[i] for i in range(total))
-            self._doc_chunks = {}
-            self._doc_total = None
-            self._fire("full_sync", full)
+        events = []
+        with self._lock:
+            sync = self._doc(doc_id)
+            sync.chunks[idx] = text
+            if not sync.meta:
+                sync.meta = {k: payload.get(k) for k in ("filename", "by", "ref")}
+                sync.meta["fresh"] = bool(payload.get("fresh"))
+            if len(sync.chunks) < total:
+                return
+            full = "".join(sync.chunks[i] for i in range(total))
+            meta = sync.meta
+            sync.chunks, sync.meta = {}, {}
+            sync.ready = True
+            sync.state = "synced"
+            sync.outstanding = sync.buffer = None
+            sync.outstanding_meta = sync.buffer_meta = None
+            sync.expected_rev = int(payload["revision"])
+            for stale in [r for r in sync.rev_buffer if r < sync.expected_rev]:
+                del sync.rev_buffer[stale]      # already contained in the text
+            events.append(("full_sync", (doc_id, full, meta)))
+            events.extend(self._drain_rev_buffer(doc_id, sync))
+        for name, args in events:
+            self._fire(name, *args)
 
     def _handle_remote_op(self, payload):
+        # Runs on the dispatcher's thread (see _to_ui). The state machine is
+        # advanced under the lock, but the callbacks are only *collected*
+        # there and fired after it is released: a callback can end up in
+        # Tk, which makes a thread wait until the main thread services the
+        # call, and waiting on the UI while holding a lock the UI needs for
+        # its next keystroke (local_edit) is what used to freeze the app.
+        doc_id = payload.get("doc", p.MAIN_DOC)
         with self._lock:
+            sync = self._doc(doc_id)
             base_rev = payload["base_rev"]
-            self.rev_buffer[base_rev] = payload
-            self._drain_rev_buffer()
+            if sync.ready and base_rev < sync.expected_rev:
+                return      # already folded into the text we were given
+            sync.rev_buffer[base_rev] = payload
+            events = self._drain_rev_buffer(doc_id, sync) if sync.ready else []
+        for name, args in events:
+            self._fire(name, *args)
 
-    def _drain_rev_buffer(self):
-        while self.expected_rev in self.rev_buffer:
-            payload = self.rev_buffer.pop(self.expected_rev)
+    def _drain_rev_buffer(self, doc_id, sync):
+        """Applies every buffered op of one document that is next in line
+        and returns the events to fire. Caller holds the lock and must fire
+        the events only after releasing it."""
+        events = []
+        while sync.expected_rev in sync.rev_buffer:
+            payload = sync.rev_buffer.pop(sync.expected_rev)
             op = ot.Op.from_json(payload["ops"])
             is_mine = payload.get("from") == self.client_id
             swap = payload.get("swap") if isinstance(payload.get("swap"), dict) else None
             to_apply = None
             if is_mine:
-                self._on_own_ack()
+                self._on_own_ack(doc_id, sync)
             else:
-                to_apply = self._transform_incoming(op)
-            self.expected_rev += 1
+                to_apply = self._transform_incoming(sync, op)
+            sync.expected_rev += 1
             if to_apply is not None and (swap is not None or not to_apply.is_noop()):
-                self._fire("remote_op", to_apply, payload.get("from"), swap)
+                events.append(("remote_op", (doc_id, to_apply, payload.get("from"), swap)))
+        return events
 
-    def _on_own_ack(self):
-        if self.state == "awaiting":
-            self.state = "synced"
-            self.outstanding = None
-            self.outstanding_meta = None
-        elif self.state == "awaiting_buffer":
-            self.state = "awaiting"
-            self.outstanding = self.buffer
-            self.outstanding_meta = self.buffer_meta
-            self.buffer = None
-            self.buffer_meta = None
-            self._send_op(self.expected_rev + 1, self.outstanding, self.outstanding_meta)
+    def _on_own_ack(self, doc_id, sync):
+        if sync.state == "awaiting":
+            sync.state = "synced"
+            sync.outstanding = None
+            sync.outstanding_meta = None
+        elif sync.state == "awaiting_buffer":
+            sync.state = "awaiting"
+            sync.outstanding = sync.buffer
+            sync.outstanding_meta = sync.buffer_meta
+            sync.buffer = None
+            sync.buffer_meta = None
+            self._send_op(doc_id, sync.expected_rev + 1, sync.outstanding, sync.outstanding_meta)
 
-    def _transform_incoming(self, op):
-        if self.state == "synced":
+    @staticmethod
+    def _transform_incoming(sync, op):
+        if sync.state == "synced":
             return op
-        if self.state == "awaiting":
-            self.outstanding, op2 = ot.transform(self.outstanding, op)
+        if sync.state == "awaiting":
+            sync.outstanding, op2 = ot.transform(sync.outstanding, op)
             return op2
-        self.outstanding, op2 = ot.transform(self.outstanding, op)
-        self.buffer, op3 = ot.transform(self.buffer, op2)
+        sync.outstanding, op2 = ot.transform(sync.outstanding, op)
+        sync.buffer, op3 = ot.transform(sync.buffer, op2)
         return op3
 
     def _on_timeout(self, addr):
@@ -533,16 +671,16 @@ class FailoverController:
     """Owns the "who is the sequencer now" decision and the mechanics of
     reconnecting after the current one disappears. Deliberately GUI-free:
     the caller (EditorApp) supplies small callbacks for the Tk-side effects
-    (getting the current document text to seed a promoted server, and
+    (getting every shared document to seed a promoted server, and
     reacting once reconnection succeeds or gives up) so this class can be
     unit-tested with plain Server/Client sockets, no Tk involved."""
 
-    def __init__(self, username, advertise_host, advertise_port, get_doc_text,
+    def __init__(self, username, advertise_host, advertise_port, get_docs,
                  on_reconnected, on_failed, reconnect_delay=(0.3, 0.6), advertise_socket=None):
         self.username = username
         self.advertise_host = advertise_host
         self.advertise_port = advertise_port
-        self.get_doc_text = get_doc_text
+        self.get_docs = get_docs
         self.on_reconnected = on_reconnected
         self.on_failed = on_failed
         self._reconnect_delay = reconnect_delay
@@ -620,10 +758,10 @@ class FailoverController:
         self.on_reconnected(new_client, new_server, reason)
 
     def _promote_self(self):
-        doc = self.get_doc_text() if self.get_doc_text else ""
+        docs = self.get_docs() if self.get_docs else None
         sock = self.advertise_socket.detach() if self.advertise_socket else None
         try:
-            server = Server(self.advertise_port, initial_doc=doc, sock=sock)
+            server = Server(self.advertise_port, initial_docs=docs, sock=sock)
         except OSError:
             if self.advertise_socket:
                 self.advertise_socket.close()

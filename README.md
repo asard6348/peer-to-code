@@ -10,7 +10,10 @@ Edit the same file together with other people, live, over a server or peer-to-pe
 - **Two ways to connect** – a host/client session, or a decentralized
   peer-to-peer mesh
 - **Chat** – talk to your session without leaving the editor
-- **Tabs** – work on several files at once
+- **Tabs** – work on several files at once; right-click a tab and choose
+  **Share** to put it in the session. Share as many tabs as you like: everyone
+  gets each one in a tab of their own (or in the matching tab, if they already
+  have that file open)
 - **Syntax highlighting** for 30+ languages
 - **Run your code** from the editor, with output in a built-in terminal
 - **File explorer**, drag-and-drop file opening, and themes

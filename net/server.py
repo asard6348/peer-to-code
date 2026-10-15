@@ -17,6 +17,11 @@ CHAT_RATE_BURST = 5
 CHAT_RATE_PERIOD = 5.0
 CHAT_MAX_RECIPIENTS = 16
 
+# Upper bound on simultaneously shared documents, so a misbehaving peer
+# can't make every other peer allocate tabs without limit.
+MAX_DOCS = 32
+FILENAME_MAX = 200
+
 COLORS = ["#e06c75", "#61afef", "#98c379", "#e5c07b", "#c678dd", "#56b6c2", "#d19a66", "#be5046"]
 
 
@@ -26,7 +31,7 @@ class ClientRecord:
         self.addr = addr
         self.username = username
         self.color = color
-        self.cursor = None
+        self.cursors = {}  # doc id -> last cursor this client reported in that document
         self.p2p_host = p2p_host
         self.p2p_port = p2p_port
         self.is_sequencer = is_sequencer
@@ -35,12 +40,32 @@ class ClientRecord:
         self.share = None  # the runner's current/last shared run (see Server._handle_share)
 
 
-class Server:
-    def __init__(self, port, initial_doc="", max_clients=32, sock=None):
-        self.port = port
-        self.doc = initial_doc
+class DocState:
+    """One shared document: its text, its own op history and revision
+    counter (ops are numbered per document, never across them) and the
+    name peers show for it."""
+
+    def __init__(self, text="", filename=None):
+        self.doc = text
         self.history = []
         self.revision = 0
+        self.filename = filename
+
+
+class Server:
+    def __init__(self, port, initial_doc="", max_clients=32, sock=None, initial_docs=None):
+        """`initial_docs` ({doc id: (text, filename)}) seeds the session with
+        several documents at once - how a peer promoted to sequencer after a
+        failover carries every shared buffer over under the same ids, so
+        everyone else's tabs still line up. Without it the session starts
+        with the single, empty (or `initial_doc`) document MAIN_DOC."""
+        self.port = port
+        self.docs = {}
+        if initial_docs:
+            for doc_id, (text, filename) in initial_docs.items():
+                self.docs[int(doc_id)] = DocState(text, filename)
+        self.docs.setdefault(p.MAIN_DOC, DocState(initial_doc))
+        self._next_doc_id = max(self.docs) + 1
         self.clients = {}
         self.clients_by_addr = {}
         self._id_gen = itertools.count(1)
@@ -48,11 +73,12 @@ class Server:
         self.max_clients = max_clients
         self.transport = ReliableUDP(("0.0.0.0", port), sock=sock)
         self.transport.on_message = self._on_message
+        self.transport.on_foreign_version = self._on_foreign_version
+        self._refused_versions = {}     # addr -> when we last logged refusing it
         self.transport.on_peer_timeout = self._on_peer_timeout
         self.log = []
         self.on_log = None
         self._heartbeat_stop = threading.Event()
-        self.buffer_context = None
         self.chat_seq = 0
         self.chat_history = collections.deque(maxlen=CHAT_HISTORY_MAX)  # public messages only
         self.chat_rate_burst = CHAT_RATE_BURST
@@ -76,6 +102,23 @@ class Server:
         time.sleep(0.05)
         self.transport.stop()
 
+    def _on_foreign_version(self, addr, version, kind, seq, flags):
+        """Someone on another protocol version is trying to join. They can't
+        be served, but they can be told why: an older client shows the
+        reason of a HELLO_REJECT it receives (in its own dialect) as the
+        connection error, instead of waiting for a timeout."""
+        if kind != p.HELLO:
+            return
+        if flags & p.FLAG_RELIABLE:
+            self.transport.send_as_version(addr, version, p.ACK, seq)      # stop its retransmitting HELLO
+        self.transport.send_as_version(addr, version, p.HELLO_REJECT, 0,
+                                       {"reason": p.mismatch_message(version, host_is_theirs=False)})
+        now = time.monotonic()
+        if now - self._refused_versions.get(addr, -1e9) > 30:
+            self._refused_versions[addr] = now
+            self._emit_log(f"Refused {addr[0]}:{addr[1]}: it runs protocol version {version}, "
+                           f"this host runs version {p.PROTOCOL_VERSION}")
+
     def _emit_log(self, msg):
         self.log.append(msg)
         if self.on_log:
@@ -90,7 +133,7 @@ class Server:
     def _roster_payload(self):
         with self._lock:
             return {"peers": [
-                {"id": c.client_id, "name": c.username, "color": c.color, "cursor": c.cursor,
+                {"id": c.client_id, "name": c.username, "color": c.color, "cursors": list(c.cursors.values()),
                  "p2p_host": c.p2p_host, "p2p_port": c.p2p_port, "is_sequencer": c.is_sequencer}
                 for c in self.clients.values()
             ]}
@@ -104,6 +147,8 @@ class Server:
             self._handle_cursor(payload, addr)
         elif kind == p.BUFFER_CONTEXT:
             self._handle_buffer_context(payload, addr)
+        elif kind == p.DOC_OPEN:
+            self._handle_doc_open(payload, addr)
         elif kind == p.CHAT:
             self._handle_chat(payload, addr)
         elif kind in (p.RUN_START, p.RUN_OUTPUT, p.RUN_END):
@@ -132,21 +177,16 @@ class Server:
                                 p2p_host=p2p_host, p2p_port=p2p_port, is_sequencer=is_sequencer)
             self.clients[client_id] = rec
             self.clients_by_addr[addr] = client_id
-            revision = self.revision
-            doc = self.doc
+            snapshot = [(doc_id, st.doc, st.revision, st.filename)
+                        for doc_id, st in sorted(self.docs.items())]
 
         self.transport.send(addr, p.WELCOME, {
-            "client_id": client_id, "color": color, "revision": revision,
-            "username": username,
+            "client_id": client_id, "color": color, "username": username,
         }, reliable=True)
-        for i, chunk in enumerate(p.chunk_text(doc)):
-            self.transport.send(addr, p.DOC_CHUNK, {
-                "index": i, "total": len(p.chunk_text(doc)), "text": chunk, "revision": revision,
-            }, reliable=True)
-        with self._lock:
-            ctx = self.buffer_context
-        if ctx:
-            self.transport.send(addr, p.BUFFER_CONTEXT, ctx, reliable=True)
+        # Every shared document, each carrying the revision it was
+        # captured at (ops after that revision follow as normal OPs).
+        for doc_id, text, revision, filename in snapshot:
+            self._send_doc(addr, doc_id, text, revision, filename)
         with self._lock:
             history = list(self.chat_history)
         if history:
@@ -155,11 +195,35 @@ class Server:
         self._broadcast(p.PEERS, self._roster_payload())
         self._emit_log(f"{username} joined from {addr[0]}:{addr[1]}")
 
+    def _doc_id_from(self, payload):
+        """The id of an existing document named by `payload["doc"]` (absent
+        means MAIN_DOC), else None. Caller holds the lock."""
+        doc_id = payload.get("doc", p.MAIN_DOC)
+        if isinstance(doc_id, int) and not isinstance(doc_id, bool) and doc_id in self.docs:
+            return doc_id
+        return None
+
+    def _send_doc(self, addr, doc_id, text, revision, filename, **meta):
+        """Sends one document in full: DOC_CHUNKs, each repeating the small
+        header (id, revision, filename, ...) so any chunk is self-describing
+        and the chunks may arrive in any order."""
+        chunks = p.chunk_text(text)
+        for i, chunk in enumerate(chunks):
+            self.transport.send(addr, p.DOC_CHUNK, {
+                "doc": doc_id, "index": i, "total": len(chunks), "text": chunk,
+                "revision": revision, "filename": filename, **meta,
+            }, reliable=True)
+
     def _handle_op(self, payload, addr):
+        resync = False
         with self._lock:
             client_id = self.clients_by_addr.get(addr)
             if client_id is None:
                 return
+            doc_id = self._doc_id_from(payload)
+            if doc_id is None:
+                return
+            state = self.docs[doc_id]
             try:
                 base_rev = int(payload["base_rev"])
                 op = ot.Op.from_json(payload["ops"])
@@ -171,30 +235,35 @@ class Server:
                 swap = {"filename": filename if isinstance(filename, str) else None}
             else:
                 swap = None
-            base_rev = max(0, min(base_rev, self.revision))
-            for hist_op in self.history[base_rev:self.revision]:
-                op, _ = ot.transform(op, hist_op)
+            base_rev = max(0, min(base_rev, state.revision))
             try:
-                self.doc = op.apply(self.doc)
+                for hist_op in state.history[base_rev:state.revision]:
+                    op, _ = ot.transform(op, hist_op)
+                state.doc = op.apply(state.doc)
             except ValueError:
-                self._resend_full_sync(addr)
-                return
-            self.history.append(op)
-            applied_at = self.revision
-            self.revision += 1
-            self._shift_cursors(op, client_id)
+                # The op doesn't fit the document it claims to be based on.
+                resync = True
+            else:
+                state.history.append(op)
+                applied_at = state.revision
+                state.revision += 1
+                self._shift_cursors(op, client_id, doc_id)
+        if resync:
+            self._resend_full_sync(addr, doc_id)
+            return
 
-        message = {"base_rev": applied_at, "ops": op.to_json(), "from": client_id}
+        message = {"doc": doc_id, "base_rev": applied_at, "ops": op.to_json(), "from": client_id}
         if swap is not None:
             message["swap"] = swap
         self._broadcast(p.OP, message, reliable=True)
 
-    def _shift_cursors(self, op, author_id):
-        """Moves every stored cursor along with an applied op, so the
-        positions handed to someone joining (the roster) still point at the
-        same text instead of the offsets last reported before the edit."""
+    def _shift_cursors(self, op, author_id, doc_id):
+        """Moves every stored cursor in `doc_id` along with an applied op,
+        so the positions handed to someone joining (the roster) still point
+        at the same text instead of the offsets last reported before the
+        edit."""
         for rec in self.clients.values():
-            cur = rec.cursor
+            cur = rec.cursors.get(doc_id)
             if not isinstance(cur, dict):
                 continue
             moved = dict(cur)
@@ -204,24 +273,74 @@ class Server:
             if cur.get("sel") and isinstance(cur.get("start"), int) and isinstance(cur.get("end"), int):
                 moved["start"] = ot.transform_position(op.ops, cur["start"], stick_right=True)
                 moved["end"] = ot.transform_position(op.ops, cur["end"], stick_right=False)
-            rec.cursor = moved
+            rec.cursors[doc_id] = moved
 
-    def _resend_full_sync(self, addr):
+    def _resend_full_sync(self, addr, doc_id):
         with self._lock:
-            revision, doc = self.revision, self.doc
-        chunks = p.chunk_text(doc)
-        self.transport.send(addr, p.WELCOME, {"client_id": self.clients_by_addr.get(addr, 0), "revision": revision, "resync": True}, reliable=True)
-        for i, chunk in enumerate(chunks):
-            self.transport.send(addr, p.DOC_CHUNK, {"index": i, "total": len(chunks), "text": chunk, "revision": revision}, reliable=True)
+            state = self.docs.get(doc_id)
+            if state is None:
+                return
+            revision, text, filename = state.revision, state.doc, state.filename
+        self.transport.send(addr, p.WELCOME, {"client_id": self.clients_by_addr.get(addr, 0),
+                                              "doc": doc_id, "revision": revision, "resync": True}, reliable=True)
+        self._send_doc(addr, doc_id, text, revision, filename)
+
+    @staticmethod
+    def _clean_filename(value):
+        return sanitize_text(value, FILENAME_MAX) if isinstance(value, str) and value else None
 
     def _handle_buffer_context(self, payload, addr):
         with self._lock:
             client_id = self.clients_by_addr.get(addr)
             if client_id is None:
                 return
-            ctx = {"filename": payload.get("filename"), "by": client_id}
-            self.buffer_context = ctx
+            doc_id = self._doc_id_from(payload)
+            if doc_id is None:
+                return
+            filename = self._clean_filename(payload.get("filename"))
+            self.docs[doc_id].filename = filename
+            ctx = {"doc": doc_id, "filename": filename, "by": client_id}
         self._broadcast(p.BUFFER_CONTEXT, ctx, reliable=True)
+
+    def _handle_doc_open(self, payload, addr):
+        """A client shares a new document: it gets the next free id, and
+        every client (the sender included, which is how it learns the id)
+        receives the text as a fresh document. `ref` is the sender's own
+        token for the request and just rides along so it can recognise the
+        reply. Whether a recipient shows it as a new tab, or attaches it to
+        a tab it already has open with identical content, is up to it."""
+        if not isinstance(payload, dict):
+            return
+        text = payload.get("text")
+        ref = payload.get("ref")
+        if not isinstance(ref, int) or isinstance(ref, bool):
+            ref = None
+        if not isinstance(text, str):
+            return
+        error = None
+        with self._lock:
+            client_id = self.clients_by_addr.get(addr)
+            if client_id is None:
+                return
+            if len(self.docs) >= MAX_DOCS:
+                error = f"Too many shared buffers in this session (limit {MAX_DOCS})."
+            else:
+                doc_id = self._next_doc_id
+                self._next_doc_id += 1
+                filename = self._clean_filename(payload.get("filename"))
+                self.docs[doc_id] = DocState(text, filename)
+                targets = [c.addr for c in self.clients.values()]
+        if error:
+            self.transport.send(addr, p.DOC_OPEN, {"ref": ref, "error": error}, reliable=True)
+            return
+        for target in targets:
+            self._send_doc(target, doc_id, text, 0, filename, fresh=True, by=client_id, ref=ref)
+        self._emit_log(f"{self._name_of(client_id)} shared {filename or 'a new buffer'}")
+
+    def _name_of(self, client_id):
+        with self._lock:
+            rec = self.clients.get(client_id)
+        return rec.username if rec else f"#{client_id}"
 
     def _chat_allow(self, rec):
         """Token bucket: True if `rec` may send a chat message now."""
@@ -423,13 +542,19 @@ class Server:
                 self.transport.send(addr, kind, msg, reliable=True)
 
     def _handle_cursor(self, payload, addr):
+        if not isinstance(payload, dict):
+            return
         with self._lock:
             client_id = self.clients_by_addr.get(addr)
             if client_id is None:
                 return
+            doc_id = self._doc_id_from(payload)
+            if doc_id is None:
+                return
+            payload = {**payload, "doc": doc_id}
             rec = self.clients.get(client_id)
             if rec:
-                rec.cursor = payload
+                rec.cursors[doc_id] = payload
         self._broadcast(p.CURSOR, {**payload, "from": client_id}, exclude_addr=addr, reliable=False)
 
     def _handle_goodbye(self, addr):
@@ -455,4 +580,6 @@ class Server:
 
     def snapshot(self):
         with self._lock:
-            return {"revision": self.revision, "peers": len(self.clients), "doc_len": len(self.doc)}
+            main = self.docs[p.MAIN_DOC]
+            return {"revision": main.revision, "peers": len(self.clients), "doc_len": len(main.doc),
+                    "docs": len(self.docs)}
