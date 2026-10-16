@@ -1653,6 +1653,8 @@ class EditorApp(ttk.Frame):
         for seq in ("<Return>", "<KP_Enter>"):
             self.chat_entry.bind(seq, self._chat_submit)
         self.chat_entry.bind("<Tab>", self._on_chat_tab)
+        self.chat_entry.bind("<FocusIn>", self._on_window_focus_in, add="+")
+        self.winfo_toplevel().bind("<FocusIn>", self._on_window_focus_in, add="+")
         self.chat_entry.bind("<Up>", self._on_chat_history)
         self.chat_entry.bind("<Down>", self._on_chat_history)
 
@@ -1809,10 +1811,38 @@ class EditorApp(ttk.Frame):
         if payload.get("private"):
             self._last_private = (payload.get("from"), sanitize_name(payload.get("name")))
         self._chat_append(self._chat_segments(payload))
-        if not self.chat_panel.visible:
+        if not self._chat_is_seen():
             self._chat_note_unread(cfg)
 
     # -- unread counter ------------------------------------------------
+
+    def _chat_is_seen(self):
+        """True when a message arriving right now is actually in front of
+        the person: the Chat panel is open AND the editor window is
+        not minimized and has the keyboard focus. An open panel in a
+        window that's minimized or sitting behind another app is not
+        "seen" - that case used to produce no counter, flash or bell at
+        all, so a message could come and go unnoticed."""
+        if not self.chat_panel.visible:
+            return False
+        try:
+            if self.winfo_toplevel().state() == "iconic":
+                return False
+            return self.focus_displayof() is not None
+        except tk.TclError:
+            return True
+
+    def _on_window_focus_in(self, event):
+        """The window (or the Chat input) got the focus back: whatever
+        piled up while the panel was open but unattended is now seen."""
+        try:
+            if not self.winfo_exists():     # a previous session's binding on a reused window
+                return
+            if event.widget in (self.winfo_toplevel(), getattr(self, "chat_entry", None)) \
+                    and self.chat_panel.visible:
+                self._chat_clear_unread()
+        except tk.TclError:
+            pass
 
     def _chat_note_unread(self, cfg):
         self._chat_unread += 1

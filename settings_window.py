@@ -796,7 +796,7 @@ class SettingsWindow(tk.Toplevel):
         row += 1
         check(row, "show_timestamps", "Show a timestamp before each message")
         row += 1
-        check(row, "notify", "Flash the unread counter when a message arrives while the Chat panel is hidden")
+        check(row, "notify", "Flash the unread counter when a message arrives unseen (Chat hidden or window inactive)")
         row += 1
         check(row, "notify_bell", "Also ring the system bell")
         row += 1
