@@ -33,7 +33,7 @@ from dock import DockManager
 from peer_cursors import PeerCursorLayer
 from tab_bar import TabBar
 from settings_window import SettingsWindow
-from net.client import FailoverController
+from net.client import Client, ConnectCancelled, ConnectError, FailoverController
 from net.transport import MAIN_DOC
 
 # The Terminal console's stdout/stderr/prompt colors, tuned as two fixed
@@ -241,6 +241,12 @@ class EditorApp(ttk.Frame):
         self._poll_job = None
         self._console_resize_job = None
         self._known_peer_names = {}
+        # Reconnect UI (see _show_reconnect_ui): the address field that
+        # appears next to the toolbar's Disconnect button once a session
+        # drops, and the token identifying the connection attempt in flight.
+        self.reconnect_entry = None
+        self._reconnect_token = None
+        self._reconnect_client = None
         # Chat panel state (see the "Chat" section below).
         self._roster = []              # last roster from the server: [{"id", "name", "color", ...}]
         self._last_private = None      # (client id, name) of the last private sender, for `/r`
@@ -626,6 +632,8 @@ class EditorApp(ttk.Frame):
         self.tabbar.set_theme(t)
         self.interp_label.configure(bg=t["bg"], fg=t["fg"])
         self.peers_label.configure(bg=t["bg"], fg=t["fg"])
+        if self.reconnect_entry is not None:
+            self.reconnect_entry.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"])
         self.unread_label.configure(bg=t["bg"], fg=t["fg"])
         self.file_path_label.configure(bg=t["bg"], fg=t["muted_fg"])
         self.run_cmd_entry.configure(bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"])
@@ -751,7 +759,8 @@ class EditorApp(ttk.Frame):
         self.chat_panel = self.dock.add_panel("chat")
         self.dock.load(self.cfg)
 
-        self.explorer = FileExplorer(self.explorer_panel.content, self.working_dir, self._open_file_from_explorer)
+        self.explorer = FileExplorer(self.explorer_panel.content, self.working_dir, self._open_file_from_explorer,
+                                     on_root_change=self._on_explorer_root_change)
         self.explorer.pack(fill="both", expand=True)
         # A plain sans-serif face reads better for a file tree than
         # whatever the ttk theme's own default happens to be, and a
@@ -946,6 +955,12 @@ class EditorApp(ttk.Frame):
         self.working_dir = new_dir
         self.explorer.set_working_dir(new_dir)
 
+    def _on_explorer_root_change(self, new_dir):
+        """The Explorer re-rooted itself (context menu "Open in Explorer"
+        or the ".." button): keep the working folder in step, the same as
+        _switch_working_dir does for a dropped folder."""
+        self.working_dir = new_dir
+
     def _on_explorer_drop(self, paths):
         for path in paths:
             if os.path.isdir(path):
@@ -953,8 +968,30 @@ class EditorApp(ttk.Frame):
             elif os.path.isfile(path):
                 self._load_file(path)
 
+    _GUTTER_MIN_WIDTH = 48
+    _GUTTER_PAD = 8
+
+    def _fit_gutter_width(self, font):
+        """Widens the line-number gutter to fit the longest line number at
+        the current font size. The width used to be a fixed 48px, which
+        clipped the numbers once zoomed in far enough (or once the file
+        passed 999 lines). Never narrower than the original width, and
+        only reconfigured when it actually changes."""
+        try:
+            last_line = int(self.text.index("end-1c").split(".")[0])
+            digits = max(3, len(str(last_line)))
+            needed = font.measure("0" * digits) + 2 * self._GUTTER_PAD
+        except (tk.TclError, ValueError):
+            return
+        width = max(self._GUTTER_MIN_WIDTH, needed)
+        if int(self.linenumbers.cget("width")) != width:
+            self.linenumbers.configure(width=width)
+
     def _redraw_linenumbers(self, *_):
         self.linenumbers.delete("all")
+        gutter_font = (self.theme.get("font_family", CODE_FONT), self._font_size)
+        self._fit_gutter_width(tkfont.Font(font=gutter_font))
+        x_right = int(self.linenumbers.cget("width")) - self._GUTTER_PAD
         i = self.text.index("@0,0")
         while True:
             dline = self.text.dlineinfo(i)
@@ -962,8 +999,8 @@ class EditorApp(ttk.Frame):
                 break
             y = dline[1]
             line_no = str(i).split(".")[0]
-            self.linenumbers.create_text(40, y, anchor="ne", text=line_no, fill=self.theme["gutter_fg"],
-                                          font=(self.theme.get("font_family", CODE_FONT), self._font_size))
+            self.linenumbers.create_text(x_right, y, anchor="ne", text=line_no, fill=self.theme["gutter_fg"],
+                                          font=gutter_font)
             i = self.text.index(f"{i}+1line")
             if self.text.compare(i, ">=", "end"):
                 dline2 = self.text.dlineinfo(i)
@@ -2212,12 +2249,125 @@ class EditorApp(ttk.Frame):
             self.client.transport.stop()
         except Exception:
             pass
+        if self.mode in ("client", "p2p"):
+            self._show_reconnect_ui()
         messagebox.showwarning("Disconnected", reason)
+
+    # -- Reconnect ------------------------------------------------------
+
+    def _reconnect_default_address(self):
+        """What to prefill the address field with: whatever this session
+        was started against (the Connect tab's address, or the Peer to
+        Peer tab's Join address), else the address the dropped client was
+        actually talking to."""
+        conn = self.cfg.get("connection", {})
+        saved = conn.get("address" if self.mode == "client" else "p2p_join_address")
+        if saved:
+            return saved
+        addr = getattr(self.client, "server_addr", None)
+        if addr and self.mode == "client":
+            return f"{addr[0]}:{addr[1]}"
+        return ""
+
+    def _show_reconnect_ui(self):
+        """Turns the toolbar's Disconnect button into Reconnect, with an
+        address field just left of it. File > Disconnect still leaves the
+        session for good."""
+        if self.reconnect_entry is not None:
+            return
+        t = self.theme
+        entry = tk.Entry(self.toolbar, width=24, bg=t["edit_bg"], fg=t["fg"], insertbackground=t["fg"],
+                         relief="flat", font=self.disconnect_btn.cget("font"))
+        entry.insert(0, self._reconnect_default_address())
+        entry.bind("<Return>", lambda e: self.action_reconnect())
+        # Packed after the button (so it's one slot further left) and
+        # before the peers label (so the label stays leftmost of the three).
+        entry.pack(side="right", padx=(0, 6), pady=4, before=self.peers_label)
+        self.reconnect_entry = entry
+        self.disconnect_btn.configure(text="Reconnect", command=self.action_reconnect,
+                                      bg="#2f8f5b", activebackground="#3aa76a")
+        # Match the button's height exactly so the two line up: an Entry is
+        # a few pixels shorter than a Button by default.
+        self.toolbar.update_idletasks()
+        extra = self.disconnect_btn.winfo_reqheight() - entry.winfo_reqheight()
+        if extra > 0:
+            entry.pack_configure(ipady=extra // 2)
+        entry.focus_set()
+        entry.icursor("end")
+
+    def _hide_reconnect_ui(self):
+        if self.reconnect_entry is not None:
+            self.reconnect_entry.destroy()
+            self.reconnect_entry = None
+        self.disconnect_btn.configure(text="Disconnect", command=self.action_disconnect,
+                                      bg="#5a3030", activebackground="#734040", state="normal")
+
+    def action_reconnect(self):
+        if self.reconnect_entry is None or self._reconnect_token is not None:
+            return
+        from connect_window import parse_address
+        try:
+            host, port = parse_address(self.reconnect_entry.get())
+        except ValueError as e:
+            messagebox.showerror("Invalid address", str(e))
+            return
+        if self.mode == "p2p" and self.reconnect_entry.get().strip() == "":
+            messagebox.showerror("Missing address", "Enter the address of a peer still in the mesh.")
+            return
+        # Reconnecting makes the host re-send every shared document, which
+        # replaces what's in those tabs here - including anything typed
+        # while disconnected that never reached the host. Same Save /
+        # Don't Save / Cancel question as closing or running.
+        if not self._confirm_discard_all(shared_only=True):
+            return
+        extra_hello = self._failover.hello_extra(is_sequencer=False) if self._failover is not None else None
+        token = self._reconnect_token = object()
+        client = self._reconnect_client = Client()
+        self.reconnect_entry.configure(state="disabled")
+        self.disconnect_btn.configure(text="Connecting...", state="disabled")
+        self._set_status(f"Reconnecting to {host}:{port}...")
+
+        def worker():
+            try:
+                client.connect(host, port, self.username, extra_hello=extra_hello)
+            except ConnectCancelled:
+                return
+            except ConnectError as e:
+                outcome = (False, str(e))
+            else:
+                outcome = (True, None)
+            try:
+                self.after(0, lambda: self._reconnect_done(token, client, host, port, *outcome))
+            except tk.TclError:
+                pass        # the window is already gone
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reconnect_done(self, token, client, host, port, ok, error):
+        if token is not self._reconnect_token:
+            # Cancelled (the session was left) while connecting.
+            if ok:
+                client.disconnect()
+            return
+        self._reconnect_token = None
+        self._reconnect_client = None
+        if not ok:
+            if self.reconnect_entry is not None:
+                self.reconnect_entry.configure(state="normal")
+            self.disconnect_btn.configure(text="Reconnect", state="normal")
+            self._set_status(f"Reconnect failed: {error}")
+            messagebox.showerror("Reconnect", error)
+            return
+        if self.mode == "client":
+            self.cfg.setdefault("connection", {})["address"] = f"{host}:{port}"
+        self._finish_failover(client, None, "")
+        self._set_status(f"Reconnected to {host}:{port}")
 
     def _on_failover_reconnected(self, new_client, new_server, reason):
         self.after(0, lambda: self._finish_failover(new_client, new_server, reason))
 
     def _finish_failover(self, new_client, new_server, reason):
+        self._hide_reconnect_ui()
         self.client = new_client
         self.server = new_server
         self._bind_client(new_client)
@@ -2271,6 +2421,12 @@ class EditorApp(ttk.Frame):
         self._cancel_pending_jobs()
         if self._failover is not None:
             self._failover.close()
+        if self._reconnect_client is not None:
+            self._reconnect_token = None
+            try:
+                self._reconnect_client.cancel_connect()
+            except Exception:
+                pass
         try:
             self.client.on_disconnected = None
             self.client.disconnect()
@@ -2296,15 +2452,17 @@ class EditorApp(ttk.Frame):
             self._switch_to(tab)
         return self._confirm_discard()
 
-    def _confirm_discard_all(self):
+    def _confirm_discard_all(self, shared_only=False):
         """Gate before anything that would throw away every open buffer at
         once (Disconnect/Close, the window's own close button). One
         unsaved tab gets exactly the normal single-buffer "Save changes?"
         prompt (_confirm_discard_tab) - no point asking "save them all?"
         about one thing. More than one gets a single combined prompt
         instead of one dialog per tab, and a Yes saves them all via
-        save_all_tabs()."""
-        unsaved = [tab for tab in self.visible_tabs if tab.dirty]
+        save_all_tabs(). `shared_only` limits it to the shared tabs -
+        the ones a reconnect's resync replaces - leaving local-only
+        buffers out of the question."""
+        unsaved = [tab for tab in self.visible_tabs if tab.dirty and (tab.shared or not shared_only)]
         if not unsaved:
             return True
         if len(unsaved) == 1:
@@ -2316,19 +2474,20 @@ class EditorApp(ttk.Frame):
             return False
         if not choice:
             return True
-        return self.save_all_tabs()
+        return self.save_all_tabs(unsaved)
 
     def has_unsaved_tabs(self):
         return any(tab.dirty for tab in self.visible_tabs)
 
-    def save_all_tabs(self):
-        """Saves every unsaved tab, returning False if any of them ended
-        up still unsaved. Tabs that already have a file are saved first,
-        silently - then whatever's left (untitled buffers, each needing
-        its own Save As dialog) is prompted for in tab order, so a stack
-        of "Save As" dialogs doesn't get interrupted by a save that
-        should have been silent to begin with."""
-        unsaved = [tab for tab in self.visible_tabs if tab.dirty]
+    def save_all_tabs(self, tabs=None):
+        """Saves every unsaved tab (or just those in `tabs`), returning
+        False if any of them ended up still unsaved. Tabs that already
+        have a file are saved first, silently - then whatever's left
+        (untitled buffers, each needing its own Save As dialog) is
+        prompted for in tab order, so a stack of "Save As" dialogs
+        doesn't get interrupted by a save that should have been silent
+        to begin with."""
+        unsaved = [tab for tab in (self.visible_tabs if tabs is None else tabs) if tab.dirty]
         already_named = [tab for tab in unsaved if tab.current_file]
         untitled = [tab for tab in unsaved if not tab.current_file]
         for tab in already_named + untitled:
@@ -3088,8 +3247,9 @@ class EditorApp(ttk.Frame):
         it couldn't be prepared. A buffer that's already saved and clean
         runs straight from its own file; a dirty one is saved back to
         that same file first (so what runs matches what's on screen,
-        the same "save before run" most editors do) rather than forked
-        off into a second, untracked copy sitting next to it. Only a
+        the same "save before run" most editors do, but only after the
+        user agrees to it) rather than forked off into a second,
+        untracked copy sitting next to it. Only a
         buffer that was never saved anywhere - so there's no file to
         run - falls back to a temp file, and even then it's written to
         the OS temp directory rather than the project folder, and
@@ -3101,6 +3261,16 @@ class EditorApp(ttk.Frame):
             return None
         if self.current_file is not None:
             if self.dirty:
+                choice = messagebox.askyesnocancel(
+                    "Run",
+                    f"'{os.path.basename(self.current_file)}' has unsaved changes.\n\n"
+                    "Yes: save, then run.\n"
+                    "No: run the last saved version (unsaved changes are not included).\n"
+                    "Cancel: don't run.")
+                if choice is None:
+                    return None
+                if not choice:
+                    return cmd, self.current_file, False
                 self.action_save()
                 if self.dirty:
                     # action_save can no-op (declined an external-change
@@ -3637,10 +3807,10 @@ class EditorApp(ttk.Frame):
         return "break"
 
     def action_find(self):
-        FindDialog(self, replace=False)
+        FindDialog.show(self, replace=False)
 
     def action_replace(self):
-        FindDialog(self, replace=True)
+        FindDialog.show(self, replace=True)
 
     def action_toggle_comment(self):
         try:
@@ -4156,9 +4326,45 @@ class FindDialog(tk.Toplevel):
 
     _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
 
+    @classmethod
+    def show(cls, app, replace):
+        """Opens the dialog, or reuses the one already open so spamming
+        Ctrl+F / Ctrl+H can't stack up copies. Same mode: just raised and
+        refocused (picking up the current selection as the search text,
+        like a fresh dialog would). Other mode (Find vs. Replace have
+        different layouts): the old one is closed and the right one opens."""
+        for dlg in list(cls._instances):
+            try:
+                alive = dlg.winfo_exists()
+            except tk.TclError:
+                alive = False
+            if not alive:
+                cls._instances.remove(dlg)
+                continue
+            if dlg.replace_mode == replace and dlg.app is app:
+                dlg.present()
+                return dlg
+            dlg.destroy()
+        return cls(app, replace)
+
+    def present(self):
+        selected = self._selected_or_empty()
+        if selected:
+            self.find_var.set(selected)
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+            self.lift()
+            self.focus_force()
+            self.find_entry.focus_set()
+            self.find_entry.select_range(0, "end")
+        except tk.TclError:
+            pass
+
     def __init__(self, app: EditorApp, replace: bool):
         super().__init__(app)
         self.app = app
+        self.replace_mode = replace
         t = app.theme
         self.title("Replace" if replace else "Find")
         self.configure(bg=t["panel_bg"])
@@ -4177,6 +4383,7 @@ class FindDialog(tk.Toplevel):
         find_entry = tk.Entry(self, textvariable=self.find_var, width=32, bg=t["edit_bg"], fg=t["fg"],
                                insertbackground=t["fg"], relief="flat")
         find_entry.grid(row=0, column=1, padx=8, pady=6, columnspan=3, sticky="we")
+        self.find_entry = find_entry
 
         self.replace_var = tk.StringVar()
         if replace:

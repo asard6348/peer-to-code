@@ -623,10 +623,16 @@ class ConnectWindow(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_open_project(self, raw, client, server, wdir, name, extra):
-        config.add_recent_project(self.cfg, raw)
+    def _register_recent(self, path):
+        """Puts `path` (a folder, or a single file) at the top of the
+        Recent list and saves it. Shared by every tab, so Open, Connect
+        and Peer to Peer all feed the same list."""
+        config.add_recent_project(self.cfg, path)
         config.save_config(self.cfg)
         self._refresh_recent_projects()
+
+    def _finish_open_project(self, raw, client, server, wdir, name, extra):
+        self._register_recent(raw)
         self._ready("solo", client, server, wdir, name, extra)
 
     def _build_udp_page(self, parent):
@@ -717,7 +723,8 @@ class ConnectWindow(ttk.Frame):
                 self.after(0, lambda msg=str(e): self._fail(msg, server))
                 return
             extra = {"open_file": single_file} if single_file else None
-            self.after(0, lambda: self._ready("host", client, server, wdir, name, extra))
+            self.after(0, lambda: self._ready("host", client, server, wdir, name, extra,
+                                               recent_path=single_file or wdir))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -749,7 +756,7 @@ class ConnectWindow(ttk.Frame):
             except ConnectError as e:
                 self.after(0, lambda msg=str(e): self._fail(msg, None))
                 return
-            self.after(0, lambda: self._ready("client", client, None, wdir, name))
+            self.after(0, lambda: self._ready("client", client, None, wdir, name, recent_path=wdir))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -942,7 +949,8 @@ class ConnectWindow(ttk.Frame):
                 return
             self.after(0, lambda: self._ready("p2p", client, server, wdir, name,
                                                {"p2p_advertise": (pub_host, pub_port),
-                                                "p2p_advertise_socket": identity}))
+                                                "p2p_advertise_socket": identity},
+                                               recent_path=wdir))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1064,7 +1072,8 @@ class ConnectWindow(ttk.Frame):
                 return
             self.after(0, lambda: self._ready("p2p", client, None, wdir, name,
                                                {"p2p_advertise": (pub_host, pub_port),
-                                                "p2p_advertise_socket": identity}))
+                                                "p2p_advertise_socket": identity},
+                                               recent_path=wdir))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1121,6 +1130,11 @@ class ConnectWindow(ttk.Frame):
         self._set_busy(False, message)
         self.cancel_btn.configure(state="normal")
 
-    def _ready(self, mode, client, server, wdir, name, extra=None):
+    def _ready(self, mode, client, server, wdir, name, extra=None, recent_path=None):
         self._current_client = None
+        # Registered only now that the session is actually live (a failed
+        # or cancelled connection never gets here), and before on_ready,
+        # which may tear this screen down.
+        if recent_path:
+            self._register_recent(recent_path)
         self.on_ready(mode, client, server, wdir, name, extra)

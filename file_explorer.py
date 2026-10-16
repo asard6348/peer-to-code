@@ -2,6 +2,7 @@ import os
 import platform
 import shutil
 import string
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, simpledialog, messagebox, filedialog
@@ -46,7 +47,7 @@ def _filesystem_roots():
 
 
 class FileExplorer(ttk.Frame):
-    def __init__(self, master, working_dir, on_open_file, **kw):
+    def __init__(self, master, working_dir, on_open_file, on_root_change=None, **kw):
         # Gives the panel a visible themed edge (see theme.apply_base_
         # style's "Explorer.TFrame") instead of blending straight into
         # the editor pane beside it; callers can still override by
@@ -55,7 +56,20 @@ class FileExplorer(ttk.Frame):
         super().__init__(master, **kw)
         self.working_dir = working_dir
         self.on_open_file = on_open_file
+        # Called with the new root folder whenever the tree re-roots itself
+        # (context-menu "Open in Explorer" or the ".." button), so the owner
+        # can keep its own idea of the working folder in sync.
+        self.on_root_change = on_root_change
         self._whole_computer = False
+        # Path of the item the context menu was last opened on (None when
+        # it was opened on empty space).
+        self._menu_path = None
+        self._item_entries_shown = False
+        # The ".." row at the top of the tree. Deliberately NOT in
+        # _node_paths, so rename/delete/move/drag-drop never treat it as a
+        # real file or folder.
+        self._up_node = None
+        self._last_up_click = 0
         # How the tree's entries are ordered - see SORT_OPTIONS for the
         # keys this can take, and _secondary_key/_populate for how a key
         # plus this direction turn into an actual ordering. Directories
@@ -71,7 +85,9 @@ class FileExplorer(ttk.Frame):
                    command=self.refresh).pack(side="right", padx=2)
         # Collapse All sits at the left edge, Refresh at the right. (The
         # "EXPLORER" title lives in the dockable panel's own header - see
-        # dock.DockPanel - so the spacer below just keeps them apart.)
+        # dock.DockPanel - so the spacer below just keeps them apart. The
+        # "go to parent folder" control isn't up here, it's the ".." row
+        # at the top of the tree - see _refresh_up_row.)
         ttk.Button(header, text="Collapse All", style="Toolbar.Thin.TButton",
                    command=self.collapse_all).pack(side="left", padx=2)
         ttk.Frame(header).pack(side="left", fill="x", expand=True, pady=4)
@@ -109,6 +125,8 @@ class FileExplorer(ttk.Frame):
         self.tree.tag_configure("drop_target", background=self._drop_target_color())
 
         self.menu = tk.Menu(self, tearoff=0)
+        # "Open" / "Open in Explorer" only exist while the menu is open on
+        # an actual item - see _set_item_entries.
         self.menu.add_command(label="New File", command=self._new_file)
         self.menu.add_command(label="New Folder", command=self._new_folder)
         self.menu.add_separator()
@@ -277,6 +295,74 @@ class FileExplorer(ttk.Frame):
             node = self.tree.insert("", "end", text=label, open=open_roots)
             self._node_paths[node] = path
             self._populate(node, path)
+        self._refresh_up_row()
+
+    def _parent_root(self):
+        """The folder \"..\" would re-root the tree at, or None when
+        there's nowhere higher to go (whole-computer view, or already at
+        the top of the filesystem / a drive root)."""
+        if self._whole_computer or not self.working_dir:
+            return None
+        current = os.path.normpath(self.working_dir)
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            return None
+        return parent
+
+    def _refresh_up_row(self):
+        """Puts a \"..\" row first in the tree whenever there's a higher
+        folder to go to (not in the whole-computer view, nor at the top
+        of the filesystem / a drive root)."""
+        self._up_node = None
+        if self._parent_root():
+            self._up_node = self.tree.insert("", 0, text="..")
+
+    def _activate_up_row(self):
+        # A double-click would otherwise register twice: the first click
+        # re-roots the tree, and the second then lands on the new tree's
+        # own \"..\" row, going up a second level.
+        now = time.monotonic()
+        if now - self._last_up_click < 0.4:
+            return
+        self._last_up_click = now
+        self.go_up()
+
+    def _set_root(self, path, reveal=None):
+        """Re-roots the tree at folder `path`, keeping every folder that
+        was expanded still expanded (so going up shows the old root open
+        inside its parent, rather than a collapsed, disorienting tree),
+        then selects and scrolls to `reveal` if given."""
+        path = os.path.normpath(path)
+        if not os.path.isdir(path):
+            return
+        expanded = {os.path.normpath(p) for p in self._collect_expanded_paths()}
+        self.working_dir = path
+        self._whole_computer = False
+        self._rebuild(open_roots=True)
+        for root_node in self.tree.get_children(""):
+            root_path = self._node_paths.get(root_node)
+            if root_path:
+                self._reexpand(root_node, root_path, expanded)
+        self._update_tree_width()
+        self.tree.xview_moveto(0)
+        self.tree.yview_moveto(0)
+        if reveal:
+            self._reveal(reveal)
+        if self.on_root_change:
+            self.on_root_change(path)
+
+    def _reveal(self, path):
+        for node, node_path in self._node_paths.items():
+            if node_path == path:
+                self.tree.selection_set(node)
+                self.tree.focus(node)
+                self.tree.see(node)
+                return
+
+    def go_up(self):
+        parent = self._parent_root()
+        if parent:
+            self._set_root(parent, reveal=os.path.normpath(self.working_dir))
 
     def _collect_expanded_paths(self):
         expanded = set()
@@ -391,8 +477,59 @@ class FileExplorer(ttk.Frame):
         if node:
             self.tree.selection_set(node)
             self.tree.focus(node)
+        self._menu_path = self._node_paths.get(node) if node else None
+        self._set_item_entries(bool(self._menu_path))
         # Offset so the pointer starts outside the menu (see dock.py).
         self.menu.tk_popup(event.x_root + 4, event.y_root + 4)
+
+    def _set_item_entries(self, show):
+        """Adds or removes the item-specific entries (Open, Open in
+        Explorer) at the top of the menu: right-clicking empty space (or
+        the \"..\" row) shows the menu without them rather than with
+        dead, greyed-out ones."""
+        if show == self._item_entries_shown:
+            return
+        if show:
+            self.menu.insert_command(0, label="Open", command=self._open_item)
+            self.menu.insert_command(1, label="Open in Explorer", command=self._open_in_explorer)
+            self.menu.insert_separator(2)
+        else:
+            self.menu.delete(0, 2)
+        self._item_entries_shown = show
+
+    def _open_item(self):
+        """Context-menu \"Open\": a file opens in the editor, a folder
+        toggles expanded/collapsed (the same thing a double-click does
+        for each in most file trees)."""
+        path = self._menu_path
+        if not path:
+            return
+        if os.path.isfile(path):
+            self.on_open_file(path)
+            return
+        if not os.path.isdir(path):
+            return
+        node = next((n for n, p in self._node_paths.items() if p == path), None)
+        if node is None:
+            return
+        if self.tree.item(node, "open"):
+            self.tree.item(node, open=False)
+        else:
+            self._load_children(node, path)
+            self.tree.item(node, open=True)
+        self._update_tree_width()
+
+    def _open_in_explorer(self):
+        """Context-menu \"Open in Explorer\": makes the right-clicked
+        folder the tree's top-level folder. For a file, that's the folder
+        containing it, with the file selected."""
+        path = self._menu_path
+        if not path:
+            return
+        if os.path.isdir(path):
+            self._set_root(path)
+        elif os.path.isfile(path):
+            self._set_root(os.path.dirname(path), reveal=path)
 
     def _target_dir(self):
         node = self.tree.focus()
@@ -523,7 +660,7 @@ class FileExplorer(ttk.Frame):
             self.tree.item(target, tags=("drop_target",))
             self._drag_hover_node = target
 
-    def _on_drag_release(self, _event):
+    def _on_drag_release(self, event):
         start = self._drag_start_node
         hover = self._drag_hover_node
         active = self._drag_active
@@ -533,6 +670,10 @@ class FileExplorer(ttk.Frame):
         self._drag_start_node = None
         self._drag_hover_node = None
         self._drag_active = False
+        if (not active and start and start == self._up_node
+                and self.tree.identify_row(event.y) == start):
+            self._activate_up_row()
+            return
         if active and start and hover and hover != start:
             path = self._node_paths.get(start)
             dest_dir = self._node_paths.get(hover)
