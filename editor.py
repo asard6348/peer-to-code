@@ -551,8 +551,18 @@ class EditorApp(ttk.Frame):
         if not tabs:
             menu.add_command(label="(none)", state="disabled")
         for tab in tabs:
-            label = self._tab_base_title(tab) + ("" if tab.visible else "  (closed)")
+            label = self._shared_menu_title(tab) + ("" if tab.visible else "  (closed)")
             menu.add_command(label=label, command=lambda t=tab: self.action_show_shared(t))
+
+    def _shared_menu_title(self, tab):
+        """Name of a document in View > Shared Buffers. A closed (or just
+        unshared) buffer has no tab on screen, so it must not take an
+        "Untitled-N" number: that number would be remembered on the hidden
+        tab and keep showing in the list after the tab that really holds it
+        was closed or renamed. Only a buffer that is showing gets one."""
+        if tab.visible or tab.current_file or (tab.shared and tab.filename_hint):
+            return self._tab_base_title(tab)
+        return f"Untitled (shared buffer {tab.doc_id})"
 
     def _fill_peer_undo_menu(self):
         menu = self._peer_undo_menu
@@ -3230,6 +3240,9 @@ class EditorApp(ttk.Frame):
         mirror.visible = False
         tab.doc_id = None
         tab.filename_hint = self._hint_for_tab(tab)
+        # An untitled tab keeps its "Untitled-N" as the now-local tab; the
+        # closed mirror must not inherit or claim a number of its own.
+        mirror.untitled_no = None
         self._docs[doc_id] = mirror
         self._tabs.insert(self._tabs.index(tab) + 1, mirror)
         if tab is self._active:

@@ -2,6 +2,8 @@ import os
 import platform
 import shutil
 import string
+import subprocess
+import sys
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -15,6 +17,81 @@ SORT_OPTIONS = (
     ("size", "Size"),
     ("modified", "Date Modified"),
 )
+
+
+def _system_explorer_label():
+    """Menu label for \"show this in the OS's file manager\", worded the way
+    that platform's own users know it."""
+    if sys.platform == "darwin":
+        return "Reveal in Finder"
+    if platform.system() == "Windows":
+        return "Show in File Explorer"
+    return "Show in File Manager"
+
+
+def _spawn_detached(args):
+    """Starts a file-manager process and returns without waiting for it or
+    its output (file managers are long-lived, and some - Windows' explorer
+    - report failure through their exit code even when they worked)."""
+    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL, close_fds=True)
+
+
+def _reveal_in_system_file_manager(path):
+    """Opens `path` in the platform's file manager: a folder is opened, a
+    file is shown selected inside its folder when the file manager can do
+    that, and otherwise its folder is just opened."""
+    path = os.path.abspath(path)
+    is_dir = os.path.isdir(path)
+    folder = path if is_dir else os.path.dirname(path)
+
+    if platform.system() == "Windows":
+        if is_dir:
+            os.startfile(folder)
+        else:
+            # "/select," and the path have to be one argument, or explorer
+            # ignores the selection and opens the default folder.
+            _spawn_detached(["explorer", f"/select,{os.path.normpath(path)}"])
+        return
+
+    if sys.platform == "darwin":
+        _spawn_detached(["open", folder] if is_dir else ["open", "-R", path])
+        return
+
+    # Linux and other Unix desktops.
+    if not is_dir:
+        # The freedesktop FileManager1 service is implemented by Dolphin,
+        # Nautilus, Nemo, Thunar, ... and is the one portable way to select
+        # a file. It answers quickly when present and errors out when not.
+        dbus_send = shutil.which("dbus-send")
+        if dbus_send:
+            try:
+                result = subprocess.run(
+                    [dbus_send, "--session", "--print-reply", "--type=method_call",
+                     "--dest=org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                     "org.freedesktop.FileManager1.ShowItems",
+                     f"array:string:file://{_quote_path(path)}", "string:"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=3)
+                if result.returncode == 0:
+                    return
+            except (OSError, subprocess.SubprocessError):
+                pass
+        for exe, args in (("dolphin", ["--select", path]), ("nautilus", ["--select", path]),
+                           ("nemo", [path])):
+            if shutil.which(exe):
+                _spawn_detached([exe] + args)
+                return
+    opener = shutil.which("xdg-open") or shutil.which("gio")
+    if opener is None:
+        raise OSError("no file manager found (xdg-open is not installed)")
+    _spawn_detached([opener, folder] if os.path.basename(opener) != "gio" else [opener, "open", folder])
+
+
+def _quote_path(path):
+    """`path` as the path part of a file:// URI (percent-encoded)."""
+    from urllib.parse import quote
+    return quote(path)
 
 
 def _filesystem_roots():
@@ -125,8 +202,9 @@ class FileExplorer(ttk.Frame):
         self.tree.tag_configure("drop_target", background=self._drop_target_color())
 
         self.menu = tk.Menu(self, tearoff=0)
-        # "Open" / "Open in Explorer" only exist while the menu is open on
-        # an actual item - see _set_item_entries.
+        # "Open" / "Open in Explorer" / the system file manager entry only
+        # exist while the menu is open on an actual item - see
+        # _set_item_entries.
         self.menu.add_command(label="New File", command=self._new_file)
         self.menu.add_command(label="New Folder", command=self._new_folder)
         self.menu.add_separator()
@@ -484,17 +562,19 @@ class FileExplorer(ttk.Frame):
 
     def _set_item_entries(self, show):
         """Adds or removes the item-specific entries (Open, Open in
-        Explorer) at the top of the menu: right-clicking empty space (or
-        the \"..\" row) shows the menu without them rather than with
-        dead, greyed-out ones."""
+        Explorer, and the one that shows the item in the operating
+        system's own file manager) at the top of the menu: right-clicking
+        empty space (or the \"..\" row) shows the menu without them rather
+        than with dead, greyed-out ones."""
         if show == self._item_entries_shown:
             return
         if show:
             self.menu.insert_command(0, label="Open", command=self._open_item)
             self.menu.insert_command(1, label="Open in Explorer", command=self._open_in_explorer)
-            self.menu.insert_separator(2)
+            self.menu.insert_command(2, label=_system_explorer_label(), command=self._open_in_system_explorer)
+            self.menu.insert_separator(3)
         else:
-            self.menu.delete(0, 2)
+            self.menu.delete(0, 3)
         self._item_entries_shown = show
 
     def _open_item(self):
@@ -530,6 +610,20 @@ class FileExplorer(ttk.Frame):
             self._set_root(path)
         elif os.path.isfile(path):
             self._set_root(os.path.dirname(path), reveal=path)
+
+    def _open_in_system_explorer(self):
+        """Context-menu entry below \"Open in Explorer\": shows the
+        right-clicked item in the operating system's own file manager
+        (Windows Explorer, Finder, Dolphin, Nautilus, ...). A folder is
+        opened; a file is revealed (selected) inside its folder where the
+        file manager supports that."""
+        path = self._menu_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            _reveal_in_system_file_manager(path)
+        except (OSError, subprocess.SubprocessError) as e:
+            messagebox.showerror(_system_explorer_label(), f"Couldn't open the file manager:\n{e}")
 
     def _target_dir(self):
         node = self.tree.focus()
