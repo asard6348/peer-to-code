@@ -2021,7 +2021,10 @@ class EditorApp(ttk.Frame):
                 note = f" ('{sanitize_text(file, 60)}' isn't open; showing the shared buffer)"
         if tab is None:
             tab = self._active if self._active.shared else next(
-                (t for t in self._docs.values() if t.visible), next(iter(self._docs.values())))
+                (t for t in self._docs.values() if t.visible), next(iter(self._docs.values()), None))
+        if tab is None:
+            self._set_status("There is no shared buffer.")
+            return
         if not tab.visible:
             self._set_status("The shared buffer is closed.")
             return
@@ -2116,20 +2119,20 @@ class EditorApp(ttk.Frame):
             if not self.client.server_addr:
                 self._console_insert_segments([("Can't share output: not connected to a session.\n", "stderr")])
                 return False
-            if confirm and not messagebox.askyesno("Share run output", SHARE_WARNING + "\\n\\nShare the output of my runs?",
+            if confirm and not messagebox.askyesno("Share run output", SHARE_WARNING + "\n\nShare the output of my runs?",
                                                    parent=self.winfo_toplevel()):
                 return False
             self._share_on = True
             self.share_label.pack(side="right", padx=(16, 0), after=self.peers_label)
             self._console_insert_segments([
-                ("WARNING: " + SHARE_WARNING + "\\n", "stderr"),
+                ("WARNING: " + SHARE_WARNING + "\n", "stderr"),
                 ("Sharing is ON for runs you start from now on (a run already in progress is not shared). "
-                 "Type 'share off' to stop.\\n", "info")])
+                 "Type 'share off' to stop.\n", "info")])
         else:
             self._share_on = False
             self.share_label.pack_forget()
             self._share_stop("sharing turned off")
-            self._console_insert_segments([("Sharing is OFF.\\n", "info")])
+            self._console_insert_segments([("Sharing is OFF.\n", "info")])
         return self._share_on
 
     def _share_command(self, action):
@@ -2137,7 +2140,7 @@ class EditorApp(ttk.Frame):
             self.set_share_output(True)
         elif action == "off":
             self.set_share_output(False) if self._share_on else self._console_insert_segments(
-                [("Sharing is already off.\\n", "info")])
+                [("Sharing is already off.\n", "info")])
         elif action == "view":
             self._share_window(show=True)
         else:
@@ -2145,7 +2148,7 @@ class EditorApp(ttk.Frame):
             self._console_insert_segments([(
                 f"Sharing your run output: {'ON' if self._share_on else 'off'}.  "
                 f"Showing others' shared output: {'on' if cfg['view_shared'] else 'off'} "
-                f"(share view opens the read-only window).\\n", "info")])
+                f"(share view opens the read-only window).\n", "info")])
 
     def _share_window(self, show=False):
         win = self._share_win
@@ -2174,7 +2177,7 @@ class EditorApp(ttk.Frame):
         title = share_title(args, shell)
         self._share = {"run": self._share_run_counter, "streamer": ShareStreamer(self._share_run_counter, title)}
         self.client.send_share_start(self._share_run_counter, title)
-        self._console_write("[sharing this run's output with the session - 'share off' to stop]\\n", "info")
+        self._console_write("[sharing this run's output with the session - 'share off' to stop]\n", "info")
 
     def _share_output(self, pairs):
         """One call per poll tick with everything read in that tick."""
@@ -2212,7 +2215,7 @@ class EditorApp(ttk.Frame):
             if not msg["replay"]:
                 self._console_insert_segments([(
                     f"{msg['name']} is sharing the output of a run ({msg['title']}). "
-                    f"Type 'share view' to watch it (read-only).\\n", "info")])
+                    f"Type 'share view' to watch it (read-only).\n", "info")])
             for early_name, early in self._share_early.pop((sender, msg["run"]), []):
                 self._share_feed(sender, st, early_name, early)
             return
@@ -3229,27 +3232,21 @@ class EditorApp(ttk.Frame):
 
     def unshare_tab(self, tab):
         """Stops sharing `tab`: it becomes an ordinary local tab holding
-        what it holds now. The document itself carries on in the session -
-        it is tracked in a fresh, hidden shared tab (View > Shared Buffers)
-        so we keep receiving peers' changes to it."""
+        what it holds now. This peer forgets the document completely (it
+        no longer appears under View > Shared Buffers and peers' further
+        changes to it are ignored here); it carries on for everyone else."""
         if self.mode == "solo" or not tab.shared:
             return
         doc_id = tab.doc_id
-        mirror = BufferTab(doc_id=doc_id, doc=tab.doc)
-        mirror.filename_hint = tab.filename_hint
-        mirror.visible = False
         tab.doc_id = None
         tab.filename_hint = self._hint_for_tab(tab)
-        # An untitled tab keeps its "Untitled-N" as the now-local tab; the
-        # closed mirror must not inherit or claim a number of its own.
-        mirror.untitled_no = None
-        self._docs[doc_id] = mirror
-        self._tabs.insert(self._tabs.index(tab) + 1, mirror)
+        self._docs.pop(doc_id, None)
+        self.client.forget_doc(doc_id)
         if tab is self._active:
             self._after_role_change()
         else:
             self._refresh_tabs()
-        self._set_status("Unshared - this tab is now local. The shared buffer is under View > Shared Buffers")
+        self._set_status("Unshared - this tab is now local and no longer follows the session's buffer")
 
     def _begin_remote_swap(self, doc_id, swap, author):
         """A peer replaced the content of shared document `doc_id` with a

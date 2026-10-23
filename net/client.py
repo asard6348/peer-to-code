@@ -80,6 +80,9 @@ class Client:
         self._heartbeat_stop = threading.Event()
 
         self.docs = {}  # doc id -> DocSync
+        # Documents this peer left (see forget_doc): traffic for them is
+        # ignored for the rest of the connection.
+        self.forgotten = set()
         self._lock = threading.RLock()
         # Incoming document traffic (full texts and ops) is not handled on
         # the network thread but handed to `dispatcher`, which runs it on
@@ -138,6 +141,14 @@ class Client:
         if sync is None:
             sync = self.docs[doc_id] = DocSync()
         return sync
+
+    def forget_doc(self, doc_id):
+        """Stops tracking a document: drops its sync state and ignores
+        everything the session still sends about it. The document itself
+        carries on for the other peers."""
+        with self._lock:
+            self.forgotten.add(doc_id)
+            self.docs.pop(doc_id, None)
 
     def _to_ui(self, fn, *args):
         """Queues `fn(*args)` for the dispatcher's thread. A plain FIFO that
@@ -539,8 +550,11 @@ class Client:
             pass
 
     def _handle_resync(self, payload):
+        doc_id = payload.get("doc", p.MAIN_DOC)
         with self._lock:
-            self._doc(payload.get("doc", p.MAIN_DOC)).reset_for_resync()
+            if doc_id in self.forgotten:
+                return
+            self._doc(doc_id).reset_for_resync()
 
     def _handle_doc_chunk(self, payload):
         """Collects one document's chunks (they may arrive in any order);
@@ -551,6 +565,8 @@ class Client:
         idx, total, text = payload["index"], payload["total"], payload["text"]
         events = []
         with self._lock:
+            if doc_id in self.forgotten:
+                return
             sync = self._doc(doc_id)
             sync.chunks[idx] = text
             if not sync.meta:
@@ -582,6 +598,8 @@ class Client:
         # its next keystroke (local_edit) is what used to freeze the app.
         doc_id = payload.get("doc", p.MAIN_DOC)
         with self._lock:
+            if doc_id in self.forgotten:
+                return
             sync = self._doc(doc_id)
             base_rev = payload["base_rev"]
             if sync.ready and base_rev < sync.expected_rev:
