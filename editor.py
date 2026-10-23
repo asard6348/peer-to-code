@@ -303,7 +303,7 @@ class EditorApp(ttk.Frame):
         # client already received (the documents' texts), right away.
         self._pending_initial_file = initial_file
         if self.mode != "solo":
-            self._set_status("Waiting for document sync...")
+            self._set_status("Syncing...")
         self._bind_client(self.client)
         self._note_assigned_name()
 
@@ -590,7 +590,7 @@ class EditorApp(ttk.Frame):
                 self.apply_theme_live(self.cfg["theme"])
                 self._set_status("Theme applied.")
             except tk.TclError:
-                self._set_status("Theme saved. Restart the app to apply it.")
+                self._set_status("Theme saved. Restart to apply.")
         if "ui" in changed:
             ui_cfg = self.cfg.get("ui", {})
             if "explorer_font_family" in ui_cfg:
@@ -923,7 +923,7 @@ class EditorApp(ttk.Frame):
 
     def toggle_chat(self):
         if not self._chat_available():
-            self._set_status("Chat is hidden in unshared sessions (Settings > Chat).")
+            self._set_status("Chat is off here (Settings > Chat).")
             return
         self.chat_panel.toggle()
         if self.chat_panel.visible:
@@ -1383,7 +1383,7 @@ class EditorApp(ttk.Frame):
             tab.local_edited = False
             self._refresh_tabs()
         if self.mode != "solo":
-            self._set_status("Connected and synced with host")
+            self._set_status("Connected.")
         if self._pending_initial_file:
             path, self._pending_initial_file = self._pending_initial_file, None
             self._load_file(path, into_shared=True)
@@ -1552,7 +1552,7 @@ class EditorApp(ttk.Frame):
         if author is None:
             author = self.history.latest_peer()
         if author is None:
-            self._set_status("No changes by other users to undo")
+            self._set_status("Nothing to undo.")
             return "break"
         op = self.history.undo_peer(author, self.doc)
         if op is not None:
@@ -1584,6 +1584,18 @@ class EditorApp(ttk.Frame):
         self.cursor_layer.set_roster(peers)
         if note_failover and self._failover is not None:
             self._failover.note_roster(peers)
+
+    def _notify(self, text, error=False):
+        """Tells the person something the app itself has to say. The
+        Terminal only holds commands and their output, so notices go to
+        Chat - or to the status bar when Chat isn't available or is off."""
+        cfg = self._chat_cfg()
+        if getattr(self, "chat_text", None) is not None and self._chat_available() and cfg["enabled"]:
+            self._chat_append([(text + "\n", "stderr" if error else "info")], force_scroll=True)
+            if error:
+                self._set_status(text)
+        else:
+            self._set_status(text)
 
     # -- Terminal helpers ----------------------------------------------
 
@@ -1669,7 +1681,7 @@ class EditorApp(ttk.Frame):
         self.chat_entry.bind("<Down>", self._on_chat_history)
 
         self._refresh_chat_tags(t["console_bg"])
-        self._chat_append([("Type a message and press Enter. /help lists the chat commands.\n", "info")])
+        self._chat_append([("Type a message, Enter to send. /help lists commands.\n", "info")])
         self._refresh_chat_state()
 
     def _refresh_chat_state(self):
@@ -1678,8 +1690,7 @@ class EditorApp(ttk.Frame):
         self.chat_entry.configure(state="normal" if enabled else "disabled")
         if self._chat_was_enabled is not None and enabled != self._chat_was_enabled:
             self._chat_append([("Chat turned on.\n" if enabled else
-                                "Chat turned off: nothing is shown or sent until it is turned back on "
-                                "(Settings > Chat).\n", "info")], force_scroll=True)
+                                "Chat off. Turn it on in Settings > Chat.\n", "info")], force_scroll=True)
         self._chat_was_enabled = enabled
 
     def _chat_cfg(self):
@@ -1694,7 +1705,7 @@ class EditorApp(ttk.Frame):
         want = getattr(self.client, "requested_username", None)
         if got and want and got != want:
             self._chat_append(
-                [(f"The name '{sanitize_text(want, 40)}' was already taken here; you appear as '{got}'.\n", "info")])
+                [(f"Name '{sanitize_text(want, 40)}' is taken. You are '{got}'.\n", "info")])
 
     # -- drawing -------------------------------------------------------
 
@@ -2002,7 +2013,7 @@ class EditorApp(ttk.Frame):
         except Exception:
             pass
         if mute:
-            self._chat_append([(f"Muted {name}: their messages are hidden (/unmute {name} to undo).\n", "info")],
+            self._chat_append([(f"Muted {name}. /unmute {name} to undo.\n", "info")],
                               force_scroll=True)
         else:
             self._chat_append([(f"Unmuted {name}.\n", "info")], force_scroll=True)
@@ -2117,38 +2128,34 @@ class EditorApp(ttk.Frame):
             return on
         if on:
             if not self.client.server_addr:
-                self._console_insert_segments([("Can't share output: not connected to a session.\n", "stderr")])
+                self._notify("Can't share: not connected.", error=True)
                 return False
-            if confirm and not messagebox.askyesno("Share run output", SHARE_WARNING + "\n\nShare the output of my runs?",
+            if confirm and not messagebox.askyesno("Share output", SHARE_WARNING + "\n\nShare it?",
                                                    parent=self.winfo_toplevel()):
                 return False
             self._share_on = True
             self.share_label.pack(side="right", padx=(16, 0), after=self.peers_label)
-            self._console_insert_segments([
-                ("WARNING: " + SHARE_WARNING + "\n", "stderr"),
-                ("Sharing is ON for runs you start from now on (a run already in progress is not shared). "
-                 "Type 'share off' to stop.\n", "info")])
+            self._notify("Sharing ON for new runs. Everyone sees the output, secrets included. "
+                         "'share off' stops it.")
         else:
             self._share_on = False
             self.share_label.pack_forget()
             self._share_stop("sharing turned off")
-            self._console_insert_segments([("Sharing is OFF.\n", "info")])
+            self._notify("Sharing OFF.")
         return self._share_on
 
     def _share_command(self, action):
         if action == "on":
             self.set_share_output(True)
         elif action == "off":
-            self.set_share_output(False) if self._share_on else self._console_insert_segments(
-                [("Sharing is already off.\n", "info")])
+            self.set_share_output(False) if self._share_on else self._notify("Sharing is already off.")
         elif action == "view":
             self._share_window(show=True)
         else:
             cfg = self._chat_cfg()
-            self._console_insert_segments([(
-                f"Sharing your run output: {'ON' if self._share_on else 'off'}.  "
-                f"Showing others' shared output: {'on' if cfg['view_shared'] else 'off'} "
-                f"(share view opens the read-only window).\n", "info")])
+            self._notify(f"Your output: {'shared' if self._share_on else 'not shared'}. "
+                         f"Others' output: {'shown' if cfg['view_shared'] else 'hidden'}. "
+                         "'share view' opens it.")
 
     def _share_window(self, show=False):
         win = self._share_win
@@ -2177,7 +2184,6 @@ class EditorApp(ttk.Frame):
         title = share_title(args, shell)
         self._share = {"run": self._share_run_counter, "streamer": ShareStreamer(self._share_run_counter, title)}
         self.client.send_share_start(self._share_run_counter, title)
-        self._console_write("[sharing this run's output with the session - 'share off' to stop]\n", "info")
 
     def _share_output(self, pairs):
         """One call per poll tick with everything read in that tick."""
@@ -2213,9 +2219,7 @@ class EditorApp(ttk.Frame):
             if msg["from_seq"] > 1:
                 win.note(sender, msg["name"], "[earlier output of this run is no longer available]")
             if not msg["replay"]:
-                self._console_insert_segments([(
-                    f"{msg['name']} is sharing the output of a run ({msg['title']}). "
-                    f"Type 'share view' to watch it (read-only).\n", "info")])
+                self._notify(f"{msg['name']} is sharing a run ({msg['title']}). 'share view' to watch.")
             for early_name, early in self._share_early.pop((sender, msg["run"]), []):
                 self._share_feed(sender, st, early_name, early)
             return
@@ -2280,8 +2284,8 @@ class EditorApp(ttk.Frame):
         self._known_peer_names = {}
         if self._failover is not None:
             self.peers_label.configure(text="Reconnecting...")
-            self._set_status(f"{reason} Trying to reconnect automatically...")
-            self._console_write(f"{reason} Trying to reconnect automatically...\n", "info")
+            self._set_status(f"{reason} Reconnecting...")
+            self._notify(f"{reason} Reconnecting...")
             self._failover.begin(self.client, reason)
             return
         self._handle_disconnected(reason)
@@ -2426,7 +2430,7 @@ class EditorApp(ttk.Frame):
         self._note_assigned_name()
         note = "you're now the sequencer" if new_server is not None else "reconnected to the new sequencer"
         self._set_status(f"Back online: {note}")
-        self._console_write(f"Reconnected ({note})\n", "info")
+        self._notify(f"Reconnected ({note}).")
         self.peers_label.configure(text="")
 
     def _on_failover_failed(self, reason):
@@ -3221,7 +3225,7 @@ class EditorApp(ttk.Frame):
             ref = next(self._share_refs)
             tab.filename_hint = hint
             if not self.client.open_doc(hint, tab.doc, ref):
-                self._set_status("Not connected - can't share right now")
+                self._set_status("Not connected.")
                 return
             tab.pending_ref = ref
             self._pending_shares[ref] = tab
@@ -3246,7 +3250,7 @@ class EditorApp(ttk.Frame):
             self._after_role_change()
         else:
             self._refresh_tabs()
-        self._set_status("Unshared - this tab is now local and no longer follows the session's buffer")
+        self._set_status("Unshared. This tab is now local.")
 
     def _begin_remote_swap(self, doc_id, swap, author):
         """A peer replaced the content of shared document `doc_id` with a
@@ -3267,7 +3271,7 @@ class EditorApp(ttk.Frame):
             old.filename_hint = self._hint_for_tab(old)
             self._tabs.insert(self._tabs.index(old), fresh)
             self._docs[doc_id] = fresh
-            self._console_write(f"  ({self._tab_base_title(old)} stays open as a local tab)\n", "info")
+            self._notify(f"{self._tab_base_title(old)} stays open as a local tab.")
         else:
             old.visible = True
             old.filename_hint = new_hint
@@ -3393,7 +3397,7 @@ class EditorApp(ttk.Frame):
         try:
             share = parse_share_command(command)
         except ValueError as err:
-            self._console_plain_write([(f"{err}\n", "stderr")])
+            self._notify(str(err), error=True)
             self._show_prompt()
             return
         if share is not None:
@@ -3787,7 +3791,7 @@ class EditorApp(ttk.Frame):
             try:
                 share = parse_share_command(text, running=True)
             except ValueError as err:
-                self._console_plain_write([(f"{err}\n", "stderr")])
+                self._notify(str(err), error=True)
                 return
             if share is not None:
                 self._share_command(share)

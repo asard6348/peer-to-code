@@ -330,9 +330,8 @@ def parse_share_command(line, running=False):
     raise ValueError(f"usage: {head} on | {head} off | {head} view | {head}")
 
 
-SHARE_WARNING = ("Output you share can contain secrets (tokens, passwords, personal paths). "
-                 "Everyone in the session will see the output of your runs while sharing is on; "
-                 "they never see your input or environment, and cannot send you anything.")
+SHARE_WARNING = ("Everyone in the session will see your run output, including any secrets in it. "
+                 "Input and environment stay private.")
 
 
 def share_title(args, shell):
