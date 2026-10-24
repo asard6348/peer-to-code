@@ -40,9 +40,6 @@ def _strip_controls(text):
         else:
             cat = unicodedata.category(ch)
             # Cc: C0/C1 controls (ESC, BEL, CR, DEL, 0x9b CSI, ...).
-            # Cf: invisible format characters - bidi overrides can reorder
-            #     a label on screen, zero-width characters can hide text.
-            # Cs/Co/Cn: surrogates, private use, unassigned.
             if cat in ("Cc", "Cf", "Cs", "Co", "Cn"):
                 continue
             out.append(ch)
@@ -87,7 +84,7 @@ def unique_name(name, taken, max_len=NAME_MAX_LEN):
         n += 1
 
 
-# ---------------------------------------------------------------- settings
+# settings
 
 CHAT_DEFAULTS = {
     "enabled": True,
@@ -123,7 +120,7 @@ def chat_settings(cfg):
     return out
 
 
-# ----------------------------------------------------------- command parse
+# command parse
 
 ChatCommand = namedtuple("ChatCommand", "kind to reply text")
 ChatCommand.__doc__ = """kind: "send" | "list" | "mute" | "unmute" | "help".
@@ -206,23 +203,7 @@ def _drop_dashdash(text):
 
 
 def parse_chat_input(line):
-    """Parses one line typed into the Chat panel's input box.
-
-    Plain text is a message to everyone. A line starting with `/` and a
-    command word is a command:
-
-        /p <users> [--] <message>   private message (also /msg, /w)
-        /r <message>                reply to the last private sender
-        /who                        who is here (also /l, /list)
-        /mute <user>, /unmute <user>
-        /help                       (also /?)
-        //text                      the literal message `/text`
-
-    A slash line that isn't a command word at all - `/usr/bin/env`, `/ 2` -
-    is sent as the message it looks like.
-
-    Returns a ChatCommand, None for an empty line, or raises
-    ValueError(usage) for a malformed or unknown command."""
+    """Parses one line typed into the Chat panel's input box."""
     line = (line or "").strip()
     if not line:
         return None
@@ -261,14 +242,10 @@ def parse_chat_input(line):
     return ChatCommand("send", tuple(users), False, message)
 
 
-# ------------------------------------------------------------- completion
+# completion
 
 def completion_context(line):
-    """If `line` (the text before the cursor) is `/p <partial users>` with
-    the cursor still inside the user list, returns (fixed_prefix, fragment,
-    quote): the text before the fragment being completed (and before its
-    opening quote), the fragment itself (without the quote) and the opening
-    quote char ('' if none). Otherwise None."""
+    """Completion context if `line` is `/p <partial users>` with the cursor inside the user list, else None."""
     m = re.match(r"^(/(?:p|msg|w)\s+)(.*)$", line, re.S | re.I)
     if not m:
         return None
@@ -302,7 +279,7 @@ def format_name_for_command(name, quote="", close=True):
     return q + name + (q if close else "")
 
 
-# --------------------------------------------------------------- code refs
+# code refs
 
 _REF_RE = re.compile(
     r"(?<![\w/:.\-@\\#])"
@@ -312,10 +289,7 @@ _REF_RE = re.compile(
 
 
 def find_code_refs(text):
-    """[(start, end, file_or_None, line_number)] for every `:42` /
-    `file.py:42` token in text. The file part must look like a file name
-    (have an extension), which keeps times (10:30), URLs (host:8080) and
-    prose ("note:42") from turning into links."""
+    """[(start, end, file_or_None, line_number)] for every `:42` / `file.py:42` token in text."""
     refs = []
     for m in _REF_RE.finditer(text):
         refs.append((m.start(), m.end(), m.group("file"), int(m.group("line"))))

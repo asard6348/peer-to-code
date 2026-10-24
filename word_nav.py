@@ -16,7 +16,6 @@ a line's edge it first steps onto the neighbouring line.
 """
 
 import sys
-import tkinter as tk
 
 _MODS = ("Option",) if sys.platform == "darwin" else ("Control",)
 
@@ -58,7 +57,7 @@ def word_right(line, col):
     return i
 
 
-# -- Text -------------------------------------------------------------------
+# Text
 
 def _text_target(w, forward):
     """Index to move to / delete up to from the caret, or None at the very
@@ -104,7 +103,7 @@ def _text_delete(forward):
     return handler
 
 
-# -- Entry / ttk Entry --------------------------------------------------------
+# Entry / ttk Entry
 
 def _entry_target(w, forward):
     s = w.get()

@@ -1,9 +1,7 @@
-"""Plaintext operational transformation, modeled after the classic ot.js approach.
+"""Plaintext operational transformation (ot.js style).
 
-An operation is a list of components applied left-to-right against a document:
-  int > 0   -> retain that many characters
-  int < 0   -> delete that many characters (magnitude)
-  str       -> insert that string at the current cursor
+An op is a list of components applied left to right:
+  int > 0 retains that many characters, int < 0 deletes that many, str inserts.
 """
 
 
@@ -72,18 +70,20 @@ class Op:
         return "".join(out)
 
     def to_json(self):
-        return self.ops
+        return list(self.ops)
 
     @staticmethod
     def from_json(data):
+        if not isinstance(data, (list, tuple)):
+            raise ValueError("op must be a list")
         o = Op()
         for c in data:
             if isinstance(c, str):
                 o.insert(c)
-            elif c > 0:
-                o.retain(c)
+            elif isinstance(c, int) and not isinstance(c, bool):
+                o.retain(c) if c > 0 else o.delete(c)
             else:
-                o.delete(c)
+                raise ValueError(f"bad op component {c!r}")
         return o
 
     def __repr__(self):

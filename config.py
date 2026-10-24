@@ -4,6 +4,8 @@ import re
 import sys
 from pathlib import Path
 
+CODE_FONT = "Consolas" if sys.platform.startswith("win") else "Menlo" if sys.platform == "darwin" else "DejaVu Sans Mono"
+
 APP_DIRNAME = "PeerToCode"
 
 MAX_RECENT_PROJECTS = 8
@@ -18,17 +20,11 @@ DEFAULTS = {
         "p2p_join_address": "",
     },
     "ui": {
-        # Which panels are showing. Where each one is (docked left/right/
-        # bottom or floating in its own window) and how big lives in the
-        # separate "layout" section below.
+        # Which panels are showing.
         "explorer_visible": True,
         "console_visible": True,
         "chat_visible": True,
-        # Which parts of the panel layout are remembered between launches
-        # (Settings > General > Window): the side each panel is docked on /
-        # whether it floats, its size, and where its floating window sits.
-        # Same rule as the window options above - turning one off deletes it
-        # from the config on close, so that part starts from the defaults.
+        # Which parts of the panel layout are remembered between launches.
         "save_panel_layout": True,
         "save_panel_size": True,
         "save_panel_position": True,
@@ -37,11 +33,7 @@ DEFAULTS = {
         "window_position": "",
         "save_window_position": True,
         "save_window_size": True,
-        # Find/Replace dialog: its own position/size (each independently
-        # opt-in via Settings > General > Window, same as the main window
-        # above - unchecking one deletes its saved value on the next close)
-        # plus the state of its three checkboxes, which are always
-        # remembered. Size is stored as "WxH"; position as "+X+Y".
+        # Find/Replace dialog: its own position/size plus the state of its three checkboxes.
         "save_find_window_position": True,
         "save_find_window_size": True,
         "find_window_position": "",
@@ -49,18 +41,9 @@ DEFAULTS = {
         "find_match_case": False,
         "find_whole_word": False,
         "find_wrap": True,
-        # Which color theme preset is active ("system", "dark", "light",
-        # or the name of a preset saved under "theme_presets" below).
-        # "system" means the ten colors under "theme" get refreshed from
-        # the OS's current light/dark setting on every launch - see
-        # theme.apply_active_preset().
+        # Which color theme preset is active.
         "theme_preset": "system",
-        # How the file explorer's tree is ordered by default - see
-        # file_explorer.SORT_OPTIONS for the keys "explorer_sort_key" can
-        # take. Changing it from the explorer's own right-click "Sort by"
-        # submenu updates this too (see EditorApp._persist_ui_state), so
-        # Settings > General just shows/edits whatever's currently live
-        # rather than being a separate copy of it.
+        # How the file explorer's tree is ordered by default.
         "explorer_sort_key": "name",
         "explorer_sort_reverse": False,
     },
@@ -82,16 +65,9 @@ DEFAULTS = {
             "interrupted": True,
         },
     },
-    # Where each dockable panel ("explorer", "terminal", "chat") sits - see
-    # dock.DockManager.save/load for the keys: dock ("left"/"right"/
-    # "bottom"), floating, w/h (docked size), float_size ("WxH") and
-    # float_pos ("+X+Y"). Left empty here on purpose: a missing entry means
-    # "use the panel's default", which also migrates configs from before
-    # panels could move (ui.explorer_width / ui.console_height).
+    # Where each dockable panel sits - see dock.DockManager.save/load for the keys.
     "layout": {},
-    # The Chat panel. See chat_util.CHAT_DEFAULTS for the meaning of each
-    # key; editor.py reads this section through chat_util.chat_settings(),
-    # which tolerates missing or garbled values.
+    # The Chat panel.
     "chat": {
         "enabled": True,
         "show_timestamps": False,
@@ -143,24 +119,12 @@ DEFAULTS = {
         "status_bg": "#131416",
         "status_fg": "#c9ccd1",
         "border": "#3d4046",
-        "font_family": "Consolas" if sys.platform.startswith('win') else "Hack",
+        "font_family": CODE_FONT,
         "font_size": 11,
     },
-    # User-saved color theme presets: {name: {the THEME_COLOR_KEYS
-    # colors}}. The two built-ins ("dark"/"light") and the auto-following
-    # "system" preset aren't stored here - only what the user creates via
-    # Settings > Theme > Save As. A preset saved before status_bg/
-    # status_fg/border existed simply won't have those keys - theme_working
-    # is seeded from this DEFAULTS dict before a preset's colors are
-    # layered on top, so an old preset missing them still resolves to a
-    # sane value instead of a KeyError (see SettingsWindow.__init__ and
-    # theme.resolve_preset_colors).
+    # User-saved color theme presets: {name: {the THEME_COLOR_KEYS colors}}.
     "theme_presets": {},
-    # User-saved syntax palette presets: {name: {tag_name: {"foreground":
-    # "#rrggbb"} and/or {"background": "#rrggbb"}}}, one entry per
-    # syntax.TAG_NAMES. The built-ins ("auto"/"idle"/"vivid"/"custom")
-    # aren't stored here - only what the user creates via Settings >
-    # Theme > Save As for the syntax palette. See syntax.sync_saved_palettes().
+    # User-saved syntax palette presets: {name: {tag_name: {"foreground"/"background": "#rrggbb"}}}.
     "syntax_palette_presets": {},
 }
 

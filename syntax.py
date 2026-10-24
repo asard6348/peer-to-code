@@ -9,11 +9,7 @@ COLOR_THEMES = {
     "auto": {
         "label": "Auto",
         "description": "Follows the editor background: Daybreak for bright backgrounds, Midnight for dark ones.",
-        # No colors of its own - resolve_auto_theme()/_resolve_active_theme()
-        # stand in "idle" or "vivid"'s colors for this at lookup time,
-        # based on the editor background last reported via
-        # set_editor_background(). Left empty (rather than a copy of
-        # either palette) so nothing ever reads stale colors from here.
+        # No colors of its own - resolve_auto_theme/_resolve_active_theme stand in "idle" or "vivid"'s colors for this at lookup time.
         "colors": {},
     },
     "idle": {
@@ -77,10 +73,7 @@ _editor_bg = "#1e1f22"  # placeholder until set_editor_background() is called wi
 
 
 def set_color_theme(name):
-    """Switches which of COLOR_THEMES the highlighter uses from here on -
-    callers still need to re-run configure_tags()+highlight() afterward
-    (or just re-open/re-highlight the buffer) for it to actually show up,
-    same as any other tag_configure change."""
+    """Switches which of COLOR_THEMES the highlighter uses from here on."""
     global _active_color_theme
     if name in COLOR_THEMES:
         _active_color_theme = name
@@ -138,14 +131,7 @@ def set_custom_colors(overrides):
 
 
 def sync_saved_palettes(saved_presets):
-    """Rebuilds COLOR_THEMES' user-saved entries (any key not one of
-    RESERVED_PALETTE_NAMES) from `saved_presets`
-    ({name: {tag_name: {"foreground": ...} and/or {"background": ...}}}) -
-    called once at startup and again whenever Settings saves or cancels a
-    Save As/Rename/Remove, so a rename or removal takes effect right away
-    and no stale entry is left selectable. Mirrors set_custom_colors()'s
-    per-tag fallback so a saved preset is always fully colored even if it
-    predates a tag category being added."""
+    """Rebuilds COLOR_THEMES' user-saved entries from `saved_presets`."""
     base = COLOR_THEMES["idle"]["colors"]
     for key in [k for k in COLOR_THEMES if k not in RESERVED_PALETTE_NAMES]:
         del COLOR_THEMES[key]
@@ -158,10 +144,7 @@ def sync_saved_palettes(saved_presets):
 
 
 def active_palette_colors():
-    """The TAG_NAMES-keyed color dict actually in effect right now -
-    resolving "auto" to whichever of "idle"/"vivid" it currently stands
-    in for. Used by Settings' Save As to snapshot "whatever's on screen
-    right now" into a new named preset, whatever theme/preset produced it."""
+    """The TAG_NAMES-keyed color dict actually in effect right now."""
     return dict(_palette())
 
 
@@ -313,11 +296,7 @@ def _detect_by_basename(filename):
 
 
 def detect_language(filename, default="python"):
-    """None (unrecognized extension) means plaintext - no highlighting at
-    all. A brand-new, not-yet-saved buffer (falsy `filename`) uses
-    `default` instead - callers pass in the user's configured default
-    new-file language (Settings > General) rather than this function
-    assuming Python for everyone."""
+    """None (unrecognized extension) means plaintext - no highlighting at all."""
     if not filename:
         return default
     by_name = _detect_by_basename(filename)
@@ -363,12 +342,7 @@ _PY_NUMBER = re.compile(r"\.?\d(?:[\w]|\.(?!\.))*")
 
 
 def _py_scan_string(src, i, quote, triple, is_f, n):
-    """Returns the index just past the string literal whose body starts at
-    `i` (right after its opening quote). Never fails: an unterminated
-    single-quote string ends at the end of its line, an unterminated
-    triple-quoted one at the end of the buffer - the way every editor
-    colors a string that's still being typed - so the half-typed literal
-    itself is colored and nothing after it is affected."""
+    """Returns the index just past the string literal whose body starts at `i` (right after its opening quote)."""
     depth = 0
     while i < n:
         c = src[i]
@@ -401,11 +375,7 @@ def _py_scan_string(src, i, quote, triple, is_f, n):
 
 
 def _highlight_python(text_widget, source):
-    """Hand-written scanner instead of tokenize: tokenize raises on any
-    half-typed construct, and recovering by re-tokenizing the remainder as a
-    fresh chunk loses the indent stack, so the next dedented line raises
-    again and gets skipped (left uncolored). This scanner has no error
-    states, so every line is colored independently of what's broken above."""
+    """Hand-written scanner instead of tokenize."""
     n = len(source)
     line_starts = [0]
     pos = source.find("\n")
@@ -551,10 +521,7 @@ _SEMI_COMMENT = r';[^\n]*'
 _DQ_SQ_STRING = r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
 _TRIPLE_OR_DQ_STRING = r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"'
 
-# --- The rest of these mirror the hand-picked keyword sets above: enough
-# of each language's core syntax to make highlighting useful, not a
-# from-the-spec exhaustive list. Extra Kate-style languages beyond the
-# original bash/cpp/csharp/lua/rust set. ---
+# Keyword sets for the remaining languages: enough for useful highlighting, not exhaustive.
 
 _JS_KEYWORDS = {
     "break", "case", "catch", "class", "const", "continue", "debugger",
@@ -1327,10 +1294,7 @@ def _compile_lang(spec):
         fallback = r"|/\*[\s\S]*" if r"/\*" in spec["comment"] else ""
         parts.append(f"(?P<comment>{spec['comment']}{fallback})")
     if "string" in spec:
-        # Second alternative: a half-typed string. Only tried where the
-        # real pattern failed, so it colors an unclosed quote to the end
-        # of its line instead of leaving it uncolored - and, by consuming
-        # it, keeps its contents from being lexed as code.
+        # Second alternative: a half-typed string.
         fallback = "".join(
             f"|{q}[^{q}\\n]*" for q in ('"', "'") if q in spec["string"]
         )

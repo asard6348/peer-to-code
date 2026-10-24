@@ -41,12 +41,7 @@ _INCOMPLETE_TAIL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*|[PX^_][^\x1
 
 
 def sanitize_output(text):
-    """Strips everything a terminal could act on, keeping line structure and
-    plain SGR colour sequences: OSC/DCS strings, every CSI sequence except
-    `m`, stray ESC, C0/C1 controls (BEL, backspace, NUL, 0x9b CSI...), bidi
-    and zero-width format characters. CRLF and lone CR become newlines (a
-    progress bar redraws as separate lines instead of overwriting - nothing
-    here can move a cursor)."""
+    """Strips everything a terminal could act on, keeping line structure and plain SGR colour sequences."""
     if not isinstance(text, str):
         text = "" if text is None else str(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -95,15 +90,10 @@ def split_incomplete_escape(text):
     return text, ""
 
 
-# --------------------------------------------------------------- rendering
+# rendering
 
 def render_sgr(text, state=(None, False)):
-    """Splits sanitized text into [(text, (fg, bold))] runs and returns
-    (runs, new_state). fg is 0-15 (ANSI 30-37 / 90-97) or None; bold bool.
-    Only these codes are honoured: 0 (reset), 1/22 (bold on/off), 30-37,
-    90-97, 39 (default fg). Everything else - 256-colour, truecolor,
-    backgrounds, italics, blink - is parsed (so its parameters aren't
-    misread) and ignored."""
+    """Splits sanitized text into [(text, (fg, bold))] runs and returns (runs, new_state)."""
     fg, bold = state
     runs = []
     pos = 0
@@ -138,7 +128,7 @@ def render_sgr(text, state=(None, False)):
     return [r for r in runs if r[0]], (fg, bold)
 
 
-# ------------------------------------------------------ wire normalization
+# wire normalization
 
 def _int(value, default=None, lo=0, hi=10 ** 9):
     try:
@@ -170,18 +160,10 @@ def segs_bytes(segs):
     return sum(len(t.encode("utf-8", "replace")) for _s, t in segs)
 
 
-# --------------------------------------------------------- runner-side batch
+# runner-side batch
 
 class ShareStreamer:
-    """Turns the runner's poll-loop output into RUN_OUTPUT chunk payloads.
-
-    add([(is_err, char), ...]) is called once per 80 ms poll with whatever
-    arrived in that tick (not per character). It merges consecutive
-    characters of the same stream into segments - keeping stdout/stderr in
-    arrival order - holds back a half-received escape sequence, splits to
-    SHARE_CHUNK_MAX, numbers the chunks, and stops after the per-run byte
-    cap (emitting one {"truncated": True} chunk). close() returns the
-    sequence number for RUN_END."""
+    """Turns the runner's poll-loop output into RUN_OUTPUT chunk payloads."""
 
     def __init__(self, run, title, max_bytes=SHARE_RUN_MAX_BYTES):
         self.run = run
@@ -246,15 +228,10 @@ class ShareStreamer:
         return self.seq + 1
 
 
-# ------------------------------------------------------- viewer-side reorder
+# viewer-side reorder
 
 class RunAssembler:
-    """Puts one run's chunks back in order. feed(seq, item) returns the items
-    now ready, in sequence, with duplicates dropped; items arriving early
-    wait. If the sender's cap truncated the run, later chunks are discarded
-    and the END item is released immediately. release_stalled() lets the
-    caller skip a gap that never fills (a dead sender) instead of waiting
-    forever."""
+    """Puts one run's chunks back in order."""
 
     def __init__(self, from_seq=1):
         self.next_seq = from_seq
@@ -310,14 +287,10 @@ class RunAssembler:
         return [{"gap": True}] + self._drain()
 
 
-# ------------------------------------------------------- terminal commands
+# terminal commands
 
 def parse_share_command(line, running=False):
-    """`share on|off|view` or bare `share` (status) at the idle prompt; the
-    same with a leading `/` while a process runs. Returns the action
-    ("on", "off", "view", "status"), None if the line isn't a share command,
-    or raises ValueError(usage) for `share <something else>`.
-    `\\share` is left alone (it runs a program named share)."""
+    """`share on|off|view` or bare `share` (status) at the idle prompt; the same with a leading `/` while a process runs."""
     head = "/share" if running else "share"
     stripped = line.strip()
     if stripped == head:

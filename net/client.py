@@ -19,35 +19,26 @@ class ConnectError(Exception):
 
 
 class ConnectCancelled(ConnectError):
-    """Raised when connect() is aborted mid-flight via cancel_connect()."""
-    pass
+    """connect() was aborted via cancel_connect()."""
 
 
 class DocSync:
-    """The client-side OT state machine (the classic Synchronized /
-    AwaitingConfirm / AwaitingWithBuffer model) for ONE shared document.
-    A session can carry several documents, each numbered by its own server
-    revision counter, so each gets its own instance.
+    """Client-side OT state (synced / awaiting / awaiting_buffer) for one shared document.
 
-    A document is `ready` once its full text has arrived; until then the
-    ops that show up are only buffered (they apply on top of that text),
-    and local edits are dropped (the incoming text replaces whatever the
-    editor holds for it anyway)."""
+    `ready` once its full text has arrived; until then remote ops are only buffered
+    and local edits are dropped (the incoming text replaces them)."""
 
     def __init__(self):
         self.ready = False
         self.state = "synced"
         self.outstanding = None
         self.buffer = None
-        # Optional "this op replaces the whole shared buffer" marker that
-        # travels with the op it belongs to (see Client.local_edit's `swap`).
-        # Tracked next to outstanding/buffer so it survives the same
-        # queueing/composition those go through.
-        self.outstanding_meta = None
+        self.outstanding_meta = None    # `swap` markers travelling with outstanding/buffer
         self.buffer_meta = None
         self.expected_rev = 0
         self.rev_buffer = {}
         self.chunks = {}
+        self.chunk_rev = None
         self.meta = {}
 
     def reset_for_resync(self):
@@ -56,6 +47,7 @@ class DocSync:
         self.outstanding = self.buffer = None
         self.outstanding_meta = self.buffer_meta = None
         self.chunks = {}
+        self.chunk_rev = None
         self.meta = {}
 
 
@@ -69,9 +61,8 @@ class Client:
         self.server_addr = None
         self.client_id = None
         self.color = None
-        self.username = None  # the name the server finally assigned (may be "bob#2")
+        self.username = None  # as finally assigned by the server (may be "bob#2")
         self.requested_username = None
-        # Terminal chat: dedupe + short reorder window (see _handle_chat).
         self.chat_reorder_window = 0.15
         self._chat_seen = set()
         self._chat_seen_order = collections.deque()
@@ -80,17 +71,10 @@ class Client:
         self._heartbeat_stop = threading.Event()
 
         self.docs = {}  # doc id -> DocSync
-        # Documents this peer left (see forget_doc): traffic for them is
-        # ignored for the rest of the connection.
-        self.forgotten = set()
+        self.forgotten = set()      # documents this peer left; their traffic is ignored
         self._lock = threading.RLock()
-        # Incoming document traffic (full texts and ops) is not handled on
-        # the network thread but handed to `dispatcher`, which runs it on
-        # the thread that also makes local edits (for the editor: the Tk
-        # thread, `lambda fn: root.after(0, fn)`). That is what keeps a
-        # peer's op from being transformed against one state of the
-        # document and then applied to a text the user has typed into in the
-        # meantime. None (the default) runs it right on the network thread.
+        # Document traffic runs through `dispatcher` (the editor passes the Tk thread's
+        # `after`) so remote ops never race local typing; None runs it on the network thread.
         self.dispatcher = None
         self._inbox = collections.deque()
 
@@ -133,29 +117,23 @@ class Client:
     on_chat = _make_callback_prop("chat")
     on_share = _make_callback_prop("share")
     on_doc_rejected = _make_callback_prop("doc_rejected")
+    del _make_callback_prop
 
     def _doc(self, doc_id):
-        """The DocSync for `doc_id`, created on first mention (an op for a
-        document can overtake the document's own text). Caller holds the lock."""
+        """DocSync for doc_id, created on first mention (ops can overtake the text). Lock held."""
         sync = self.docs.get(doc_id)
         if sync is None:
             sync = self.docs[doc_id] = DocSync()
         return sync
 
     def forget_doc(self, doc_id):
-        """Stops tracking a document: drops its sync state and ignores
-        everything the session still sends about it. The document itself
-        carries on for the other peers."""
+        """Stop tracking a document and ignore further traffic about it."""
         with self._lock:
             self.forgotten.add(doc_id)
             self.docs.pop(doc_id, None)
 
     def _to_ui(self, fn, *args):
-        """Queues `fn(*args)` for the dispatcher's thread. A plain FIFO that
-        is drained in order, so the order messages were received in is the
-        order they run in whatever the dispatcher's scheduling does. No lock
-        is held here: the dispatcher may block this thread until the UI
-        thread has serviced it."""
+        """Queue fn for the dispatcher's thread; FIFO keeps arrival order. Call without holding the lock."""
         self._inbox.append((fn, args))
         if self.dispatcher is None:
             self._run_inbox()
@@ -174,9 +152,7 @@ class Client:
                 traceback.print_exc()
 
     def _fire(self, name, *args):
-        """Invoke a callback if set, else buffer the event so a callback
-        attached later (as happens when the editor UI is built after the
-        network handshake already completed) still receives it, in order."""
+        """Call a callback, or buffer the event until one is attached."""
         fn = getattr(self, f"_on_{name}")
         if fn:
             fn(*args)
@@ -202,12 +178,8 @@ class Client:
             hello.update(extra_hello)
         self.transport.send(self.server_addr, p.HELLO, hello, reliable=True)
 
-        # A host on another protocol version can't read our HELLO and stays
-        # silent - which looks exactly like a wrong address or a firewall.
-        # So (1) anything that comes back from the host in another version's
-        # framing is reported as the version mismatch it is, and (2) an
-        # older host, which would never answer, is nudged with a PING in its
-        # own dialect, which its server answers from anyone.
+        # A host on another protocol version stays silent, which looks like a firewall:
+        # report foreign-framed replies as a mismatch, and nudge older hosts with a PING.
         server_addr = self.server_addr
 
         def foreign(addr, version, kind, seq, flags):
@@ -242,29 +214,16 @@ class Client:
         if kind == p.HELLO_REJECT:
             self.transport.stop()
             raise ConnectError(payload.get("reason", "Connection refused by host."))
+        if not isinstance(payload, dict) or "client_id" not in payload or "color" not in payload:
+            self.transport.stop()
+            raise ConnectError("Unexpected reply from host.")
         self.client_id = payload["client_id"]
         self.color = payload["color"]
-        # The server may have renamed us to keep names unique (bob -> bob#2).
-        self.username = sanitize_name(payload.get("username", username), NAME_MAX_LEN)
+        self.username = sanitize_name(payload.get("username", username), NAME_MAX_LEN)   # may be renamed (bob#2)
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
 
     def _resolve_cancelable(self, host, port, deadline):
-        """Resolve host/port to a numeric address without letting a slow or
-        unresponsive DNS server block cancellation.
-
-        socket.sendto() transparently calls getaddrinfo() whenever it is
-        given a hostname instead of a numeric IP, and getaddrinfo() has no
-        built-in timeout. If DNS is unreachable it can block the calling
-        thread for a very long time, well past our connect timeout, and
-        past anything cancel_connect() could interrupt, since the thread
-        is stuck inside a C level OS call rather than in our poll loop.
-        Every retry from ReliableUDP's retransmit loop would hit the same
-        stall again, since sendto() re-resolves on every call. Resolving
-        once, up front, on a background thread, and polling for either a
-        result or a cancellation exactly like the handshake wait below,
-        keeps Cancel responsive and gives ReliableUDP a plain numeric
-        address to send to from then on.
-        """
+        """Resolve to a numeric address on a worker thread so slow DNS can't block cancellation or sendto()."""
         result = queue.Queue(maxsize=1)
 
         def worker():
@@ -301,6 +260,10 @@ class Client:
 
     def disconnect(self):
         self._heartbeat_stop.set()
+        with self._lock:
+            if self._chat_timer is not None:
+                self._chat_timer.cancel()
+                self._chat_timer = None
         if self.server_addr:
             for _ in range(3):
                 try:
@@ -315,14 +278,8 @@ class Client:
         self.connect("127.0.0.1", port, username, extra_hello=extra_hello)
 
     def local_edit(self, op: ot.Op, doc=p.MAIN_DOC, swap=None):
-        """Sends a local edit to document `doc`. `swap`, when given, is a small dict
-        ({"filename": hint-or-None}) marking this op as one that replaces
-        the whole shared buffer with a different document rather than
-        being an ordinary edit. It rides inside the op's own message, so
-        every peer sees it at exactly the right spot in the op stream -
-        which is what lets them keep their old copy of the buffer as a
-        local tab without racing against the (unordered) separate
-        buffer-context message."""
+        """Send a local edit. `swap` ({"filename": hint}) marks an op that replaces the whole
+        buffer; it rides in the op's own message so peers see it at the right point in the stream."""
         if op.is_noop():
             return
         with self._lock:
@@ -364,10 +321,8 @@ class Client:
         self.transport.send(self.server_addr, p.BUFFER_CONTEXT, {"doc": doc, "filename": filename}, reliable=True)
 
     def open_doc(self, filename, text, ref):
-        """Shares `text` as a NEW document. The server picks its id and
-        sends it to everyone, us included, as a full document carrying our
-        `ref` (so the sender can tell which of its tabs it is). Returns
-        False if not connected; a refusal comes back via on_doc_rejected."""
+        """Share text as a new document; the server picks the id and echoes `ref`.
+        Returns False if not connected; refusals arrive via on_doc_rejected."""
         if not self.server_addr:
             return False
         self.transport.send(self.server_addr, p.DOC_OPEN,
@@ -375,8 +330,7 @@ class Client:
         return True
 
     def send_chat(self, text, to=None):
-        """Sends a terminal chat message. `to` is None (everyone), a name /
-        "#id" string, or a list of them. Returns False if not connected."""
+        """Send a chat message; `to` is None (everyone), a name or "#id", or a list of them."""
         if not self.server_addr:
             return False
         payload = {"text": sanitize_text(text, CHAT_MAX_LEN)}
@@ -386,8 +340,6 @@ class Client:
             payload["to"] = list(to)
         self.transport.send(self.server_addr, p.CHAT, payload, reliable=True)
         return True
-
-    # ---- shared run output (opt-in; see share_util) ----
 
     def send_share_start(self, run, title):
         if not self.server_addr:
@@ -415,8 +367,7 @@ class Client:
         return True
 
     def _handle_share(self, kind, payload):
-        """Normalizes (and so re-sanitizes) a relayed run message before the
-        UI sees it: the relay isn't trusted any more than a peer is."""
+        """Re-sanitize a relayed run message before the UI sees it."""
         if not isinstance(payload, dict):
             return
         run = share_util._int(payload.get("run"), lo=1)
@@ -447,8 +398,7 @@ class Client:
 
     @staticmethod
     def _normalize_chat(msg):
-        """Re-sanitizes one relayed message (never trust the relay: the
-        server may be a peer running modified code). None if unusable."""
+        """Re-sanitize a relayed chat message (the server may be a modified peer); None if unusable."""
         if not isinstance(msg, dict):
             return None
         try:
@@ -468,7 +418,7 @@ class Client:
                 "text": text}
 
     def _chat_mark_seen(self, seq):
-        """True if seq is new (and remembers it), False for a duplicate."""
+        """True if seq is new; False for a duplicate."""
         if seq in self._chat_seen:
             return False
         self._chat_seen.add(seq)
@@ -478,13 +428,8 @@ class Client:
         return True
 
     def _handle_chat(self, payload):
-        """Relayed chat arrives over reliable UDP, which is not ordered across
-        messages. Each message carries a server-assigned `seq`: duplicates
-        are dropped, and live messages are held for chat_reorder_window
-        seconds and released sorted by seq. (A message later than that is
-        still delivered - late beats lost - just out of order.) Server
-        errors are not sequenced and pass straight through; the join
-        history arrives as one batch, sorted, as {"history": [...]}."""
+        """Drop duplicate chats and release live ones sorted by seq after a short reorder window.
+        Errors pass straight through; join history arrives as one sorted batch."""
         if not isinstance(payload, dict):
             return
         if "error" in payload:
@@ -519,9 +464,7 @@ class Client:
 
     def _on_message(self, kind, payload, addr):
         if kind == p.WELCOME:
-            if payload.get("resync"):
-                # The server gave up on one of our ops: that document's text
-                # is about to be resent in full, replacing our copy.
+            if payload.get("resync"):       # the server rejected one of our ops and will resend that text
                 self._to_ui(self._handle_resync, payload)
             else:
                 self._connect_result.put((kind, payload))
@@ -557,17 +500,20 @@ class Client:
             self._doc(doc_id).reset_for_resync()
 
     def _handle_doc_chunk(self, payload):
-        """Collects one document's chunks (they may arrive in any order);
-        once complete the document becomes ready at the revision it was
-        captured at, the editor is told the full text, and any ops that
-        arrived early are applied on top."""
+        """Collect a document's chunks (any order); when complete, publish the text and apply early ops."""
         doc_id = payload.get("doc", p.MAIN_DOC)
-        idx, total, text = payload["index"], payload["total"], payload["text"]
+        idx, total, text = payload.get("index"), payload.get("total"), payload.get("text")
+        revision = payload.get("revision")
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (idx, total, revision)) \
+                or not isinstance(text, str) or not 0 <= idx < total <= 1_000_000:
+            return
         events = []
         with self._lock:
             if doc_id in self.forgotten:
                 return
             sync = self._doc(doc_id)
+            if sync.chunk_rev != revision:      # chunks of an older transfer must not mix in
+                sync.chunks, sync.meta, sync.chunk_rev = {}, {}, revision
             sync.chunks[idx] = text
             if not sync.meta:
                 sync.meta = {k: payload.get(k) for k in ("filename", "by", "ref")}
@@ -576,12 +522,12 @@ class Client:
                 return
             full = "".join(sync.chunks[i] for i in range(total))
             meta = sync.meta
-            sync.chunks, sync.meta = {}, {}
+            sync.chunks, sync.meta, sync.chunk_rev = {}, {}, None
             sync.ready = True
             sync.state = "synced"
             sync.outstanding = sync.buffer = None
             sync.outstanding_meta = sync.buffer_meta = None
-            sync.expected_rev = int(payload["revision"])
+            sync.expected_rev = revision
             for stale in [r for r in sync.rev_buffer if r < sync.expected_rev]:
                 del sync.rev_buffer[stale]      # already contained in the text
             events.append(("full_sync", (doc_id, full, meta)))
@@ -590,12 +536,8 @@ class Client:
             self._fire(name, *args)
 
     def _handle_remote_op(self, payload):
-        # Runs on the dispatcher's thread (see _to_ui). The state machine is
-        # advanced under the lock, but the callbacks are only *collected*
-        # there and fired after it is released: a callback can end up in
-        # Tk, which makes a thread wait until the main thread services the
-        # call, and waiting on the UI while holding a lock the UI needs for
-        # its next keystroke (local_edit) is what used to freeze the app.
+        # Callbacks are collected under the lock and fired after releasing it: they can
+        # block on Tk, and holding the lock the UI needs for local_edit would freeze the app.
         doc_id = payload.get("doc", p.MAIN_DOC)
         with self._lock:
             if doc_id in self.forgotten:
@@ -610,9 +552,7 @@ class Client:
             self._fire(name, *args)
 
     def _drain_rev_buffer(self, doc_id, sync):
-        """Applies every buffered op of one document that is next in line
-        and returns the events to fire. Caller holds the lock and must fire
-        the events only after releasing it."""
+        """Apply buffered ops that are next in line; return events to fire after releasing the lock."""
         events = []
         while sync.expected_rev in sync.rev_buffer:
             payload = sync.rev_buffer.pop(sync.expected_rev)
@@ -666,17 +606,8 @@ def reachable_peers(roster):
 
 
 def elect_sequencer(roster, my_id):
-    """Pure, deterministic election: the lowest client id among the peers
-    who were alive, per the last shared roster, survives, possibly
-    including myself. Every peer computes this independently from the same
-    last-known-good roster and reaches the same answer without asking
-    anyone, which is what makes it decentralized rather than requiring a
-    coordinator to hand out the new role.
-
-    If my own last-known roster entry says I was the outgoing sequencer, I
-    do not re-nominate myself, since the whole point of failover is someone
-    else taking over. This matters because a sequencer's own local client is
-    also a roster member and can observe its own shutdown broadcast."""
+    """Deterministic election: the lowest id in the last shared roster wins, so every peer agrees
+    without coordination. An outgoing sequencer never re-nominates itself."""
     candidates = [peer["id"] for peer in reachable_peers(roster) if peer.get("id") is not None]
     my_entry = next((peer for peer in roster if peer.get("id") == my_id), None)
     was_sequencer = bool(my_entry and my_entry.get("is_sequencer"))
@@ -686,12 +617,7 @@ def elect_sequencer(roster, my_id):
 
 
 class FailoverController:
-    """Owns the "who is the sequencer now" decision and the mechanics of
-    reconnecting after the current one disappears. Deliberately GUI-free:
-    the caller (EditorApp) supplies small callbacks for the Tk-side effects
-    (getting every shared document to seed a promoted server, and
-    reacting once reconnection succeeds or gives up) so this class can be
-    unit-tested with plain Server/Client sockets, no Tk involved."""
+    """Elects a new sequencer and reconnects when the current one disappears; GUI-free."""
 
     def __init__(self, username, advertise_host, advertise_port, get_docs,
                  on_reconnected, on_failed, reconnect_delay=(0.3, 0.6), advertise_socket=None):
@@ -725,8 +651,7 @@ class FailoverController:
             self.advertise_socket.close()
 
     def begin(self, old_client, reason):
-        """Kicks off the election and reconnect attempt in the background.
-        Safe to call from the Tk thread; the network work happens off it."""
+        """Start election and reconnect in the background (safe from the Tk thread)."""
         threading.Thread(target=self._run, args=(old_client, reason), daemon=True).start()
 
     def _run(self, old_client, reason):

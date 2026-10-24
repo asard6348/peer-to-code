@@ -13,8 +13,6 @@ import sys
 _IS_WINDOWS = sys.platform.startswith("win")
 
 # language code (see syntax.EXTENSION_LANGUAGE) -> commands to try, in order.
-# Only the first word of each is looked up on PATH. Python is handled
-# separately in detect() because it needs the "am I a frozen app" check.
 RUNNERS = {
     "bash": ["bash", "sh"],
     "javascript": ["node", "nodejs", "bun"],

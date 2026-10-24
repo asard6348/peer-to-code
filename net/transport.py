@@ -1,37 +1,14 @@
-"""The network layer this whole app talks over: how a message is packed into
-bytes, and how those bytes get delivered over UDP without silently getting
-lost. The two used to live in separate files, but neither means anything
-without the other, so they live together here now.
+"""Wire format and reliable delivery over UDP.
 
-Wire format: every packet starts with a fixed header (a magic value so we
-never mistake noise from some other program on the same port for our own
-traffic, a message kind, a sequence number, and a reliability flag), followed
-by a JSON body — or, for oversized messages, by a small fragment header and
-a slice of the JSON body (see "Fragmentation" below). Kept deliberately
-plain text and simple to decode by hand if you ever need to read a packet
-capture.
-
-Reliability: plain UDP can drop or reorder packets, so ReliableUDP adds a
-thin layer on top. Anything sent with reliable=True gets retried on a timer
-until the other side acknowledges it, and duplicate deliveries are filtered
-out on arrival so a retried packet never gets applied twice. Anything sent
-with reliable=False (cursor position updates, pings) is fire-and-forget,
-since losing one of those just means the next one corrects it.
-
-Fragmentation: a single sendto() call fails outright (OSError: Message too
-long / EMSGSIZE) once a datagram exceeds whatever ceiling the local network
-stack enforces. That ceiling isn't the same everywhere — it's well below the
-65507-byte theoretical UDP max on some Android/Termux loopback setups, and
-real Wi-Fi/mobile links fragment or drop oversized datagrams even when the
-socket itself accepts them. A single large edit (opening or pasting a big
-file, replacing the whole shared buffer) can easily produce a JSON body of
-several hundred KB, so send() transparently splits anything bigger than
-FRAGMENT_SIZE into several small fragments, each sent and acknowledged as
-its own datagram, and the receiving side reassembles them before handing a
-complete message to on_message. Every caller of send() stays oblivious to
-this; only ReliableUDP itself knows fragments exist.
+Every packet is a fixed header (magic, kind, sequence number, flags) plus a
+JSON body, or a fragment header plus a slice of one for oversized messages.
+Reliable packets are retried until acknowledged and de-duplicated on arrival;
+unreliable ones (cursors, pings) are fire-and-forget. Bodies above
+FRAGMENT_SIZE are split into separately acknowledged datagrams and reassembled
+before delivery, because many network stacks drop or reject large datagrams.
 """
 
+import collections
 import itertools
 import json
 import socket
@@ -40,32 +17,24 @@ import threading
 import time
 import traceback
 
-# Bumped when per-document sync was added (every document message now carries
-# a document id, and DOC_OPEN exists). Peers on a different version can't
-# understand each other, so each side recognises the other's packets (see
-# ReliableUDP.on_foreign_version) and says so, rather than leaving the person
-# at the other end to wait for a connection timeout.
+# Bump on incompatible changes; mismatched peers get a clear message instead of a timeout.
 PROTOCOL_VERSION = 2
 MAGIC = b"CE%d" % PROTOCOL_VERSION
 
-# Versions older than this one that a connecting client probes for (see
-# Client.connect): their server answers a PING from anyone with a PONG, which
-# is what reveals that a host which stays silent to our HELLO is merely old.
+# Older versions a client probes for: their servers answer any PING with a PONG,
+# which reveals that a host silent to our HELLO is merely old.
 PROBE_VERSIONS = (1,)
 
 
 def version_of(magic: bytes):
-    """The protocol version a packet's magic stands for, or None if it isn't a
-    Peer to Code magic at all."""
+    """Protocol version encoded in a magic, or None if it isn't ours."""
     if len(magic) == 3 and magic[:2] == b"CE" and magic[2:].isdigit():
         return int(magic[2:])
     return None
 
 
 def mismatch_message(theirs, host_is_theirs):
-    """What to tell a person whose version doesn't match the one they're
-    talking to. `host_is_theirs`: the other side is the host (we are joining
-    it) rather than a client joining us."""
+    """User-facing text for a protocol mismatch; host_is_theirs means we are joining their host."""
     if host_is_theirs:
         if theirs < PROTOCOL_VERSION:
             return (f"The host runs an older version of Peer to Code (protocol {theirs}) that this "
@@ -99,9 +68,7 @@ RUN_OUTPUT = 16
 RUN_END = 17
 DOC_OPEN = 18
 
-# A session can share several documents at once, each with its own id, its own
-# revision counter and its own op history. Id 1 always exists: it is the
-# document a fresh session starts out with.
+# Each shared document has its own id, revision and op history; id 1 always exists.
 MAIN_DOC = 1
 
 HEADER = struct.Struct("!3sBIB")
@@ -111,17 +78,15 @@ FLAG_RELIABLE = 1
 FLAG_FRAGMENT = 2
 
 MAX_DATAGRAM = 60000
-
 FRAGMENT_SIZE = 1200
+MAX_FRAGMENTS = 8192
+MAX_INFLIGHT_FRAGMENTED = 32
+FRAGMENT_TTL = 30.0
+SEEN_WINDOW = 4096
 
 
 def parse_header(raw: bytes):
-    """Parses the fixed header (and fragment header, if present) off the
-    front of a packet, returning (kind, seq, reliable, frag_info, body).
-    frag_info is None for an ordinary packet, or (frag_id, frag_index,
-    frag_count) for one piece of a fragmented message. body is the
-    remaining raw bytes — a complete JSON document for a non-fragmented
-    packet, or one slice of one for a fragment."""
+    """Return (kind, seq, reliable, frag_info, body); frag_info is None or (id, index, count)."""
     if len(raw) < HEADER.size:
         raise ValueError("packet too short")
     magic, kind, seq, flags = HEADER.unpack_from(raw, 0)
@@ -133,14 +98,14 @@ def parse_header(raw: bytes):
         if len(raw) < offset + FRAG_HEADER.size:
             raise ValueError("truncated fragment header")
         frag_info = FRAG_HEADER.unpack_from(raw, offset)
+        if not 0 < frag_info[2] <= MAX_FRAGMENTS or frag_info[1] >= frag_info[2]:
+            raise ValueError("bad fragment header")
         offset += FRAG_HEADER.size
     return kind, seq, bool(flags & FLAG_RELIABLE), frag_info, raw[offset:]
 
 
 def chunk_text(text: str, chunk_size: int = 8000):
-    """Splits a document into pieces small enough to fit in one datagram, for
-    the initial full-sync send. Always returns at least one chunk, even for
-    an empty document, so the receiving side has something to assemble."""
+    """Split text into chunks for the initial sync; always at least one, even when empty."""
     chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
     return chunks or [""]
 
@@ -150,40 +115,45 @@ MAX_RETRIES = 20
 
 
 class Peer:
-    """Per-remote-address bookkeeping: outbound reliability plus inbound
-    duplicate detection, kept separately for every address we talk to."""
+    """Per-address state: outbound retries, inbound de-duplication, fragment buffers."""
 
     def __init__(self, addr):
         self.addr = addr
         self.send_seq = itertools.count(1)
         self.pending = {}
         self.seen_seq = set()
-        self.last_seen_seq_order = []
+        self.seen_order = collections.deque()
         self.alive = True
         self.last_activity = time.monotonic()
         self.frag_id_seq = itertools.count(1)
-        self.frag_buffers = {}
+        self.frag_buffers = {}      # frag_id -> (first_seen, {index: bytes})
+
+    def is_duplicate(self, seq):
+        """Record seq; True if it was already delivered (sliding window)."""
+        if seq in self.seen_seq:
+            return True
+        self.seen_seq.add(seq)
+        self.seen_order.append(seq)
+        if len(self.seen_order) > SEEN_WINDOW:
+            self.seen_seq.discard(self.seen_order.popleft())
+        return False
 
 
 class ReliableUDP:
-    """A minimal reliable-messaging layer over a UDP socket. Everything else
-    in net/ talks through this rather than touching sockets directly."""
+    """Reliable messaging over a UDP socket; the rest of net/ never touches sockets directly."""
 
     def __init__(self, bind_addr=("0.0.0.0", 0), sock=None):
         if sock is not None:
             self.sock = sock
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sock.bind(bind_addr)
         self.sock.settimeout(0.5)
         self.local_port = self.sock.getsockname()[1]
         self.peers = {}
         self.on_message = None
         self.on_peer_timeout = None
-        # Called as (addr, version, kind, seq, flags) for a packet that is
-        # a Peer to Code packet of another protocol version.
-        self.on_foreign_version = None
+        self.on_foreign_version = None      # (addr, version, kind, seq, flags)
         self._lock = threading.Lock()
         self._running = False
 
@@ -198,6 +168,11 @@ class ReliableUDP:
             self.sock.close()
         except OSError:
             pass
+
+    def drop_peer(self, addr):
+        """Forget all state for an address (call when it leaves for good)."""
+        with self._lock:
+            self.peers.pop(addr, None)
 
     def _get_peer(self, addr):
         with self._lock:
@@ -215,6 +190,8 @@ class ReliableUDP:
         frag_id = next(peer.frag_id_seq) & 0xFFFFFFFF
         pieces = [body[i:i + FRAGMENT_SIZE] for i in range(0, len(body), FRAGMENT_SIZE)]
         frag_count = len(pieces)
+        if frag_count > MAX_FRAGMENTS:
+            raise ValueError(f"message too large ({len(body)} bytes)")
         last_seq = None
         for idx, piece in enumerate(pieces):
             last_seq = self._send_datagram(peer, addr, kind, reliable, piece,
@@ -222,7 +199,7 @@ class ReliableUDP:
         return last_seq
 
     def _send_datagram(self, peer, addr, kind, reliable, body, frag=None):
-        seq = next(peer.send_seq) if reliable else 0
+        seq = next(peer.send_seq) & 0xFFFFFFFF if reliable else 0
         flags = (FLAG_RELIABLE if reliable else 0) | (FLAG_FRAGMENT if frag else 0)
         raw = HEADER.pack(MAGIC, kind, seq, flags)
         if frag is not None:
@@ -238,9 +215,7 @@ class ReliableUDP:
         return seq
 
     def send_as_version(self, addr, version, kind, seq=0, payload=None):
-        """One unreliable packet framed in another protocol version's header
-        (the header layout has never changed, only the magic) - used to
-        answer a peer in the only dialect it will recognise."""
+        """One unreliable packet with another version's magic, to answer a peer in its own dialect."""
         body = json.dumps(payload).encode("utf-8") if payload is not None else b""
         try:
             self.sock.sendto(HEADER.pack(b"CE%d" % version, kind, seq, 0) + body, addr)
@@ -255,17 +230,23 @@ class ReliableUDP:
             pass
 
     def _reassemble(self, peer, frag_info, chunk):
-        """Buffers one fragment; returns the joined body once every fragment
-        of that message has arrived, or None while still waiting."""
+        """Buffer one fragment; return the joined body once complete, else None."""
         frag_id, frag_index, frag_count = frag_info
+        now = time.monotonic()
         with self._lock:
-            buf = peer.frag_buffers.setdefault(frag_id, {})
+            for fid in [f for f, (t, _) in peer.frag_buffers.items() if now - t > FRAGMENT_TTL]:
+                del peer.frag_buffers[fid]
+            if frag_id not in peer.frag_buffers and len(peer.frag_buffers) >= MAX_INFLIGHT_FRAGMENTED:
+                del peer.frag_buffers[next(iter(peer.frag_buffers))]
+            _, buf = peer.frag_buffers.setdefault(frag_id, (now, {}))
             buf[frag_index] = chunk
             if len(buf) < frag_count:
                 return None
-            pieces = [buf[i] for i in range(frag_count)]
             del peer.frag_buffers[frag_id]
-        return b"".join(pieces)
+        try:
+            return b"".join(buf[i] for i in range(frag_count))
+        except KeyError:
+            return None
 
     def _note_foreign_packet(self, raw, addr):
         if self.on_foreign_version is None or len(raw) < HEADER.size:
@@ -285,8 +266,13 @@ class ReliableUDP:
                 raw, addr = self.sock.recvfrom(65535)
             except socket.timeout:
                 continue
+            except ConnectionResetError:    # Windows reports ICMP "port unreachable" this way
+                continue
             except OSError:
-                break
+                if not self._running or self.sock.fileno() == -1:
+                    break
+                time.sleep(0.1)
+                continue
             try:
                 kind, seq, reliable, frag_info, body = parse_header(raw)
             except (ValueError, struct.error):
@@ -302,13 +288,8 @@ class ReliableUDP:
             if reliable:
                 self._send_ack(addr, seq)
                 with self._lock:
-                    if seq in peer.seen_seq:
+                    if peer.is_duplicate(seq):
                         continue
-                    peer.seen_seq.add(seq)
-                    peer.last_seen_seq_order.append(seq)
-                    if len(peer.last_seen_seq_order) > 4096:
-                        old = peer.last_seen_seq_order.pop(0)
-                        peer.seen_seq.discard(old)
             if frag_info is not None:
                 body = self._reassemble(peer, frag_info, body)
                 if body is None:
@@ -318,11 +299,7 @@ class ReliableUDP:
             except (ValueError, UnicodeDecodeError):
                 continue
             if self.on_message:
-                # One bad packet (a missing field, an op that doesn't fit
-                # the document) must not kill the receive thread: it is
-                # the only thing delivering messages, so letting the
-                # exception escape silently ends networking for good.
-                try:
+                try:     # a bad packet must not kill the receive thread
                     self.on_message(kind, payload, addr)
                 except Exception:
                     traceback.print_exc()
@@ -346,7 +323,10 @@ class ReliableUDP:
                         if peer.alive:
                             peer.alive = False
                             if self.on_peer_timeout:
-                                self.on_peer_timeout(addr)
+                                try:
+                                    self.on_peer_timeout(addr)
+                                except Exception:
+                                    traceback.print_exc()
                         continue
                     try:
                         self.sock.sendto(raw, addr)

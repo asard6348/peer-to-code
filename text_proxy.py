@@ -11,15 +11,7 @@ _char_offset = char_offset
 
 
 def _safe_call(widget, orig_name, cmd, args):
-    """The Tcl side (e.g. the Text widget's own built-in Ctrl+C -> Copy
-    binding, which runs `$w get sel.first sel.last`) often wraps calls
-    like this in its own `catch`, expecting a plain, harmless error back
-    when e.g. there's no selection to copy. But since we've replaced the
-    widget's real Tcl command with this Python one, an uncaught
-    tk.TclError here isn't a Tcl-level error for that surrounding catch
-    to see and swallow - it's a Python exception, which propagates
-    straight out of mainloop() and prints a traceback instead. Matches
-    the same catch install_proxy's command() already does."""
+    """Raise a plain TclError, which Tcl-side `catch` wrappers expect."""
     try:
         return widget.tk.call((orig_name, cmd) + args)
     except tk.TclError:
@@ -66,19 +58,7 @@ def install_proxy(widget: tk.Text, on_insert, on_delete):
 
 
 def install_delete_guard(widget: tk.Text, boundary_mark):
-    """Renames the Tcl command backing `widget` and clamps every delete
-    (and insert) so nothing at or before `boundary_mark` can ever be
-    removed or overwritten - however it's triggered. Backspace and
-    Delete are easy enough to catch with an ordinary key binding, but
-    Tk's Text widget has several other built-in ways to delete text -
-    Ctrl+D and Ctrl+H (its emacs-style bindings), Ctrl+X/<<Cut>>, a
-    right-click context menu, a script calling .delete() directly - and
-    re-discovering and re-blocking each one individually as it turns up
-    is a losing game (that's exactly how Ctrl+X and Ctrl+D slipped
-    through). Catching it here, at the Tcl command level every one of
-    those ultimately funnels through, covers all of them - and anything
-    else - at once, the same way install_proxy above observes every
-    edit instead of chasing individual key bindings."""
+    """Renames the Tcl command backing `widget` and clamps every delete so nothing at or before `boundary_mark` can ever be removed or overwritten."""
     orig_name = widget._w + "_delguard_orig"
     widget.tk.call("rename", widget._w, orig_name)
 

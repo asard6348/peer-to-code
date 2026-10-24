@@ -10,7 +10,8 @@ rebuild on every drag.
 """
 import colorsys
 import tkinter as tk
-from tkinter import ttk
+
+from config import CODE_FONT
 
 _BAR_WIDTH = 256
 _BAR_HEIGHT = 20
@@ -82,7 +83,7 @@ class HSVColorDialog(tk.Toplevel):
         self.hex_var = tk.StringVar(value=self._current_hex())
         hex_entry = tk.Entry(hex_area, textvariable=self.hex_var, bg=edit_bg, fg=fg,
                               insertbackground=fg, relief="flat", highlightthickness=1,
-                              highlightbackground=border, highlightcolor=accent, font=("Consolas", 11))
+                              highlightbackground=border, highlightcolor=accent, font=(CODE_FONT, 11))
         hex_entry.pack(anchor="w", fill="x", pady=(2, 0))
         hex_entry.bind("<Return>", self._on_hex_entered)
         hex_entry.bind("<FocusOut>", self._on_hex_entered)
@@ -111,7 +112,7 @@ class HSVColorDialog(tk.Toplevel):
         hex_entry.focus_set()
         hex_entry.selection_range(0, "end")
 
-    # -- layout helpers ---------------------------------------------------
+    # layout helpers
 
     def _center_on_parent(self, parent):
         try:
@@ -142,7 +143,7 @@ class HSVColorDialog(tk.Toplevel):
         self._sliders[key] = value_lbl
         self._slider_canvas[key] = (canvas, row_color_fn)
 
-    # -- color math for each bar's gradient --------------------------------
+    # color math for each bar's gradient
 
     def _hue_row_color(self, frac):
         r, g, b = colorsys.hsv_to_rgb(frac, 1.0, 1.0)
@@ -160,7 +161,7 @@ class HSVColorDialog(tk.Toplevel):
         r, g, b = colorsys.hsv_to_rgb(self._h, self._s, self._v)
         return _rgb_to_hex(r * 255, g * 255, b * 255)
 
-    # -- redrawing ----------------------------------------------------------
+    # redrawing
 
     def _build_gradient_image(self, row_color_fn):
         row = "{" + " ".join(row_color_fn(x / (_BAR_WIDTH - 1)) for x in range(_BAR_WIDTH)) + "}"

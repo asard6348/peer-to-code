@@ -6,3 +6,6 @@ dist/
 .venv/
 venv/
 demos/
+.p2c-*.tmp
+.idea/
+.vscode/

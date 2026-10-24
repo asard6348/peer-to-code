@@ -44,7 +44,7 @@ class SharedOutputWindow(tk.Toplevel):
         self._tabs = {}          # sender id -> {"frame", "header", "text", "name"}
         self._tag_cache = set()
 
-    # -- tabs ---------------------------------------------------------------
+    # tabs
 
     def _tab(self, sender, name):
         tab = self._tabs.get(sender)
@@ -103,7 +103,7 @@ class SharedOutputWindow(tk.Toplevel):
             tab["text"].tag_configure(name, **opts)
         return name
 
-    # -- API used by EditorApp ---------------------------------------------
+    # API used by EditorApp
 
     def start_run(self, sender, name, title, status="running"):
         tab = self._tab(sender, name)

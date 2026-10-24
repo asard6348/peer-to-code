@@ -26,13 +26,9 @@ class App:
         if config_path:
             config.set_config_path(config_path)
         self.cfg = config.load_config()
-        # Resolves the "system" preset (the default) against the OS's
-        # current light/dark setting before anything - the connect screen
-        # included - reads cfg["theme"]. See theme.apply_active_preset().
+        # Resolves the "system" preset against the OS's current light/dark setting before anything.
         theme.apply_active_preset(self.cfg)
-        # Remembers what the OS was reporting just now, so
-        # _poll_system_theme can tell a real change from a no-op - see
-        # _start_system_theme_watch.
+        # Remembers what the OS was reporting just now, so _poll_system_theme can tell a real change from a no-op.
         self._system_dark = theme.detect_system_dark_mode()
         self._system_theme_job = None
         self._signal_pump_job = None
@@ -53,9 +49,7 @@ class App:
         self.client = None
         self.server = None
         self._initial_path = initial_path
-        # Height (px) the editor's native X11 menubar adds to the window
-        # on top of what Tk's geometry() reports. 0 everywhere else. See
-        # _measure_menubar_extra.
+        # Height (px) the editor's native X11 menubar adds to the window on top of what Tk's geometry() reports.
         self._menubar_extra = 0
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -97,51 +91,20 @@ class App:
                 pass
 
     def _install_sigint_handler(self):
-        """Ctrl+C in a terminal (or `kill -INT`, same thing Termux sends)
-        delivers SIGINT, and Python's default disposition for that is to
-        raise KeyboardInterrupt - but only the next time the interpreter
-        actually checks for a pending signal. While mainloop() is sitting
-        in Tk's C-level event loop waiting on X11/Tcl events, that check
-        can be delayed indefinitely: with nothing else waking the loop up,
-        Ctrl+C can appear to do nothing at all, and the window has to be
-        force-killed - which skips _cleanup() entirely, so nothing (last
-        tab, window geometry, etc.) gets saved.
-
-        Installing an explicit handler plus a frequent no-op timer
-        (_pump_signals) fixes this two ways: the timer guarantees Python
-        returns to a bytecode boundary often enough to notice the signal
-        promptly, and having our own handler means we trigger the same
-        graceful shutdown _cleanup() path ourselves instead of hoping a
-        bare KeyboardInterrupt unwinds cleanly out of the C mainloop
-        call - which, on this evidence, it doesn't always do."""
+        """Ctrl+C in a terminal delivers SIGINT, and Python's default disposition for that is to raise KeyboardInterrupt."""
         try:
             signal.signal(signal.SIGINT, self._on_sigint)
         except (ValueError, OSError):
-            # Only fails when not called from the main thread, or on a
-            # platform without SIGINT - the run()-level try/except around
-            # mainloop() is the fallback in that case.
+            # Only fails when not called from the main thread, or on a platform without SIGINT.
             return
         self._pump_signals()
 
     def _on_sigint(self, _signum, _frame):
-        # A signal handler runs mid-bytecode in the main thread, not as a
-        # normal Tk callback - don't touch widgets directly here. Hand off
-        # to a real event-loop turn instead.
+        # A signal handler runs mid-bytecode in the main thread, not as a normal Tk callback.
         self.root.after(0, self._quit_from_signal)
 
     def _quit_from_signal(self):
-        """A real terminal's Ctrl+C is delivered to this whole process
-        (e.g. Termux behind Termux:X11, an SSH session, etc.) regardless
-        of which window has focus, so this can arrive while a script is
-        running in the Terminal console with no chance for that console's
-        own selection-aware Ctrl+C handling to weigh in first. A real
-        terminal doesn't quit the shell in that situation either - it
-        forwards the interrupt to the foreground job and leaves the
-        shell running. So: a script running - interrupt just that,
-        exactly like the console's own Ctrl+C would, and leave the app
-        open. Nothing running - fall through to actually quitting, which
-        is the whole reason this handler exists (kill -INT, a terminal
-        closing, etc. should still shut the app down cleanly)."""
+        """A real terminal's Ctrl+C is delivered to this whole process regardless of which window has focus."""
         editor = self.editor
         if editor and editor.run_proc and editor.run_proc.poll() is None:
             editor._interrupt_run_proc()
@@ -161,14 +124,7 @@ class App:
         self._signal_pump_job = self.root.after(200, self._pump_signals)
 
     def _stop_signal_pump(self):
-        """Cancels the recurring _pump_signals timer. Must run before
-        self.root.destroy() - unlike _stop_system_theme_watch (called
-        from the same places), this one was previously never cancelled
-        at all, so the pending `after` timer kept firing every 200ms
-        after the root window (and its Tcl command list) was torn down,
-        crashing deep inside tkinter's own callit()/deletecommand() with
-        "AttributeError: 'NoneType' object has no attribute 'remove'"
-        the next time it fired."""
+        """Cancels the recurring _pump_signals timer."""
         if self._signal_pump_job is not None:
             try:
                 self.root.after_cancel(self._signal_pump_job)
@@ -177,25 +133,14 @@ class App:
             self._signal_pump_job = None
 
     def _start_system_theme_watch(self):
-        """Polling is the only portable way to notice the OS's light/dark
-        setting changing while the app is already running - there's no
-        single cross-platform push notification for it, and
-        detect_system_dark_mode's own OS calls (a registry read, a
-        `defaults read`, a `gsettings get`) are cheap enough that a
-        couple-times-a-second check is unnoticeable. Without this, the
-        "System" preset only ever picked up a change on the next launch
-        (see theme.apply_active_preset's docstring) - flipping the OS
-        theme while Peer to Code was already open did nothing until you
-        restarted it."""
+        """Polling is the only portable way to notice the OS's light/dark setting changing while the app is already running."""
         self._poll_system_theme()
 
     def _poll_system_theme(self):
         self._system_theme_job = self.root.after(1500, self._poll_system_theme)
         ui_cfg = self.cfg.get("ui", {})
         if ui_cfg.get("theme_preset", theme.SYSTEM_PRESET) != theme.SYSTEM_PRESET:
-            # A fixed Dark/Light/custom preset deliberately doesn't
-            # follow the OS - nothing to reconcile, and no need to keep
-            # re-reading self._system_dark while it wouldn't be used.
+            # A fixed Dark/Light/custom preset deliberately doesn't follow the OS.
             return
         dark = theme.detect_system_dark_mode()
         if dark == self._system_dark:
@@ -220,16 +165,7 @@ class App:
             self.connect_frame.apply_theme_live(t)
 
     def _apply_saved_geometry(self):
-        """Restores the window's last size and/or position - whichever of
-        the two the person has chosen to remember in Settings > Config
-        File (each is independent; either can be off). Both are clamped
-        so they're always fully reachable on the current screen - a saved
-        position can be stale (different monitor layout, or an
-        iconified-window quirk like Windows reporting geometry as
-        "1x1+-32000+-32000" while minimized), so neither is trusted
-        blindly. Whichever piece isn't remembered (never saved, or
-        deleted because its checkbox is off) is simply left unspecified,
-        so Tk/the window manager places or sizes it automatically."""
+        """Restores the window's last size and/or position."""
         ui = self.cfg.get("ui", {})
         size = self._sanitize_size(ui.get("window_size", "")) or "1100x700"
         position = self._sanitize_position(ui.get("window_position", ""), size) or ""
@@ -254,13 +190,7 @@ class App:
         return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
     def _verify_placement(self):
-        """Some window managers (KDE under XWayland, for one) place a window
-        a title bar lower than the position it was asked for, while Tk then
-        reports the window's *actual* position. Saving that and asking for it
-        again at the next launch moves the window down by the title bar every
-        time. So: see where the window really landed, and if it isn't where
-        it was supposed to be, ask for the position minus that difference
-        (once) and remember the difference for the next launch."""
+        """Some window managers place a window a title bar lower than the position it was asked for."""
         if self._want_pos is None:
             return
         try:
@@ -334,21 +264,7 @@ class App:
         return (int(m.group(1)), int(m.group(2))) if m else None
 
     def _measure_menubar_extra(self, before_rooty):
-        """On X11 a native menubar is added on top of the window's
-        client area: the window is a menubar's height taller than Tk's
-        geometry() says. Normally the window manager simply grows the
-        window, so nothing needs correcting - and this must NOT resize
-        or move the window itself (any geometry() call made while the
-        window is mapped can make some window managers re-place it, which
-        showed up as the window jumping down when the editor opened).
-        The one case that needs help is a window already filling the
-        screen (maximized): it can't grow, so the menubar takes its
-        height out of geometry() instead, and the height saved on close
-        would be that much too short - see _cleanup, which adds it back.
-        The menubar's height shows up as a jump in the window's root y,
-        which is how it's measured here. Windows (custom in-window
-        menubar) and macOS (menubar outside the window) have nothing to
-        correct."""
+        """On X11 a native menubar is added on top of the window's client area."""
         if not sys.platform.startswith("linux"):
             return 0
         self.root.update_idletasks()
@@ -356,11 +272,7 @@ class App:
 
     @staticmethod
     def _destroy_tree(widget):
-        """Destroys a widget and everything below it. A stale Python callback
-        name (Tkinter raises "can't delete Tcl command" for one that is
-        already gone) must never abort the teardown, or the window is left
-        empty with no Connect screen; so on failure fall back to destroying
-        the children one by one and forgetting the bookkeeping."""
+        """Destroys a widget and everything below it."""
         try:
             widget.destroy()
             return
@@ -395,9 +307,7 @@ class App:
         if sys.platform == "darwin":
             self.root.config(menu=tk.Menu(self.root))
         else:
-            # No menu bar at all here. Elsewhere an (empty) native one still
-            # takes up room above the window, which the editor's own bar then
-            # changes - the window would resize when a session opens.
+            # No menu bar at all here.
             self.root.config(menu="")
         self.connect_frame = ConnectWindow(self.root, self.cfg, self._on_ready, initial_path=self._initial_path)
         self._initial_path = None
@@ -437,13 +347,7 @@ class App:
             pass
 
     def _cleanup(self, ask_to_save):
-        """Persists UI state and disconnects/stops networking - shared by a
-        normal window-close and a Ctrl+C in the terminal (see run()), so
-        both actually save things like panel visibility/sizes and
-        remembered per-file-type interpreters instead of only the former.
-        Returns False if the person cancelled out of an (optional) prompt
-        to save unsaved changes first, meaning the caller should NOT
-        proceed with closing."""
+        """Persists UI state and disconnects/stops networking."""
         if ask_to_save and self.editor and not self.editor._confirm_discard_all():
             return False
         if self.editor:
@@ -456,28 +360,15 @@ class App:
         except tk.TclError:
             normal = False
         if normal:
-            # Only overwrite the saved geometry while the window is in its
-            # regular, on-screen state - if it's minimized/withdrawn at
-            # close time, .geometry() can report nonsense (e.g. Windows
-            # reports iconified windows as "1x1+-32000+-32000"), and
-            # saving that would leave a bad value in place for next time.
+            # Only overwrite the saved geometry while the window is in its regular, on-screen state.
             ui = self.cfg.setdefault("ui", {})
             m = re.match(r"^(\d+x\d+)([+-]\d+[+-]\d+)$", self.root.geometry())
             size, position = (m.group(1), m.group(2)) if m else (None, None)
             if size and self.editor and self._menubar_extra and self._is_zoomed():
-                # A maximized window can't grow to make room for the
-                # editor's native menubar, so geometry() comes back that
-                # much shorter than the screen it fills; store the full
-                # height so the next launch matches what was on screen.
-                # (A normal window just grows by the menubar, and its
-                # geometry() height is already the right thing to save.)
+                # A maximized window can't grow to make room for the editor's native menubar.
                 w, h = (int(v) for v in size.split("x"))
                 size = f"{w}x{h + self._menubar_extra}"
-            # Each half is independently opt-in (Settings > Config File):
-            # when its checkbox is off, the key is removed from the
-            # config entirely rather than merely left unwritten, so the
-            # next launch has nothing to fall back on for it and sizes
-            # or places the window automatically instead.
+            # Each half is independently opt-in.
             if ui.get("save_window_size", True) and size:
                 ui["window_size"] = size
             else:
@@ -487,6 +378,8 @@ class App:
             else:
                 ui.pop("window_position", None)
                 ui.pop("window_placement_offset", None)
+        if self.editor:
+            self.editor.stop_run()
         config.save_config(self.cfg)
         client = self.editor.client if self.editor else self.client
         server = self.editor.server if self.editor else self.server

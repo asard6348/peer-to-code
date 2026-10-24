@@ -11,11 +11,13 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox
 from tkinter import font as tkfont
 
+import fileio
 import interpreters
 import ot
+import procutil
 import syntax
 import config
 import theme
@@ -36,48 +38,25 @@ from settings_window import SettingsWindow
 from net.client import Client, ConnectCancelled, ConnectError, FailoverController
 from net.transport import MAIN_DOC
 
-# The Terminal console's stdout/stderr/prompt colors, tuned as two fixed
-# pairs rather than one - the "dark" set is bright, saturated color meant
-# to pop against a near-black console background, and reads as barely
-# more than a smudge against a light one (and vice versa for "light"'s
-# deeper, more saturated tones on a near-black background). Which pair
-# applies is decided at paint time from the *current* console background's
-# brightness (see _console_tag_colors below), the same test the "auto"
-# syntax palette uses - so it keeps working for a user's own saved
-# preset, not just the two built-in Dark/Light themes.
+# The Terminal console's stdout/stderr/prompt colors, tuned as two fixed pairs rather than one.
 CONSOLE_TAG_COLORS_DARK = {"stderr": "#e06c75", "info": "#61afef", "prompt": "#98c379"}
 CONSOLE_TAG_COLORS_LIGHT = {"stderr": "#cf222e", "info": "#0969da", "prompt": "#1a7f37"}
 
-# How many spaces one indent level is - Tab, auto-indent-on-Enter, and the
-# backspace-removes-a-whole-level behavior all agree on this single width
-# rather than each hardcoding their own "    ".
+# How many spaces one indent level is.
 INDENT_WIDTH = 4
-# A line ending in one of these (ignoring trailing whitespace) gets one
-# extra indent level on the line Enter creates - covers the common
-# "opens a block" punctuation across most of this editor's supported
-# languages (Python's ':', C-family/JS/etc.'s '{', and an open '(' or '['
-# left dangling at line end) without needing per-language grammar.
+# A line ending in one of these gets one extra indent level on the line Enter creates.
 _INDENT_AFTER_SUFFIXES = (":", "{", "(", "[")
 _OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
 _CLOSE_TO_OPEN = {v: k for k, v in _OPEN_TO_CLOSE.items()}
-# Python has no closing bracket to hang a dedent off of for its
-# colon-based blocks, so the electric-dedent-on-':' behavior keys off
-# these instead - a bare 'else'/'elif'/'except'/'finally' clause dedents
-# to line up with the statement it belongs to.
+# Python has no closing bracket to hang a dedent off of for its colon-based blocks.
 _PY_DEDENT_KEYWORDS = re.compile(r"^(else|elif|except|finally)\b")
-# What a dedented else/elif/except/finally is allowed to land next to at
-# the same indent level - a sibling clause of the block it's continuing,
-# not just any statement that happens to be shallower.
+# What a dedented else/elif/except/finally is allowed to land next to at the same indent level.
 _PY_BLOCK_OPENERS = re.compile(r"^(if|elif|else|for|while|try|except|finally|with)\b")
-# A line whose statement is one of these unconditionally ends control
-# flow at that point - nothing after it in the same block can still run
-# - so the line Enter creates lands one level shallower instead of
-# carrying the same indent forward, the same way it would if you'd
-# dedented by hand to start the next statement in the enclosing block.
+# A line whose statement is one of these unconditionally ends control flow at that point.
 _PY_FLOW_DEDENT_KEYWORDS = re.compile(r"^(return|break|continue|pass|raise)\b")
 
 # Default code-like font
-CODE_FONT = "Consolas" if os.name=='nt' else "Hack"
+from config import CODE_FONT
 
 
 def _console_tag_colors(console_bg):
@@ -110,11 +89,7 @@ SHORTCUT_SPECS = [
     ("prev_tab", "Previous Tab", "<Control-Prior>", "action_prev_tab"),
 ]
 
-# Shortcuts scoped to the Terminal console only (bound to that widget, not
-# the whole window) - terminal-like conveniences that only make sense
-# while it has focus. Same (action_id, label, default_accel, method_name)
-# shape as SHORTCUT_SPECS so both share the Settings > Shortcuts UI and
-# the same _capture_accel/accel_display machinery.
+# Shortcuts scoped to the Terminal console only.
 OUTPUT_SHORTCUT_SPECS = [
     ("console_interrupt", "Send Interrupt", "<Control-c>", "_console_send_interrupt"),
 ]
@@ -153,15 +128,7 @@ def _active_tab_attr(name):
 
 
 class BufferTab:
-    """Everything that belongs to one open buffer.
-
-    A tab is either *shared* - it mirrors one of the collaborative documents
-    the session carries (`doc_id`), and only its edits are sent over the
-    network - or local: a plain single-user buffer that peers never see.
-    Any number of tabs can be shared, each bound to its own document. EditorApp shows one tab at a time in its single
-    Text widget and keeps the others' state here, so the rest of the
-    editor (undo, run, save, ...) only ever deals with "the active tab".
-    """
+    """Everything that belongs to one open buffer."""
 
     _ids = itertools.count(1)
 
@@ -180,10 +147,9 @@ class BufferTab:
         self.current_file = None
         self.filename_hint = None
         self.loaded_mtime = None
-        # True once *this user* has typed into the tab - as opposed to
-        # content that merely arrived from a peer. Decides whether the tab
-        # is worth keeping as a local tab when a peer replaces the shared
-        # buffer (see EditorApp._worth_keeping).
+        self.eol = "\n"      # line ending and BOM the file had on disk, restored on save
+        self.bom = False
+        # True once *this user* has typed into the tab - as opposed to content that merely arrived from a peer.
         self.local_edited = False
         self.untitled_no = None
         # Restored when the tab is switched back to.
@@ -215,10 +181,7 @@ class EditorApp(ttk.Frame):
         self.output_shortcuts = dict(self.cfg.setdefault("output_shortcuts", {}))
         self._opened_single_file = bool(initial_file)
 
-        # Open buffers. `_active` is the one shown in the Text widget; the
-        # per-buffer state below (doc, history, current_file, ...) is exposed
-        # as properties that read/write the active tab, so everything that
-        # works on "the current buffer" keeps working unchanged.
+        # Open buffers.
         first_tab = BufferTab(doc_id=MAIN_DOC)
         self._tabs = [first_tab]
         self._active = first_tab
@@ -233,7 +196,7 @@ class EditorApp(ttk.Frame):
         self._suppress_capture = False
         self._highlight_job = None
         self.run_proc = None
-        self.out_queue = queue.Queue()
+        self.out_queue = queue.Queue(maxsize=256)   # bounded: a chatty child blocks instead of flooding the UI
         self._exit_queue = queue.Queue()
         self._proc_exit_expected = False
         self._interrupt_sent = False
@@ -241,9 +204,7 @@ class EditorApp(ttk.Frame):
         self._poll_job = None
         self._console_resize_job = None
         self._known_peer_names = {}
-        # Reconnect UI (see _show_reconnect_ui): the address field that
-        # appears next to the toolbar's Disconnect button once a session
-        # drops, and the token identifying the connection attempt in flight.
+        # Reconnect UI: the address field that appears next to the toolbar's Disconnect button once a session drops.
         self.reconnect_entry = None
         self._reconnect_token = None
         self._reconnect_client = None
@@ -327,10 +288,7 @@ class EditorApp(ttk.Frame):
     _loaded_mtime = _active_tab_attr("loaded_mtime")
 
     def _update_title(self):
-        # Reflects *any* tab having unsaved changes, not just the one
-        # currently on screen - a background tab a peer just dirtied, or
-        # one the user typed into before switching away, shouldn't be
-        # invisible just because it isn't the active tab right now.
+        # Reflects *any* tab having unsaved changes, not just the one currently on screen.
         base = "Peer to Code"
         self.winfo_toplevel().title(f"*{base}*" if self.has_unsaved_tabs() else base)
 
@@ -360,27 +318,7 @@ class EditorApp(ttk.Frame):
         t = self.theme
         a = self._accel
 
-        # On Windows, a menu bar attached the normal way (root.config(menu=))
-        # is drawn by the OS itself, using the system's own menu-bar theme -
-        # tk.Menu's bg/fg options get mostly ignored, and what's left behind
-        # is a thin light-colored border/strip along the bar that no Tk
-        # option can touch, however dark the rest of the window is. Building
-        # the bar ourselves instead - a plain Frame holding a Menubutton per
-        # top-level entry, each posting its dropdown like any other popup
-        # menu - keeps every pixel of it, border included, a normal themed
-        # widget. macOS's menu bar lives outside the window entirely (so
-        # this bug doesn't occur there, and replacing it would also lose
-        # the native Mac menu bar for no benefit), and Linux/X11 already
-        # draws tk.Menu itself and honors these colors - see _theme_menus -
-        # so both keep the native menu bar as before.
-        #
-        # Linux/X11 gets the in-window bar too, for a different reason: a
-        # native X11 menu bar is stacked *on top of* the window rather than
-        # drawn inside it, so attaching it made the whole window one
-        # menubar-height taller (and its contents that much lower) the moment
-        # a session opened, compared with the Connect screen. An in-window
-        # bar can't change the window's size: the status bar and everything
-        # else stays inside the geometry the window was given.
+        # On Windows, a menu bar attached the normal way (root.config) is drawn by the OS itself.
         self._use_custom_menubar = sys.platform.startswith(("win", "linux"))
 
         old_bar = getattr(self, "_custom_menubar", None)
@@ -394,11 +332,7 @@ class EditorApp(ttk.Frame):
         if self._use_custom_menubar:
             root.config(menu="")
             bar = tk.Frame(self, bg=t["bg"], bd=0, highlightthickness=0)
-            # On a rebuild (e.g. after changing shortcuts) the toolbar,
-            # status bar and body are already packed. A plain pack() would
-            # append the bar to the END of the pack order, after the body
-            # has claimed all the space, so it would collapse to nothing.
-            # Insert it ahead of whatever is already packed instead.
+            # On a rebuild (e.g. after changing shortcuts) the toolbar, status bar and body are already packed.
             existing = self.pack_slaves()
             if existing:
                 bar.pack(side="top", fill="x", before=existing[0])
@@ -420,12 +354,7 @@ class EditorApp(ttk.Frame):
             self._custom_menubar = None
             menubar = tk.Menu(root)
             root.config(menu=menubar)
-            # Kept so a later live theme switch can repaint every menu
-            # without rebuilding them (see _theme_menus) - tk.Menu isn't a
-            # ttk widget, so it doesn't pick up style changes automatically,
-            # and unlike a combobox's popdown it also doesn't read the
-            # option database fresh each time it's posted, so it has to be
-            # told directly.
+            # Kept so a later live theme switch can repaint every menu without rebuilding them.
             self._menus.append(menubar)
 
             def add_menu(label):
@@ -497,17 +426,7 @@ class EditorApp(ttk.Frame):
         self._theme_menus(t)
 
     def _theme_menus(self, t):
-        """Repaints every tk.Menu this app owns (the menu bar and each of
-        its dropdowns, including the dynamically-filled "Undo Change By"
-        submenu) to match `t`. tk.Menu is a plain Tk widget, not a ttk
-        one, so restyling "TMenubutton"/etc. never reaches it, and unlike
-        the option-database-driven widgets in theme.apply_classic_widget_
-        defaults, it doesn't reread anything on its own either - it has
-        to be told directly, every time. See _build_menu for why Windows
-        instead gets a custom widget-based bar here (self._menu_buttons)
-        rather than relying on this to reach the native one: Linux/X11
-        draws tk.Menu itself and honors these colors, and macOS draws its
-        menu bar outside the window and mostly ignores them anyway."""
+        """Repaints every tk.Menu this app owns to match `t`."""
         for menu in getattr(self, "_menus", ()):
             try:
                 menu.configure(bg=t["bg"], fg=t["fg"], activebackground=t["sel_bg"],
@@ -555,11 +474,7 @@ class EditorApp(ttk.Frame):
             menu.add_command(label=label, command=lambda t=tab: self.action_show_shared(t))
 
     def _shared_menu_title(self, tab):
-        """Name of a document in View > Shared Buffers. A closed (or just
-        unshared) buffer has no tab on screen, so it must not take an
-        "Untitled-N" number: that number would be remembered on the hidden
-        tab and keep showing in the list after the tab that really holds it
-        was closed or renamed. Only a buffer that is showing gets one."""
+        """Name of a document in View > Shared Buffers."""
         if tab.visible or tab.current_file or (tab.shared and tab.filename_hint):
             return self._tab_base_title(tab)
         return f"Untitled (shared buffer {tab.doc_id})"
@@ -628,7 +543,7 @@ class EditorApp(ttk.Frame):
 
     def apply_theme_live(self, new_theme):
         self.theme = t = new_theme
-        font_family = t.get("font_family", CODE_FONT)
+        font_family = theme.usable_font(t.get("font_family", CODE_FONT))
         self._font_size = int(t.get("font_size", 11))
         self._apply_ttk_style(t)
         toplevel = self.winfo_toplevel()
@@ -661,11 +576,7 @@ class EditorApp(ttk.Frame):
         self.status_right.configure(bg=t["status_bg"], fg=t["status_fg"])
         self.status_left.configure(bg=t["status_bg"], fg=t["status_fg"])
         self._theme_menus(t)
-        # Explorer and Terminal now have fully independent font family
-        # *and* size (see _set_explorer_font_size/_family and
-        # _set_console_font_size/_family) - a theme change updates
-        # colors everywhere, including the console's background here,
-        # but deliberately leaves both panels' own fonts alone.
+        # Explorer and Terminal now have fully independent font family *and* size.
         self.console.configure(bg=t["console_bg"], fg=t["fg"])
         console_tag_colors = _console_tag_colors(t["console_bg"])
         self.console.tag_configure("stderr", foreground=console_tag_colors["stderr"])
@@ -683,7 +594,7 @@ class EditorApp(ttk.Frame):
     def _build_layout(self):
         t = self.theme
         ui_prefs = self.cfg.get("ui", {})
-        font_family = t.get("font_family", CODE_FONT)
+        font_family = theme.usable_font(t.get("font_family", CODE_FONT))
         font_size = int(t.get("font_size", 11))
         self._font_size = int(ui_prefs.get("editor_font_size") or font_size)
         self._console_font_family = ui_prefs.get("console_font_family") or font_family
@@ -723,10 +634,7 @@ class EditorApp(ttk.Frame):
         self.run_cmd_entry.pack(side="left", fill="x", expand=True)
         self.run_cmd.trace_add("write", self._on_run_cmd_edited)
 
-        # width=1 keeps the label's requested size fixed no matter how long
-        # (or how far scrolled) its text is - it just takes whatever room
-        # the toolbar has left. The text itself is scrolled by hand, see
-        # _render_file_path.
+        # width=1 keeps the label's requested size fixed no matter how long its text is.
         self.file_path_label = tk.Label(toolbar, text="", bg=t["bg"], fg=t["muted_fg"], anchor="w", width=1)
         self.file_path_label.pack(side="left", padx=(12, 0), fill="x", expand=True)
         self._path_full_text = ""
@@ -760,9 +668,7 @@ class EditorApp(ttk.Frame):
         center.add(edit_outer, minsize=30, stretch="always")
         self.edit_outer = edit_outer
 
-        # Explorer, Terminal and Chat are dockable panels (see dock.py): each
-        # can sit on the left, right or bottom of the editor, or float in a
-        # window of its own, and the layout is remembered between launches.
+        # Explorer, Terminal and Chat are dockable panels.
         self.dock = DockManager(self, body, center, edit_outer, t, on_visibility=self._on_panel_visibility)
         self.explorer_panel = self.dock.add_panel("explorer")
         self.terminal_panel = self.dock.add_panel("terminal")
@@ -772,10 +678,7 @@ class EditorApp(ttk.Frame):
         self.explorer = FileExplorer(self.explorer_panel.content, self.working_dir, self._open_file_from_explorer,
                                      on_root_change=self._on_explorer_root_change)
         self.explorer.pack(fill="both", expand=True)
-        # A plain sans-serif face reads better for a file tree than
-        # whatever the ttk theme's own default happens to be, and a
-        # touch smaller than the editor/Terminal's own default size
-        # suits a dense list of file names.
+        # A plain sans-serif face reads better for a file tree than whatever the ttk theme's own default happens to be.
         self._explorer_font_family = ui_prefs.get("explorer_font_family") or "sans-serif"
         self._explorer_font_size = int(ui_prefs.get("explorer_font_size") or 9)
         self.explorer.set_font(self._explorer_font_family, self._explorer_font_size)
@@ -844,29 +747,11 @@ class EditorApp(ttk.Frame):
         self.console.tag_configure("prompt", foreground=console_tag_colors["prompt"])
         self.ansi_console = ansi.AnsiConsole(self.console, base_tag_colors=console_tag_colors)
 
-        # A run's prompt (e.g. input(">> ")) is shown right in this same
-        # pane, and the person types their reply directly after it -
-        # same for the $ prompt shown here whenever nothing's running,
-        # where what gets typed and submitted is a command instead of a
-        # reply. "input_start" is the boundary between that settled
-        # output (read-only) and the live, editable tail. See
-        # _on_console_key / _submit_console_input.
+        # A run's input() prompt is shown right in this pane.
         self.console.mark_set("input_start", "end-1c")
-        # Left gravity: text typed exactly at this mark (i.e. right after
-        # a prompt, the common case) must extend past it rather than
-        # push it forward - otherwise every keystroke would silently
-        # widen the "already sent" region to swallow whatever was just
-        # typed, and Enter would always submit an empty line.
+        # Left gravity: text typed exactly at this mark must extend past it rather than push it forward.
         self.console.mark_gravity("input_start", "left")
-        # Backspace/Delete are blocked from crossing input_start in
-        # _on_console_key below, but Tk's Text widget has several other
-        # built-in ways to delete text - Ctrl+X (<<Cut>>), Ctrl+D/Ctrl+H
-        # (its emacs-style bindings), a right-click context menu - that
-        # would otherwise bypass that key-level check entirely. This
-        # catches all of them at once, whatever they're bound to.
-        # Keep the guard's handle on the real Text command: chat/join lines are
-        # inserted *above* the live input line (before input_start), which the
-        # guard would otherwise clamp to input_start. See _console_insert_segments.
+        # Backspace/Delete are blocked from crossing input_start in _on_console_key below.
         self._console_raw_cmd = install_delete_guard(self.console, "input_start")
         self.console.bind("<Key>", self._on_console_key)
         self.console.bind("<<Paste>>", self._on_console_paste)
@@ -899,15 +784,7 @@ class EditorApp(ttk.Frame):
         self._redraw_linenumbers()
 
     def _on_text_yview_changed(self, *args):
-        """The Text widget's yscrollcommand, called on every change to
-        the visible range, not just drags of our own scrollbar: mouse-wheel
-        (Windows/macOS <MouseWheel>), touchpad/wheel on X11 (delivered as
-        <Button-4>/<Button-5>, which Tk's default Text bindings already
-        handle before we ever see them), keyboard navigation, search
-        jumps, etc. Hooking here instead of specific event bindings is what
-        keeps the line-number gutter in sync regardless of *how* the view
-        moved, rather than only for whichever input method we happened to
-        bind."""
+        """The Text widget's yscrollcommand, called on every change to the visible range, not just drags of our own scrollbar."""
         self.yscroll.set(*args)
         self._redraw_linenumbers()
 
@@ -982,11 +859,7 @@ class EditorApp(ttk.Frame):
     _GUTTER_PAD = 8
 
     def _fit_gutter_width(self, font):
-        """Widens the line-number gutter to fit the longest line number at
-        the current font size. The width used to be a fixed 48px, which
-        clipped the numbers once zoomed in far enough (or once the file
-        passed 999 lines). Never narrower than the original width, and
-        only reconfigured when it actually changes."""
+        """Widens the line-number gutter to fit the longest line number at the current font size."""
         try:
             last_line = int(self.text.index("end-1c").split(".")[0])
             digits = max(3, len(str(last_line)))
@@ -999,7 +872,7 @@ class EditorApp(ttk.Frame):
 
     def _redraw_linenumbers(self, *_):
         self.linenumbers.delete("all")
-        gutter_font = (self.theme.get("font_family", CODE_FONT), self._font_size)
+        gutter_font = (theme.usable_font(self.theme.get("font_family", CODE_FONT)), self._font_size)
         self._fit_gutter_width(tkfont.Font(font=gutter_font))
         x_right = int(self.linenumbers.cget("width")) - self._GUTTER_PAD
         i = self.text.index("@0,0")
@@ -1020,27 +893,7 @@ class EditorApp(ttk.Frame):
             self.cursor_layer.refresh()
 
     def _bind_zoom_gestures(self):
-        """Ctrl+scroll wheel (desktop) and pinch (touch/trackpad) each
-        change the font size of whichever of the three panels they're
-        used over - the code editor (together with its line-number
-        gutter, so the two stay in proportion), the Explorer file tree,
-        or the Terminal console - independently of one another. Bound
-        directly on the widgets rather than routed through the
-        remappable SHORTCUT_SPECS/shortcuts config system: these are
-        gestures, not key accelerators, and "on mobile always
-        pinch-to-zoom" means this shouldn't be something a shortcut
-        remap could turn off.
-
-        Caveat, to be upfront about: <<TouchpadPinch>> is only actually
-        *generated* by Tk's own macOS (Aqua) build - vanilla Tk/X11 (which
-        is what Termux's X11 route uses) has no standard event for a
-        genuine two-finger pinch at all, so this binding is a no-op
-        there. Whatever a two-finger touchscreen pinch actually turns
-        into by the time it reaches Tk on that route (typically a burst
-        of synthetic wheel-tick events) is handled by the coalescing in
-        _bind_zoom below instead. Ctrl+scroll is the one guaranteed to
-        work everywhere a wheel/scroll event reaches Tk at all.
-        """
+        """Ctrl+scroll wheel and pinch each change the font size of whichever of the three panels they're used over."""
         self._bind_zoom((self.text, self.linenumbers),
                          lambda steps: self._set_font_size(self._font_size + steps))
         self._bind_zoom((self.explorer.tree,),
@@ -1050,18 +903,7 @@ class EditorApp(ttk.Frame):
                          lambda steps: self._set_console_font_size(self._console_font_size + steps))
 
     def _bind_zoom(self, widgets, zoom_by):
-        """A real pinch or scroll gesture - especially a touchscreen
-        pinch translated into wheel ticks by whatever X server/VNC layer
-        sits between the touch and Tk - can deliver a whole burst of
-        these events within a handful of milliseconds, not just one or
-        two. Applying every single tick immediately meant dozens of full
-        font/style reflows firing back-to-back for one gesture, which is
-        what showed up as the Terminal's scrollbar frantically resizing
-        and the font appearing "stuck" - by the time the eye registered
-        one size, several more had already been applied and half-undone
-        by jitter in the other direction. Coalescing the ticks and
-        applying only their net total after a brief pause fixes that
-        without changing how any single Ctrl+scroll click behaves."""
+        """Coalesce a burst of pinch/wheel events into a single zoom step."""
         state = {"accum": 0, "job": None}
         anchor = widgets[0]
 
@@ -1108,7 +950,7 @@ class EditorApp(ttk.Frame):
         if size == self._font_size:
             return
         self._font_size = size
-        font_family = self.theme.get("font_family", CODE_FONT)
+        font_family = theme.usable_font(self.theme.get("font_family", CODE_FONT))
         self.text.configure(font=(font_family, size))
         self._redraw_linenumbers()
 
@@ -1164,9 +1006,7 @@ class EditorApp(ttk.Frame):
         def fire():
             self._cursor_send_job = None
             if not self._active.shared:
-                # Cursor positions are offsets into the shared document -
-                # meaningless (and confusing for peers) while a local tab
-                # is showing.
+                # Cursor positions are offsets into the shared document - meaningless while a local tab is showing.
                 return
             offset = char_offset(self.text, "insert")
             has_sel = bool(self.text.tag_ranges("sel"))
@@ -1227,13 +1067,7 @@ class EditorApp(ttk.Frame):
             self._run_commands.pop(key, None)
 
     def _recall_run_command(self, language):
-        """Puts the interpreter for `language` into the Interpreter box:
-        the global one when that option is on, else whatever was
-        remembered for this file type, else an auto-detected runner (which
-        then gets remembered too). A file type with nothing remembered or
-        detectable shows an empty box instead of keeping the previous
-        type's command. A remembered command that is just this packaged
-        app's own executable is dropped, since it can't run scripts."""
+        """Puts the interpreter for `language` into the Interpreter box."""
         if self._use_global_interpreter():
             target = self.cfg.get("editor", {}).get("global_interpreter", "")
         else:
@@ -1351,10 +1185,7 @@ class EditorApp(ttk.Frame):
         self._refresh_dirty()
 
     def _apply_full_sync(self, doc_id, text, meta=None):
-        """A shared document's complete text arrived: at join, after a
-        failover or resync (the tab for it already exists - its content is
-        replaced), when someone shares a new document, or as the answer to
-        our own share (the tab we sent already holds this content)."""
+        """A shared document's complete text arrived."""
         meta = meta or {}
         mine = meta.get("by") == self.client.client_id
         tab = self._docs.get(doc_id)
@@ -1412,10 +1243,7 @@ class EditorApp(ttk.Frame):
         return tab
 
     def _open_remote_document(self, doc_id, text, meta):
-        """A document we have no tab for yet. If we already have the very
-        same file open, unshared, with identical content, that tab simply
-        joins the document; otherwise it gets a tab of its own, opened next
-        to the others without taking focus away from what is being typed."""
+        """A document we have no tab for yet."""
         filename = meta.get("filename")
         same = next((t for t in self._tabs
                      if not t.shared and t.pending_ref is None and t.current_file is not None
@@ -1483,9 +1311,7 @@ class EditorApp(ttk.Frame):
             self._redraw_linenumbers()
             self._schedule_highlight()
         else:
-            # The shared buffer isn't on screen (a local tab is, or it's
-            # hidden) - keep its stored copy current so it's right when it
-            # is shown again.
+            # The shared buffer isn't on screen - keep its stored copy current so it's right when it is shown again.
             was_dirty = tab.dirty
             before = tab.doc
             tab.doc = op.apply(before)
@@ -1597,17 +1423,10 @@ class EditorApp(ttk.Frame):
         else:
             self._set_status(text)
 
-    # -- Terminal helpers ----------------------------------------------
+    # Terminal helpers
 
     def _console_insert_segments(self, segs):
-        """Prints plain-text segments *above* the live input line: the
-        process's partial output / the $ prompt and anything typed after it
-        stay exactly as they were, just pushed down, and input_start stays
-        glued to them. Used for everything that can arrive at any moment
-        (shared-run notices and the like), so it never lands in the middle of what
-        the person is typing or of a streaming process's output. Bypasses
-        AnsiConsole entirely: no escape sequence can be interpreted, and a
-        half-received sequence pending in AnsiConsole is left alone."""
+        """Prints plain-text segments *above* the live input line."""
         c = self.console
         line_start = c.index("input_start linestart")
         at_line_start = c.compare(line_start, "==", "input_start")
@@ -1633,17 +1452,7 @@ class EditorApp(ttk.Frame):
         c.mark_set("input_start", "end-1c")
         c.see("end")
 
-    # ------------------------------------------------------------------
-    # Chat
-    #
-    # The Chat panel - a dockable window like the Explorer and the Terminal
-    # - talks to the other people in the session: type a message and press
-    # Enter, or use /p, /r, /who, /mute, /unmute and /help (see chat_util).
-    # Everything a peer sends is sanitized again here (chat_util) and is
-    # drawn with plain Text.insert into a read-only Text widget - never
-    # through AnsiConsole - so nothing a peer types can be interpreted as a
-    # terminal escape sequence.
-    # ------------------------------------------------------------------
+    # Chat panel
 
     CHAT_MAX_LINES = 5000
 
@@ -1707,7 +1516,7 @@ class EditorApp(ttk.Frame):
             self._chat_append(
                 [(f"Name '{sanitize_text(want, 40)}' is taken. You are '{got}'.\n", "info")])
 
-    # -- drawing -------------------------------------------------------
+    # drawing
 
     @staticmethod
     def _tags_arg(tag):
@@ -1716,10 +1525,7 @@ class EditorApp(ttk.Frame):
         return (tag,) if isinstance(tag, str) else tuple(tag)
 
     def _refresh_chat_tags(self, console_bg):
-        """(Re)configures the chat tags for the console background: the
-        colors adapt to light/dark exactly like the console's own tags do
-        (see _console_tag_colors), and each per-peer name tag keeps its
-        peer's assigned color, darkened on a light background."""
+        """Configure chat tags for the console background."""
         light = syntax.brightness(console_bg) >= 0.5
         colors = _console_tag_colors(console_bg)
         c = self.chat_text
@@ -1783,10 +1589,7 @@ class EditorApp(ttk.Frame):
         return segs
 
     def _chat_append(self, segs, force_scroll=False):
-        """Adds [(text, tag)] segments at the end of the Chat panel. The view
-        only follows the new text when it was already at the bottom (or
-        force_scroll, for the person's own messages and command output) so
-        scrolling back through history isn't yanked away by an arrival."""
+        """Adds [(text, tag)] segments at the end of the Chat panel."""
         c = self.chat_text
         at_bottom = c.yview()[1] >= 0.999
         c.configure(state="normal")
@@ -1801,7 +1604,7 @@ class EditorApp(ttk.Frame):
         if force_scroll or at_bottom:
             c.see("end")
 
-    # -- receiving -----------------------------------------------------
+    # receiving
 
     def _chat_muted(self, name, cfg=None):
         cfg = cfg or self._chat_cfg()
@@ -1835,15 +1638,10 @@ class EditorApp(ttk.Frame):
         if not self._chat_is_seen():
             self._chat_note_unread(cfg)
 
-    # -- unread counter ------------------------------------------------
+    # unread counter
 
     def _chat_is_seen(self):
-        """True when a message arriving right now is actually in front of
-        the person: the Chat panel is open AND the editor window is
-        not minimized and has the keyboard focus. An open panel in a
-        window that's minimized or sitting behind another app is not
-        "seen" - that case used to produce no counter, flash or bell at
-        all, so a message could come and go unnoticed."""
+        """True when a message arriving right now is actually in front of the person."""
         if not self.chat_panel.visible:
             return False
         try:
@@ -1909,7 +1707,7 @@ class EditorApp(ttk.Frame):
         else:
             self.toggle_chat()
 
-    # -- sending / commands ---------------------------------------------
+    # sending / commands
 
     def _chat_label_for(self, token):
         if token.startswith("#") and token[1:].isdigit():
@@ -2018,7 +1816,7 @@ class EditorApp(ttk.Frame):
         else:
             self._chat_append([(f"Unmuted {name}.\n", "info")], force_scroll=True)
 
-    # -- links in messages ------------------------------------------------
+    # links in messages
 
     def _follow_chat_ref(self, file, line):
         """Click on `:42` / `file.py:42`: jump to that line. Only ever moves
@@ -2048,7 +1846,7 @@ class EditorApp(ttk.Frame):
         self.text.focus_set()
         self._set_status(f"Jumped to line {n}{note}")
 
-    # -- Tab completion / input history ---------------------------------------
+    # Tab completion / input history
 
     def _on_chat_tab(self, _event=None):
         """Tab after `/p `: completes user names (or #ids) from the roster.
@@ -2107,18 +1905,7 @@ class EditorApp(ttk.Frame):
         self.chat_entry.icursor("end")
         return "break"
 
-    # ------------------------------------------------------------------
-    # Shared run output (phase 2)
-    #
-    # Strictly opt-in by the person running: `share on` at the prompt (or
-    # `/share on` mid-run), or Settings > Chat. It is never saved to the
-    # config, so it is off at every launch. While on, the *output* of runs
-    # started afterwards (stdout/stderr only - never stdin, never the
-    # environment, never the command's arguments) is batched on the existing
-    # 80 ms _poll_output tick and relayed to the others, who see it in a
-    # separate read-only window (shared_output_view). Nothing a viewer does
-    # can reach the runner. See share_util for the wire format and limits.
-    # ------------------------------------------------------------------
+    # Shared run output (opt-in)
 
     def set_share_output(self, on, confirm=False):
         """Turns sharing on/off; returns the resulting state. With confirm=True
@@ -2172,7 +1959,7 @@ class EditorApp(ttk.Frame):
             win.lift()
         return win
 
-    # -- runner side -------------------------------------------------------
+    # runner side
 
     def _share_begin(self, args, shell):
         """Called right after a process started. Announces the run (title =
@@ -2198,7 +1985,7 @@ class EditorApp(ttk.Frame):
         if share:
             self.client.send_share_end(share["run"], share["streamer"].end_seq(), code=code, reason=reason)
 
-    # -- viewer side -------------------------------------------------------
+    # viewer side
 
     def _on_share(self, name, msg):
         self.after(0, lambda: self._show_share(name, msg))
@@ -2300,13 +2087,10 @@ class EditorApp(ttk.Frame):
             self._show_reconnect_ui()
         messagebox.showwarning("Disconnected", reason)
 
-    # -- Reconnect ------------------------------------------------------
+    # Reconnect
 
     def _reconnect_default_address(self):
-        """What to prefill the address field with: whatever this session
-        was started against (the Connect tab's address, or the Peer to
-        Peer tab's Join address), else the address the dropped client was
-        actually talking to."""
+        """What to prefill the address field with."""
         conn = self.cfg.get("connection", {})
         saved = conn.get("address" if self.mode == "client" else "p2p_join_address")
         if saved:
@@ -2361,10 +2145,7 @@ class EditorApp(ttk.Frame):
         if self.mode == "p2p" and self.reconnect_entry.get().strip() == "":
             messagebox.showerror("Missing address", "Enter the address of a peer still in the mesh.")
             return
-        # Reconnecting makes the host re-send every shared document, which
-        # replaces what's in those tabs here - including anything typed
-        # while disconnected that never reached the host. Same Save /
-        # Don't Save / Cancel question as closing or running.
+        # Reconnecting makes the host re-send every shared document, which replaces what's in those tabs here.
         if not self._confirm_discard_all(shared_only=True):
             return
         extra_hello = self._failover.hello_extra(is_sequencer=False) if self._failover is not None else None
@@ -2440,11 +2221,7 @@ class EditorApp(ttk.Frame):
         self.status_left.configure(text=text)
 
     def _persist_ui_state(self):
-        """Remembers the panel layout (which panels are showing, where each
-        is docked or floating, and its size - see dock.DockManager.save),
-        which Connect-screen tab this session started from, and the
-        editor's zoomed-in/out font size, so all of it comes back the
-        same way next time."""
+        """Remembers the panel layout, which Connect-screen tab this session started from."""
         ui = self.cfg.setdefault("ui", {})
         ui["last_tab"] = {"solo": "Open", "p2p": "Peer to Peer"}.get(self.mode, "Connect")
         ui["editor_font_size"] = self._font_size
@@ -2500,15 +2277,7 @@ class EditorApp(ttk.Frame):
         return self._confirm_discard()
 
     def _confirm_discard_all(self, shared_only=False):
-        """Gate before anything that would throw away every open buffer at
-        once (Disconnect/Close, the window's own close button). One
-        unsaved tab gets exactly the normal single-buffer "Save changes?"
-        prompt (_confirm_discard_tab) - no point asking "save them all?"
-        about one thing. More than one gets a single combined prompt
-        instead of one dialog per tab, and a Yes saves them all via
-        save_all_tabs(). `shared_only` limits it to the shared tabs -
-        the ones a reconnect's resync replaces - leaving local-only
-        buffers out of the question."""
+        """Gate before anything that would throw away every open buffer at once (Disconnect/Close, the window's own close button)."""
         unsaved = [tab for tab in self.visible_tabs if tab.dirty and (tab.shared or not shared_only)]
         if not unsaved:
             return True
@@ -2527,13 +2296,7 @@ class EditorApp(ttk.Frame):
         return any(tab.dirty for tab in self.visible_tabs)
 
     def save_all_tabs(self, tabs=None):
-        """Saves every unsaved tab (or just those in `tabs`), returning
-        False if any of them ended up still unsaved. Tabs that already
-        have a file are saved first, silently - then whatever's left
-        (untitled buffers, each needing its own Save As dialog) is
-        prompted for in tab order, so a stack of "Save As" dialogs
-        doesn't get interrupted by a save that should have been silent
-        to begin with."""
+        """Saves every unsaved tab (or just those in `tabs`), returning False if any of them ended up still unsaved."""
         unsaved = [tab for tab in (self.visible_tabs if tabs is None else tabs) if tab.dirty]
         already_named = [tab for tab in unsaved if tab.current_file]
         untitled = [tab for tab in unsaved if not tab.current_file]
@@ -2545,18 +2308,7 @@ class EditorApp(ttk.Frame):
         return True
 
     def _confirm_discard(self):
-        """Gate before anything that would throw away the active buffer
-        (closing its tab, Disconnect/Close). Offers Save / Don't Save / Cancel
-        rather than a blunt Discard/Keep choice - "Save changes?" with
-        Yes meaning save (the safe, non-destructive default) rather than
-        a "Discard unsaved changes?" dialog where Yes was the destructive
-        option, which is easy to click on reflex and lose work to. Also
-        adds a genuine Cancel, matching how "Save before quitting?"
-        already behaves.
-        Returns True once it's actually safe to proceed (saved, or the
-        person explicitly chose to discard); False if they cancelled, or
-        chose to save but the save didn't actually go through (e.g. a
-        Save As they then cancelled, or a write that failed)."""
+        """Gate before anything that would throw away the active buffer (closing its tab, Disconnect/Close)."""
         if not self.dirty:
             return True
         choice = messagebox.askyesnocancel(
@@ -2569,13 +2321,7 @@ class EditorApp(ttk.Frame):
         return True
 
     def _share_hint_for(self, path):
-        """Computes what to broadcast to peers as the shared buffer's
-        filename: a path relative to the working directory when the file
-        is actually inside it - giving peers useful context (e.g.
-        'src/main.py', the path under the top folder shown in Explorer)
-        without revealing where that folder actually lives - or just the
-        bare filename otherwise. Never the full local absolute path, which
-        could expose personal directory structure to other peers."""
+        """Computes what to broadcast to peers as the shared buffer's filename."""
         try:
             rel = os.path.relpath(path, self.working_dir)
         except ValueError:
@@ -2585,10 +2331,7 @@ class EditorApp(ttk.Frame):
         return os.path.basename(path)
 
     def _update_file_path_label(self):
-        """Shown next to the interpreter box. Only the person who actually
-        opened the active file locally sees its real absolute path - for
-        everyone else it shows whatever privacy-scoped hint the opener's
-        client broadcast (see _share_hint_for)."""
+        """Shown next to the interpreter box."""
         if self.current_file:
             text = self.current_file
         elif self.active_filename_hint:
@@ -2659,11 +2402,7 @@ class EditorApp(ttk.Frame):
         self._switch_to(tab)
 
     def action_open(self):
-        """Opens a file or a directory - Tkinter has no built-in picker
-        that handles both, so this asks which kind first, then shows the
-        matching native dialog. Opening a directory switches the working
-        directory (see _switch_working_dir), the same as picking one on
-        the Open tab, or dropping a folder onto Explorer."""
+        """Opens a file or a directory - Tkinter has no built-in picker that handles both, so this asks which kind first."""
         choice = self._prompt_file_or_directory()
         if choice is None:
             return
@@ -2728,16 +2467,7 @@ class EditorApp(ttk.Frame):
         return None
 
     def _load_file(self, path, into_shared=False):
-        """Opens `path` in its own new local tab (or focuses the tab that
-        already has it) - it is NOT sent to peers; right-click the tab >
-        Share for that. `into_shared` is for the file a session was
-        started with, which is meant to be the shared buffer from the
-        start. Opening a file over a still-untouched shared tab (nobody's
-        typed into it or put a file in it - true whether that's a Solo
-        session's only tab, or the still-blank buffer a host or peer
-        hasn't done anything with yet) just fills that tab and makes the
-        opened file the shared one, instead of leaving an empty, useless
-        tab sitting around next to it."""
+        """Opens `path` in its own new local tab - it is NOT sent to peers; right-click the tab > Share for that."""
         existing = self._find_tab_for_path(path)
         if existing is not None:
             if into_shared:
@@ -2746,18 +2476,19 @@ class EditorApp(ttk.Frame):
                 self._switch_to(existing)
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except (OSError, UnicodeDecodeError) as e:
+            content, eol, bom = fileio.read_text(path)
+        except UnicodeDecodeError:
+            messagebox.showerror("Open File", f"'{os.path.basename(path)}' is not a UTF-8 text file.")
+            return
+        except OSError as e:
             messagebox.showerror("Open File", str(e))
             return
         tab = BufferTab(doc=content)
+        tab.eol, tab.bom = eol, bom
         tab.current_file = path
         tab.loaded_mtime = self._safe_mtime(path)
         tab.filename_hint = self._share_hint_for(path)
-        # An empty, never-saved local tab that's on screen is just a
-        # placeholder - the opened file takes its place (same slot in the
-        # strip) instead of leaving it sitting there.
+        # An empty, never-saved local tab that's on screen is just a placeholder.
         blank = self._active if self._is_blank_local_tab(self._active) else None
         self._tabs.append(tab)
         if blank is not None:
@@ -2782,11 +2513,14 @@ class EditorApp(ttk.Frame):
         self._write_to(self.current_file)
 
     def action_save_as(self):
-        path = filedialog.asksaveasfilename(initialdir=self.working_dir, defaultextension=".py")
-        if not path:
+        current = self.current_file
+        path = filedialog.asksaveasfilename(
+            initialdir=os.path.dirname(current) if current else self.working_dir,
+            initialfile=os.path.basename(current) if current else "",
+            defaultextension="" if current else ".py")
+        if not path or not self._write_to(path):
             return
         self.current_file = path
-        self._write_to(path)
         self.explorer.refresh()
         self.active_filename_hint = self._share_hint_for(path)
         if self._active.shared:
@@ -2816,17 +2550,18 @@ class EditorApp(ttk.Frame):
         return True
 
     def _write_to(self, path):
+        """Save the buffer to path; returns False (after reporting) on failure."""
         content = self.text.get("1.0", "end-1c")
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except OSError as e:
+            fileio.write_text(path, content, self._active.eol, self._active.bom)
+        except (OSError, ValueError) as e:
             messagebox.showerror("Save", str(e))
-            return
+            return False
         self._saved_doc = content
         self._refresh_dirty()
         self._loaded_mtime = self._safe_mtime(path)
         self._update_cursor_status()
+        return True
 
     def action_reveal(self):
         try:
@@ -2840,11 +2575,7 @@ class EditorApp(ttk.Frame):
             messagebox.showerror("Open Working Directory", str(e))
 
     def action_copy_invite_address(self):
-        """Puts the address someone else needs to Join this mesh on the
-        clipboard - advertise_host:advertise_port, the same value shown in
-        the Peer to Peer tab's Address field once Start/Join found it (via
-        STUN, if a public one was reachable) and is what this peer told
-        the mesh to reach it at."""
+        """Puts the address someone else needs to Join this mesh on the clipboard."""
         host, port = self.p2p_advertise
         addr = f"{host}:{port}"
         self.clipboard_clear()
@@ -2855,13 +2586,7 @@ class EditorApp(ttk.Frame):
         self.after(0, lambda: self._handle_buffer_context(payload))
 
     def _handle_buffer_context(self, payload):
-        """Tells us the *name* the shared buffer now goes by - for syntax
-        highlighting and the tab title - and (for late joiners, and after
-        a peer's Save As) that's all it is. Whether the shared buffer was
-        actually replaced with a different document is decided by the
-        "swap" marker riding on the op itself (see _begin_remote_swap),
-        which - unlike this separate message - is guaranteed to arrive in
-        order with the edits."""
+        """A peer changed the shared buffer's filename (drives highlighting and the tab title)."""
         filename = payload.get("filename")
         by = payload.get("by")
         tab = self._docs.get(payload.get("doc", MAIN_DOC))
@@ -2879,16 +2604,7 @@ class EditorApp(ttk.Frame):
         label = sanitize_text(filename, 200) if filename else "a blank buffer"
         self._chat_append([(f"{sanitize_name(who)} loaded {label} into a shared buffer\n", "info")])
 
-    # ------------------------------------------------------------------
     # Buffer tabs
-    #
-    # Model: every open buffer is a BufferTab. Exactly one is the shared
-    # tab (cloud icon) and mirrors the session's collaborative document;
-    # the rest are local. One Text widget shows whichever tab is active -
-    # switching stores the outgoing tab's caret/scroll and loads the
-    # incoming tab's text. Remote edits always go to the shared tab (into
-    # the widget if it's showing, into its stored copy if not).
-    # ------------------------------------------------------------------
 
     @property
     def visible_tabs(self):
@@ -2924,10 +2640,7 @@ class EditorApp(ttk.Frame):
         return n
 
     def _refresh_tabs(self):
-        # Any refresh of the tab strip is a good time to also recheck the
-        # window-title asterisk, since it depends on every tab's dirty
-        # state (see _update_title) and not just the active one - this
-        # covers e.g. a background tab a peer's edit just dirtied.
+        # Any refresh of the tab strip is a good time to also recheck the window-title asterisk.
         self._update_title()
         bar = getattr(self, "tabbar", None)
         if bar is None:
@@ -3054,10 +2767,7 @@ class EditorApp(ttk.Frame):
         tabs = self.visible_tabs
         index = tabs.index(tab) if tab in tabs else 0
         if tab.shared:
-            # The session's document has to keep being tracked, so a shared
-            # tab can't really go away - it's just hidden (bring it back
-            # with View > Shared Buffers, or when a peer replaces its
-            # content). Closing it also ends any file association.
+            # The session's document has to keep being tracked, so a shared tab can't really go away - it's just hidden.
             tab.visible = False
             tab.current_file = None
             tab.loaded_mtime = None
@@ -3162,18 +2872,7 @@ class EditorApp(ttk.Frame):
         if tab.shared and self.mode != "solo":
             menu.add_command(label="Clear Shared Buffer...", command=lambda: self._clear_shared_tab(tab))
         menu.add_command(label="Close", command=lambda: self.close_tab(tab))
-        # tk_popup()'s own local grab is enough to dismiss the menu on a
-        # click inside this window, but it doesn't reliably catch the
-        # pointer leaving the app entirely (clicking another window,
-        # alt-tabbing away) - on several window managers that leaves the
-        # popup's override-redirect toplevel stuck on screen with nothing
-        # left to unpost it. Binding <FocusOut> covers that case
-        # explicitly. <Unmap> fires once the menu *has* gone away, however
-        # that happened (an item picked, Escape, or the FocusOut above),
-        # and is the safe point to destroy it - Tk still delivers any
-        # picked entry's command afterwards, since that's just a bound
-        # Python callable rather than anything that needs the (by-then
-        # unposted) menu widget to still exist.
+        # tk_popup's own local grab is enough to dismiss the menu on a click inside this window.
         menu.bind("<FocusOut>", lambda _e: menu.unpost())
         menu.bind("<Unmap>", lambda _e: self.after_idle(self._destroy_tab_menu, menu))
         try:
@@ -3198,16 +2897,7 @@ class EditorApp(ttk.Frame):
         self._make_shared(tab)
 
     def _make_shared(self, tab):
-        """Shares `tab` with the session as a document of its own. Every
-        peer gets a tab for it - or, where they already have the same file
-        open with identical content, that tab joins in - and the buffers
-        already being shared stay exactly as they are.
-
-        The one exception is a still-untouched placeholder shared tab (the
-        blank buffer a session starts with): instead of leaving that empty
-        tab sitting around next to the new one, `tab` takes its document
-        over, sent as a buffer swap so a peer who did put something in the
-        placeholder keeps it as a local tab."""
+        """Shares `tab` with the session as a document of its own."""
         hint = self._hint_for_tab(tab)
         placeholder = self._pristine_shared_tab()
         if placeholder is not None and placeholder is not tab:
@@ -3235,10 +2925,7 @@ class EditorApp(ttk.Frame):
             self._switch_to(tab)
 
     def unshare_tab(self, tab):
-        """Stops sharing `tab`: it becomes an ordinary local tab holding
-        what it holds now. This peer forgets the document completely (it
-        no longer appears under View > Shared Buffers and peers' further
-        changes to it are ignored here); it carries on for everyone else."""
+        """Stops sharing `tab`: it becomes an ordinary local tab holding what it holds now."""
         if self.mode == "solo" or not tab.shared:
             return
         doc_id = tab.doc_id
@@ -3253,13 +2940,7 @@ class EditorApp(ttk.Frame):
         self._set_status("Unshared. This tab is now local.")
 
     def _begin_remote_swap(self, doc_id, swap, author):
-        """A peer replaced the content of shared document `doc_id` with a
-        different document (the op that's about to be applied carries
-        `swap`). If we had a file open in its tab - or typed into it - keep
-        that as a local tab exactly as it is right now, and let a new shared
-        tab take over the document; the incoming op then turns that new tab
-        into the peer's buffer. Runs *before* the op is applied, so the
-        local tab really does keep our old content."""
+        """A peer replaced the content of shared document `doc_id` with a different document."""
         old = self._docs[doc_id]
         new_hint = swap.get("filename")
         # Both of us have the same file open -> keep working on it here.
@@ -3276,28 +2957,11 @@ class EditorApp(ttk.Frame):
             old.visible = True
             old.filename_hint = new_hint
             old.local_edited = old.local_edited and same_file
-        # Peer cursors are offsets into a shared document, so whichever
-        # tab is on screen now, the layer has to show the document *that*
-        # tab holds (or nothing, if it just stopped being shared) - not
-        # just in the branch above, which only reassigns the document's
-        # tab in the "demoted" case. Recomputing it unconditionally keeps a
-        # peer's cursor from lingering, mispositioned, in a tab that just
-        # stopped being shared.
+        # Peer cursors are offsets into a shared document, so whichever tab is on screen now.
         self.cursor_layer.set_doc(self._active.doc_id)
 
     def _prepare_run_target(self):
-        """Returns (cmd, target, is_temp) for the buffer to run, or None
-        (after showing an error, or the user declining a save prompt) if
-        it couldn't be prepared. A buffer that's already saved and clean
-        runs straight from its own file; a dirty one is saved back to
-        that same file first (so what runs matches what's on screen,
-        the same "save before run" most editors do, but only after the
-        user agrees to it) rather than forked off into a second,
-        untracked copy sitting next to it. Only a
-        buffer that was never saved anywhere - so there's no file to
-        run - falls back to a temp file, and even then it's written to
-        the OS temp directory rather than the project folder, and
-        removed again once the run finishes (see _watch_run_proc)."""
+        """Return (command, path, is_temp) for the buffer to run, or None if it can't be prepared."""
         cmd = self.run_cmd.get().strip()
         if not interpreters.is_valid(cmd, self.working_dir):
             if self._ask_set_interpreter():
@@ -3317,10 +2981,7 @@ class EditorApp(ttk.Frame):
                     return cmd, self.current_file, False
                 self.action_save()
                 if self.dirty:
-                    # action_save can no-op (declined an external-change
-                    # prompt) or fail (write error, already reported by
-                    # action_save itself) - either way there's nothing
-                    # safe to run.
+                    # action_save can no-op or fail - either way there's nothing safe to run.
                     return None
             return cmd, self.current_file, False
 
@@ -3383,17 +3044,7 @@ class EditorApp(ttk.Frame):
             pass
 
     def _run_terminal_command(self, command):
-        """Runs a line typed straight at the Terminal's own $ prompt as a
-        plain system command - `ls`, `git status`, `pip install x`,
-        anything, not just this project's file - the same as typing it
-        into any other terminal. Goes through a shell (needed for
-        pipes, globbing, and builtins like `cd`) via the exact same
-        process machinery the Run button uses (_launch_process: live
-        streaming, selection-aware Ctrl+C, exit reporting), rather than a
-        single blocking subprocess.run() call, which would freeze this
-        whole app for as long as the command runs and couldn't be
-        interrupted or show output as it happens - the opposite of
-        "behave like a terminal"."""
+        """Runs a line typed straight at the Terminal's own $ prompt as a plain system command."""
         try:
             share = parse_share_command(command)
         except ValueError as err:
@@ -3411,44 +3062,9 @@ class EditorApp(ttk.Frame):
         self._launch_process(command, shell=True)
 
     def _launch_process(self, args, shell=False, cleanup_path=None):
-        """Actually starts args - either an argv list (Run button) or a
-        single shell command string (shell=True, a line typed at the
-        Terminal's own prompt) - as run_proc, and wires up the pump/
-        watch machinery every run shares regardless of how it started.
-        cleanup_path, when given (an unsaved buffer's temp file - see
-        _prepare_run_target), is removed once the process ends, or right
-        away if it never managed to start."""
-        # A separate process group so Ctrl+C can be sent to just the
-        # child later - without this it would also land on our own
-        # process. On Windows that's CREATE_NEW_PROCESS_GROUP (console
-        # control events go to every process sharing the group). On
-        # POSIX it's start_new_session=True (== os.setsid()): otherwise
-        # the child inherits *our* foreground process group, and when
-        # this app is itself running under a real terminal (a Termux
-        # session behind Termux:X11, an SSH session, etc.), a Ctrl+C
-        # typed into that terminal is delivered by the kernel straight
-        # to every process in the group - killing the child directly,
-        # no matter what has focus in our own GUI, before our own
-        # selection-aware Ctrl+C handling ever gets a say.
-        is_windows = sys.platform.startswith("win")
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if is_windows else 0
-        # bufsize=1 above only affects how *we* read the pipe. It says
-        # nothing about the child itself: since its stdout isn't a tty,
-        # a Python child defaults to full block buffering there, so
-        # prints (e.g. from a script that then sits in a tkinter
-        # mainloop) don't cross the pipe until the buffer fills or the
-        # process exits - looking like the terminal only "wakes up"
-        # once the run finishes. PYTHONUNBUFFERED forces it unbuffered.
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+        """Actually starts args - either an argv list or a single shell command string."""
         try:
-            self.run_proc = subprocess.Popen(
-                args, cwd=self.working_dir, shell=shell,
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
-                creationflags=creationflags,
-                start_new_session=(not is_windows),
-                env=env,
-            )
+            self.run_proc = procutil.spawn(args, self.working_dir, shell=shell)
         except OSError as e:
             self._ensure_newline()
             self._console_write(f"Failed to launch: {e}\n", "stderr")
@@ -3461,24 +3077,13 @@ class EditorApp(ttk.Frame):
             return
         self._proc_exit_expected = False
         self._interrupt_sent = False
-        threading.Thread(target=self._pump_stream, args=(self.run_proc.stdout, False), daemon=True).start()
-        threading.Thread(target=self._pump_stream, args=(self.run_proc.stderr, True), daemon=True).start()
+        for stream, is_err in ((self.run_proc.stdout, False), (self.run_proc.stderr, True)):
+            threading.Thread(target=procutil.pump, args=(stream, is_err, self.out_queue), daemon=True).start()
         threading.Thread(target=self._watch_run_proc, args=(self.run_proc, cleanup_path), daemon=True).start()
         self._share_begin(args, shell)
 
     def _watch_run_proc(self, proc, cleanup_path=None):
-        """Waits (off the main thread - proc.wait() blocks) for this run
-        to actually end, how ever it ends: normal exit, our own Stop or
-        interrupt, or - the thing we actually can't see any other way -
-        something outside this app killing it directly (a stray terminal
-        signal delivered to the child's process/session despite the
-        isolation in _launch_process, another process sending it a
-        signal, etc.). cleanup_path is removed once it does, regardless
-        of which of those it was, so an unsaved buffer's temp file (see
-        _prepare_run_target) never outlives the run it was made for.
-        Only enqueues a report for the run this thread was started for,
-        so a stale watcher from a previous run can't report on top of a
-        new one that's since started."""
+        """Waits (off the main thread - proc.wait blocks) for this run to actually end, how ever it ends."""
         returncode = proc.wait()
         if cleanup_path:
             try:
@@ -3494,26 +3099,13 @@ class EditorApp(ttk.Frame):
         return self.cfg.get("editor", {}).get("terminal_messages", {}).get(key, True)
 
     def _report_proc_exit(self, returncode):
-        """Describes how a run ended, in the same spot [stopped] and
-        [interrupted] print. Skipped when we ourselves asked for the
-        exit (action_stop/_interrupt_run_proc already said so); shown
-        otherwise so an exit neither of those caused - the mysterious
-        case - is at least visible instead of the console just going
-        quiet with no explanation. Either way, a fresh $ prompt follows -
-        every run ends back at the prompt, the same as any terminal,
-        whether it was launched from the Run button or typed here."""
-        # An interrupt only explains the exit if the script actually died of
-        # it (killed by SIGINT, shell-style 130, Windows' Ctrl+C status). A
-        # script that caught the interrupt and then finished on its own
-        # still gets its normal [finished].
+        """Describes how a run ended, in the same spot [stopped] and [interrupted] print."""
+        # An interrupt only explains the exit if the script actually died of it.
         died_of_interrupt = self._interrupt_sent and (
             returncode < 0 or returncode in (130, 3221225786))
         if not (self._proc_exit_expected or died_of_interrupt):
             if returncode < 0 and not sys.platform.startswith("win"):
-                # An external, unexplained kill - always reported
-                # regardless of the [finished] toggle below, since it's
-                # the "otherwise the console just goes quiet with no
-                # explanation" case this whole method exists for.
+                # An external, unexplained kill - always reported regardless of the [finished] toggle below.
                 try:
                     sig_name = signal.Signals(-returncode).name
                 except ValueError:
@@ -3527,16 +3119,7 @@ class EditorApp(ttk.Frame):
         self._show_prompt()
 
     def _ensure_newline(self):
-        """Makes sure whatever gets written next starts on its own line -
-        but without forcing a full blank line above it when the console
-        is already sitting at the start of one (the common case, since
-        output almost always ends with its own trailing newline already).
-        Used before every one-line status message ([finished], [stopped],
-        [interrupted], a $ prompt, a Run-button command echo) instead of
-        each of them unconditionally prefixing "\\n", which is what
-        produced a stray blank line both above *and* below [finished]:
-        its own leading "\\n" made one, and the next prompt's leading
-        "\\n" made a second."""
+        """Makes sure whatever gets written next starts on its own line."""
         self.ansi_console.flush()
         if self.console.index("end-1c") == "1.0":
             return
@@ -3552,34 +3135,30 @@ class EditorApp(ttk.Frame):
         self._console_history_pos = None
 
     def action_stop(self):
-        if self.run_proc and self.run_proc.poll() is None:
+        proc = self.run_proc
+        if proc and proc.poll() is None:
             self._proc_exit_expected = True
-            self.run_proc.terminate()
+            procutil.stop(proc)
+            self.after(2000, lambda: procutil.stop(proc, force=True))   # no-op if it already exited
             if self._terminal_message_enabled("stopped"):
                 self._ensure_newline()
                 self._console_write("[stopped]\n", "info")
 
-    def _pump_stream(self, stream, is_err):
-        """Reads one character at a time rather than by line: a script
-        blocked on input(">> ") has already written and flushed that
-        prompt, but it has no trailing newline, so readline() would sit
-        waiting forever and the prompt would never reach the console.
-        Reading a fixed (small) size instead returns as soon as whatever
-        is currently available shows up, prompt included."""
-        for ch in iter(lambda: stream.read(1), ""):
-            self.out_queue.put((ch, is_err))
-        stream.close()
+    def stop_run(self):
+        """Kill the running process tree now (used when the app closes)."""
+        if self.run_proc and self.run_proc.poll() is None:
+            self._proc_exit_expected = True
+            procutil.stop(self.run_proc, force=True)
 
     def _poll_output(self):
         self._drain_out_queue()
         try:
             while True:
                 returncode = self._exit_queue.get_nowait()
-                # The pump threads may still have the run's last bytes in
-                # flight when the exit is noticed: take whatever is queued so
-                # output always precedes the [finished] line (and the end of
-                # a shared run).
-                self._drain_out_queue()
+                for _ in range(50):     # the last output must precede [finished]
+                    if self.out_queue.empty():
+                        break
+                    self._drain_out_queue()
                 self._share_stop("", code=returncode)
                 self._report_proc_exit(returncode)
         except queue.Empty:
@@ -3587,22 +3166,21 @@ class EditorApp(ttk.Frame):
         self._share_tick()
         self._poll_job = self.after(80, self._poll_output)
 
-    def _drain_out_queue(self):
-        buf = []
-        cur_tag = None
-        shared = []
-        try:
-            while True:
-                ch, is_err = self.out_queue.get_nowait()
-                shared.append((is_err, ch))
-                tag = "stderr" if is_err else None
-                if buf and tag != cur_tag:
-                    self._console_write("".join(buf), cur_tag)
-                    buf = []
-                cur_tag = tag
-                buf.append(ch)
-        except queue.Empty:
-            pass
+    def _drain_out_queue(self, limit=64):
+        """Write queued output to the console; at most `limit` chunks per tick keeps the UI responsive."""
+        buf, cur_tag, shared = [], None, []
+        for _ in range(limit):
+            try:
+                chunk, is_err = self.out_queue.get_nowait()
+            except queue.Empty:
+                break
+            shared.append((is_err, chunk))
+            tag = "stderr" if is_err else None
+            if buf and tag != cur_tag:
+                self._console_write("".join(buf), cur_tag)
+                buf = []
+            cur_tag = tag
+            buf.append(chunk)
         if buf:
             self._console_write("".join(buf), cur_tag)
         self._share_output(shared)      # one batch per tick, in arrival order
@@ -3626,17 +3204,7 @@ class EditorApp(ttk.Frame):
     def _console_write(self, text, tag=None):
         self.ansi_console.write(text, tag)
         self.console.see("end")
-        # Everything just written becomes settled history - the live,
-        # editable tail (where a typed reply, or a command at the $
-        # prompt, lives) always starts fresh right after it. See
-        # _on_console_key.
-        #
-        # "end-1c", not "end": a Tk Text widget always has an implicit
-        # trailing newline past the last real character, so plain "end"
-        # points one (phantom, empty) line further than the text actually
-        # written - using it here would leave input_start permanently one
-        # line ahead of the content, silently sending an empty line to
-        # the running process's stdin no matter what was typed.
+        # Everything just written becomes settled history - the live, editable tail always starts fresh right after it.
         self.console.mark_set("input_start", "end-1c")
 
     def _on_console_key(self, event):
@@ -3671,15 +3239,7 @@ class EditorApp(ttk.Frame):
         return None
 
     def _on_console_tab(self, event):
-        """Tab, in the Terminal console: completes the path fragment
-        under the cursor against real files/directories, the same as
-        any Linux shell's filename completion - one match completes it
-        (with a trailing / for a directory, so completion can continue
-        into it); several matches complete as far as their common
-        prefix goes, or list every candidate (like a second Tab in bash)
-        once there's nothing left to add automatically. Only applies
-        while idle at the $ prompt - not while a script is running and
-        this tail is a reply being typed for its stdin instead."""
+        """Tab, in the Terminal console: completes the path fragment under the cursor against real files/directories."""
         if self.run_proc and self.run_proc.poll() is None:
             return None
         cursor = self.console.index("insert")
@@ -3716,10 +3276,7 @@ class EditorApp(ttk.Frame):
             if len(common) > len(partial):
                 completed, suffix = common, ""
             else:
-                # Nothing left to auto-complete with several candidates
-                # still matching - list them, the same as a second Tab
-                # press would in bash, then restore the prompt with
-                # whatever was already typed so typing can continue.
+                # Nothing left to auto-complete with several candidates still matching.
                 self._ensure_newline()
                 self._console_write("  ".join(displayed(n) for n in candidates) + "\n", "info")
                 self._show_prompt()
@@ -3732,15 +3289,7 @@ class EditorApp(ttk.Frame):
         return "break"
 
     def _on_console_history(self, event):
-        """Up/Down at the console's own $ prompt: walks backward/forward
-        through commands previously run there, the same as a shell's
-        readline history. Scoped the same way Tab-completion above is -
-        only while idle at the $ prompt (a running process doesn't have
-        a command history to walk, just whatever reply is being typed
-        for its stdin) and only while the cursor is actually on that
-        live tail, so arrowing up through old *output* to look at it, or
-        to select/copy something, still just moves the cursor as usual
-        instead of being hijacked."""
+        """Up/Down at the $ prompt browse command history."""
         if self.run_proc and self.run_proc.poll() is None:
             return None
         cursor = self.console.index("insert")
@@ -3777,11 +3326,7 @@ class EditorApp(ttk.Frame):
         self.console.see("end")
 
     def _submit_console_input(self):
-        """Enter, in the Terminal console: sends the typed tail (since
-        "input_start") to the running process's stdin if something's
-        running - for scripts that call input(), prompt for a password,
-        etc. - or, when idle, runs it as a system command instead, right
-        at the console's own $ prompt, same as any real terminal."""
+        """Enter, in the Terminal console: sends the typed tail to the running process's stdin if something's running."""
         running = bool(self.run_proc and self.run_proc.poll() is None)
         text = self.console.get("input_start", "end-1c")
         self.console.insert("end", "\n")
@@ -3796,13 +3341,7 @@ class EditorApp(ttk.Frame):
             if share is not None:
                 self._share_command(share)
                 return
-            if not self.run_proc.stdin:
-                return
-            try:
-                self.run_proc.stdin.write(text + "\n")
-                self.run_proc.stdin.flush()
-            except (OSError, ValueError):
-                return
+            procutil.send_line(self.run_proc, text)
             return
         command = text.strip()
         if not command:
@@ -3826,15 +3365,7 @@ class EditorApp(ttk.Frame):
             return "break"
         if not clip:
             return "break"
-        # Normalize line endings before inserting. Clipboard content that
-        # came from Windows (or was copied from a file with CRLF endings)
-        # commonly uses "\r\n", and some sources use a lone "\r" - Tk's
-        # Text widget treats those as literal characters rather than line
-        # breaks, so without this every pasted line would carry a stray
-        # control character at its end. That breaks anything downstream
-        # that works line-by-line: leading-whitespace/indent math,
-        # trailing-whitespace display, and the peer sync char-offset
-        # accounting all assume "\n" is the only line separator.
+        # Normalize line endings before inserting.
         clip = clip.replace("\r\n", "\n").replace("\r", "\n")
         with self._single_undo_step():
             if text.tag_ranges("sel"):
@@ -3918,13 +3449,7 @@ class EditorApp(ttk.Frame):
         return "break"
 
     def _selection_line_range(self):
-        """Returns (start_line, end_line) ints for the current selection,
-        or None if there isn't one. Checked two ways on purpose: most Tk
-        builds raise TclError from text.index("sel.first") when nothing
-        is selected, but at least one build out there (seen via Termux's
-        Python 3.13) just returns an empty string instead - int('') then
-        blows up with an uncaught ValueError. Handle both so indent/
-        dedent never crash just because nothing's selected."""
+        """Returns (start_line, end_line) ints for the current selection, or None if there isn't one."""
         try:
             first = self.text.index("sel.first")
             last = self.text.index("sel.last")
@@ -3937,12 +3462,7 @@ class EditorApp(ttk.Frame):
     def action_indent(self, event=None):
         sel = self._selection_line_range()
         if sel is None:
-            # No selection: pad to the next tab-stop rather than always
-            # inserting a flat INDENT_WIDTH block, so Tab lands on the
-            # same aligned columns (4, 8, 12, ...) regardless of where in
-            # the line the cursor happens to be - matching Tab in VS
-            # Code/Sublime/etc. rather than always adding exactly 4
-            # characters even from an already-misaligned column.
+            # No selection: pad to the next tab-stop rather than always inserting a flat INDENT_WIDTH block.
             col = int(self.text.index("insert").split(".")[1])
             pad = INDENT_WIDTH - (col % INDENT_WIDTH)
             self.text.insert("insert", " " * pad)
@@ -3974,12 +3494,7 @@ class EditorApp(ttk.Frame):
         return line_text[:len(line_text) - len(line_text.lstrip(" \t"))]
 
     def _matching_bracket_index(self, before_text, close_char):
-        """Scans `before_text` (everything in the buffer up to some
-        position) backward for the opener that `close_char` would match
-        if inserted right after it, tracking nesting depth of that one
-        bracket type only. Returns a character offset into `before_text`,
-        or None if there's no unmatched opener - e.g. a stray ')' with
-        nothing open, or genuinely balanced code with no gap to fill."""
+        """Scans `before_text` backward for the opener that `close_char` would match if inserted right after it."""
         open_char = _CLOSE_TO_OPEN[close_char]
         depth = 0
         i = len(before_text) - 1
@@ -3995,27 +3510,7 @@ class EditorApp(ttk.Frame):
         return None
 
     def _on_text_return(self, event=None):
-        """Auto-indent, the way every mainstream code editor does it:
-        - A new line starts at the same indent level as the line it was
-          split from, rather than snapping back to column 0.
-        - One extra level is added when the line up to the cursor ends
-          with something that conventionally opens a new block (':',
-          '{', '(', '[') - covers Python's colon-based blocks and
-          brace/paren-based blocks in most of this editor's other
-          languages without needing per-language grammar.
-        - Pressing Enter with the cursor sitting directly between a
-          matching bracket pair ('{|}', '(|)', '[|]', nothing typed
-          between them yet) splits it into three lines instead of one,
-          with the cursor indented a level deeper and the closing
-          bracket left behind at the original indent - e.g. '{}' becomes
-          '{', an indented blank line with the cursor, then '}'.
-        - In Python, pressing Enter at the end of a line whose statement
-          is a bare 'return', 'break', 'continue', 'pass', or 'raise'
-          (with or without a value/argument) dedents the new line one
-          level, since nothing else in that block can execute after it -
-          covers the same "no closing bracket to hang it off of" gap as
-          the electric else/elif/except/finally dedent, but for the
-          other direction: leaving a block instead of joining one."""
+        """Auto-indent on Enter."""
         text = self.text
         with self._single_undo_step():
             if text.tag_ranges("sel"):
@@ -4044,15 +3539,7 @@ class EditorApp(ttk.Frame):
         return "break"
 
     def _on_text_backspace(self, event=None):
-        """Backspace removes a whole indent level (up to the previous
-        multiple-of-INDENT_WIDTH column) in one press when everything
-        from the start of the line to the cursor is indentation - instead
-        of the default one-space-per-press, which means either repeatedly
-        pressing Backspace or holding it (and overshooting into the
-        previous line's text) just to back out one level. Falls through
-        to the Text widget's normal Backspace anywhere else (a selection,
-        mid-word, column 0, or a line that mixes indentation with tabs -
-        left alone rather than guessed at)."""
+        """Backspace removes a whole indent level in one press when everything from the start of the line to the cursor is indentation."""
         text = self.text
         if text.tag_ranges("sel"):
             return None
@@ -4135,12 +3622,7 @@ class EditorApp(ttk.Frame):
                     if len(prev_indent) == len(current_indent) and _PY_BLOCK_OPENERS.match(prev_stripped):
                         target_indent = prev_indent
                         break
-                    # Same or deeper indent but not a sibling clause (an
-                    # ordinary statement inside the block, or a nested
-                    # block's contents) - keep walking up past it rather
-                    # than giving up, since skipping over regular
-                    # same-level statements to find the block's own
-                    # header/sibling is exactly the normal case.
+                    # Same or deeper indent but not a sibling clause.
                 n -= 1
             if target_indent is None or target_indent == current_indent:
                 return None
@@ -4151,12 +3633,7 @@ class EditorApp(ttk.Frame):
         return None
 
     def _cancel_pending_jobs(self):
-        """Cancels every self-rescheduling after() job. Without this, a
-        job like _poll_output (which reschedules itself every 80ms
-        indefinitely) keeps firing after the editor is torn down - back to
-        Connect, or on quit - and since the underlying widgets are gone by
-        then, Tk logs an "invalid command name" error to the console for
-        every tick until the process exits."""
+        """Cancels every self-rescheduling after() job."""
         win, self._share_win = self._share_win, None
         if win is not None:
             try:
@@ -4173,13 +3650,7 @@ class EditorApp(ttk.Frame):
                 setattr(self, attr, None)
 
     def _unbind_shortcuts(self):
-        """Releases every shortcut this editor bound onto the shared root
-        window (and the text widget). Without the root half of this,
-        closing the editor (back to Connect, or on quit) would leave those
-        root-level bindings dangling with closures over a now-destroyed
-        widget - and since the root window is reused for the next screen,
-        pressing e.g. Ctrl+S there would still try to invoke a method on
-        the dead editor instance."""
+        """Releases every shortcut this editor bound onto the shared root window (and the text widget)."""
         root = self.winfo_toplevel()
         for accel in self._bound_accels:
             try:
@@ -4265,11 +3736,7 @@ class EditorApp(ttk.Frame):
         self._bound_console_accels = []
 
     def _apply_output_shortcuts(self):
-        """Binds OUTPUT_SHORTCUT_SPECS onto the Terminal console widget only
-        - not root, not the editor's text widget - so these terminal-like
-        conveniences (Ctrl+C to interrupt whatever's running, etc.) only
-        fire while the console itself has focus, the same way a real
-        terminal's shortcuts don't leak into whatever else is open."""
+        """Binds OUTPUT_SHORTCUT_SPECS onto the Terminal console widget only - not root, not the editor's text widget."""
         self._unbind_output_shortcuts()
         for action_id, _label, default_accel, method_name in OUTPUT_SHORTCUT_SPECS:
             accel = self.output_shortcuts.get(action_id) or default_accel
@@ -4284,25 +3751,11 @@ class EditorApp(ttk.Frame):
                 pass
 
     def _console_send_interrupt(self):
-        """Ctrl+C, by default: while a script is running, sends it the
-        same interrupt a terminal's Ctrl+C would (SIGINT on POSIX,
-        CTRL_C_EVENT on Windows) instead of the usual copy-to-clipboard.
-        Returns True if it handled the key (caller should suppress the
-        default binding), False to let Ctrl+C fall through to copying a
-        selection as normal.
-
-        This mirrors the classic PTY convention every real terminal
-        emulator follows: Ctrl+C only interrupts when there's nothing
-        selected. If the user has highlighted output (to copy it), Ctrl+C
-        copies that selection instead - it does not also kill the running
-        script. So: no selection - interrupt; a selection present - copy,
-        even if something is running."""
+        """Ctrl+C: interrupt the running script unless text is selected (then copy). True if handled."""
         if self.console.tag_ranges("sel"):
             return False
         if not (self.run_proc and self.run_proc.poll() is None):
-            # Idle, at a $ prompt: like a shell, abandon whatever is typed
-            # on the line and start a fresh prompt, so Ctrl+C always does
-            # something instead of silently doing nothing.
+            # Idle, at a $ prompt: like a shell, abandon whatever is typed on the line and start a fresh prompt.
             self._console_write("^C\n", "info")
             self._show_prompt()
             return True
@@ -4310,44 +3763,16 @@ class EditorApp(ttk.Frame):
         return True
 
     def _interrupt_run_proc(self):
-        """Actually delivers the interrupt to run_proc - factored out of
-        _console_send_interrupt so app.py's terminal-level Ctrl+C handler
-        (a real OS SIGINT, for when this whole app is itself running
-        under a terminal) can reuse the exact same delivery instead of
-        quitting the whole app while a script is running, same as a
-        shell forwards Ctrl+C to its foreground job rather than dying
-        itself. Signals the child's own process group (see
-        start_new_session in _launch_process), not just the one process, so
-        it reaches anything that child itself spawned too. Guarded by
-        _proc_exit_expected so a second, redundant trigger for the same
-        Ctrl+C - e.g. both the console's own key binding and app.py's
-        terminal-level SIGINT forwarder firing for one keypress, which
-        does happen in some environments - can't send the signal or
-        print "[interrupted]" a second time (a short time window, not a
-        permanent flag, so a script that catches the interrupt and keeps
-        going can still be interrupted again)."""
+        """Actually delivers the interrupt to run_proc."""
         if not (self.run_proc and self.run_proc.poll() is None):
             return
-        # Only a *near-simultaneous* duplicate is dropped (the key binding
-        # and app.py's SIGINT forwarder can both fire for one keypress).
-        # Gating on _proc_exit_expected instead - which stays set after the
-        # first interrupt - made every later Ctrl+C a silent no-op when the
-        # script caught the first SIGINT and kept running.
+        # Only a *near-simultaneous* duplicate is dropped.
         now = time.monotonic()
         if now - getattr(self, "_last_interrupt_at", 0.0) < 0.25:
             return
         self._last_interrupt_at = now
         self._interrupt_sent = True
-        try:
-            if sys.platform.startswith("win"):
-                self.run_proc.send_signal(signal.CTRL_C_EVENT)
-            else:
-                os.killpg(os.getpgid(self.run_proc.pid), signal.SIGINT)
-        except (OSError, ValueError, ProcessLookupError):
-            try:
-                self.run_proc.send_signal(signal.SIGINT)
-            except (OSError, ValueError):
-                return
+        procutil.interrupt(self.run_proc)
         if self._terminal_message_enabled("interrupted"):
             self._ensure_newline()
             self._console_write("[interrupted]\n", "info")
@@ -4358,25 +3783,17 @@ class FindDialog(tk.Toplevel):
     either direction, whole-word and case-sensitive matching, and optional
     wraparound, on top of the original find-next/replace/replace-all."""
 
-    # Class-level, not instance-level, on purpose: this is what makes the
-    # find/replace text survive after the dialog is closed and reopened,
-    # for the lifetime of the app.
+    # Class-level, not instance-level, on purpose.
     _last_find = ""
     _last_replace = ""
-    # Dialogs currently open, so EditorApp._persist_ui_state can store their
-    # geometry too when the whole app closes with one still showing (the
-    # window's own <Destroy> then fires after the config was already saved).
+    # Dialogs currently open, so EditorApp._persist_ui_state can store their geometry too when the whole app closes with one still showing.
     _instances = []
 
     _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
 
     @classmethod
     def show(cls, app, replace):
-        """Opens the dialog, or reuses the one already open so spamming
-        Ctrl+F / Ctrl+H can't stack up copies. Same mode: just raised and
-        refocused (picking up the current selection as the search text,
-        like a fresh dialog would). Other mode (Find vs. Replace have
-        different layouts): the old one is closed and the right one opens."""
+        """Opens the dialog, or reuses the one already open so spamming Ctrl+F / Ctrl+H can't stack up copies."""
         for dlg in list(cls._instances):
             try:
                 alive = dlg.winfo_exists()
@@ -4412,9 +3829,7 @@ class FindDialog(tk.Toplevel):
         t = app.theme
         self.title("Replace" if replace else "Find")
         self.configure(bg=t["panel_bg"])
-        # Width only: the height is fixed by the layout (and differs between
-        # Find and Replace), but a wider box is genuinely useful for long
-        # search strings, and gives "remember size" something real to keep.
+        # Width only: the height is fixed by the layout, but a wider box is genuinely useful for long search strings.
         self.resizable(True, False)
         self.transient(app.winfo_toplevel())
         for col in (1, 2, 3):
@@ -4482,12 +3897,7 @@ class FindDialog(tk.Toplevel):
         self.after(50, _focus)
 
     def _apply_saved_geometry(self):
-        """Restores the dialog's last width and/or position, whichever of
-        the two Settings > General > Window says to remember. Both are
-        clamped to the current screen (a saved position can be stale after
-        a monitor layout change), and the width never drops below what the
-        buttons need. Anything not remembered is left to the window manager
-        / the layout's natural size."""
+        """Restores the dialog's last width and/or position, whichever of the two Settings > General > Window says to remember."""
         ui = self.app.cfg.get("ui", {})
         self.update_idletasks()
         req_w, req_h = self.winfo_reqwidth(), self.winfo_reqheight()
@@ -4513,10 +3923,7 @@ class FindDialog(tk.Toplevel):
             pass
 
     def _on_configure(self, event):
-        # Cache the last good geometry as it changes: by the time <Destroy>
-        # fires the window may already be unqueryable, and a minimized
-        # window reports nonsense (e.g. "1x1+-32000+-32000" on Windows), so
-        # only a normal, on-screen state is ever remembered.
+        # Cache the last good geometry as it changes.
         if event.widget is not self:
             return
         try:
@@ -4526,11 +3933,7 @@ class FindDialog(tk.Toplevel):
             pass
 
     def _store_state(self):
-        """Writes this dialog's geometry and checkbox states into the app's
-        in-memory config (the caller decides when to flush it to disk).
-        Each half of the geometry is independently opt-in: when its
-        checkbox in Settings is off, the key is removed entirely, mirroring
-        how the main window's own size/position behave."""
+        """Writes this dialog's geometry and checkbox states into the app's in-memory config."""
         ui = self.app.cfg.setdefault("ui", {})
         try:
             ui["find_match_case"] = bool(self.match_case_var.get())
@@ -4564,12 +3967,7 @@ class FindDialog(tk.Toplevel):
             ui["find_window_position"] = f"+{int(x.lstrip('+'))}+{int(y.lstrip('+'))}"
 
     def _on_destroy(self, event):
-        # <Destroy> bubbles up from every child as the window closes, not
-        # just this Toplevel itself - and the window manager's own close
-        # button destroys us at the Tcl level directly, bypassing a
-        # Python-level override of destroy() entirely, so this virtual
-        # event (rather than overriding destroy()) is the one place that
-        # reliably catches every way this dialog can go away.
+        # <Destroy> bubbles up from every child as the window closes, not just this Toplevel itself.
         if event.widget is self:
             FindDialog._last_find = self.find_var.get()
             FindDialog._last_replace = self.replace_var.get()
@@ -4585,10 +3983,7 @@ class FindDialog(tk.Toplevel):
             return ""
 
     def _pattern(self, needle):
-        """Returns (pattern, is_regexp). Whole-word matching is implemented
-        as a regexp search with Tcl's \\y word-boundary marker around the
-        needle, with the needle itself escaped first so regex-special
-        characters the user typed are still matched literally."""
+        """Returns (pattern, is_regexp)."""
         if self.whole_word_var.get():
             return r"\y%s\y" % re.escape(needle), True
         return needle, False
@@ -4624,11 +4019,7 @@ class FindDialog(tk.Toplevel):
             self.status_var.set(f"'{needle}' not found.")
             return
         end = f"{pos}+{length}c"
-        # A real selection, not a separate highlight tag of our own: this
-        # is what makes a match behave exactly like any other selection
-        # once found - it's still there after this dialog is closed, and
-        # goes away the normal way (clicking elsewhere in the editor),
-        # instead of a custom tag that nothing was ever clearing.
+        # A real selection, not a separate highlight tag of our own.
         text.tag_remove("sel", "1.0", "end")
         text.tag_add("sel", pos, end)
         text.mark_set("insert", pos if backwards else end)

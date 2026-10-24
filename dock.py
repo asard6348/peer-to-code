@@ -39,9 +39,7 @@ BOTTOM_FRACTION = 0.30
 FLOAT_MIN = (220, 120)
 FLOAT_VISIBLE_MARGIN = 80
 
-# key -> defaults. `vis_key` is the (long-standing) ui flag the panel's
-# visibility is stored under; `size` is (width, height) when first docked or
-# floated; `min_w`/`min_h` are the pane minimums.
+# key -> defaults.
 PANEL_SPECS = {
     "explorer": {"title": "EXPLORER", "vis_key": "explorer_visible", "dock": "left",
                  "size": (220, 400), "min_w": 60, "min_h": 60},
@@ -94,9 +92,7 @@ class DockPanel:
         t = mgr.theme
 
         self.visible = True
-        # Unavailable right now (e.g. Chat in an unshared session): kept off
-        # screen whatever `visible` says, and `visible` - the person's own
-        # preference, which is what gets saved - is left alone.
+        # Unavailable right now: kept off screen whatever `visible` says.
         self.disabled = False
         self.floating = False
         self.dock = spec["dock"]            # side used when docked (kept while floating)
@@ -115,11 +111,7 @@ class DockPanel:
         self.close_btn = tk.Label(self.header, text="×", bg=t["bg"], fg=t["muted_fg"],
                                   font=("Segoe UI", 11), padx=6, cursor="hand2")
         self.close_btn.pack(side="right", pady=(2, 0))
-        # A real Menubutton, not a Label that pops a menu on click: Tk's own
-        # Menubutton drops the menu below the button and supports both
-        # click-then-pick and press-drag-release. Popping a menu up under
-        # the pointer on mouse-down made the release land on the first
-        # entry and pick it straight away.
+        # A real Menubutton, not a Label that pops a menu on click.
         self.menu_btn = tk.Menubutton(self.header, text="≡", bg=t["bg"], fg=t["muted_fg"],
                                       font=("Segoe UI", 11), padx=6, pady=0, bd=0, relief="flat",
                                       highlightthickness=0, indicatoron=False, cursor="hand2",
@@ -144,7 +136,7 @@ class DockPanel:
         self.close_btn.bind("<Leave>", lambda e: self.close_btn.configure(bg=self.mgr.theme["bg"]))
         self.set_theme(t)
 
-    # -- convenience --------------------------------------------------------
+    # convenience
 
     def show(self):
         self.mgr.set_visible(self, True)
@@ -191,23 +183,13 @@ class DockPanel:
         m.add_command(label="Hide", command=self.hide)
 
     def _popup_menu(self, event):
-        """Right-click on the title bar: the same menu, right at the press.
-        It is placed a few pixels right/down of the pointer so the pointer
-        starts *outside* it: releasing the button without moving then picks
-        nothing (the menu stays up), while dragging onto an entry and
-        releasing there picks that entry. No grab_release() afterwards - it
-        cancels the menu's own grab, which is what dismisses it again on
-        the next click elsewhere (without the grab it stays up forever)."""
+        """Right-click on the title bar: the same menu, right at the press."""
         self._menu.tk_popup(event.x_root + 4, event.y_root + 4)
 
 
 class DockManager:
     def __init__(self, host, body, center, anchor, theme, on_visibility=None):
-        """host: the editor frame every panel frame is a child of. body: the
-        horizontal PanedWindow holding [left dock | center | right dock].
-        center: the vertical PanedWindow holding [editor | bottom dock].
-        anchor: the editor widget in `center` the bottom dock goes under.
-        on_visibility(panel) is called after a panel is shown or hidden."""
+        """host: the editor frame every panel frame is a child of."""
         self.host = host
         self.body = body
         self.center = center
@@ -228,7 +210,7 @@ class DockManager:
         self._zone_label.place(relx=0.5, rely=0.5, anchor="center")
         self._zone_side = None
 
-    # -- panels ---------------------------------------------------------------
+    # panels
 
     def add_panel(self, key):
         panel = DockPanel(self, key)
@@ -247,7 +229,7 @@ class DockManager:
         self._zone.configure(bg=t["accent"])
         self._zone_label.configure(bg=t["accent"])
 
-    # -- state changes -----------------------------------------------------------
+    # state changes
 
     def set_visible(self, panel, visible):
         visible = bool(visible)
@@ -353,7 +335,7 @@ class DockManager:
             for panel in self.ordered():
                 self.on_visibility(panel)
 
-    # -- geometry ------------------------------------------------------------------
+    # geometry
 
     def _screen_bounds(self):
         h = self.host
@@ -384,11 +366,7 @@ class DockManager:
             if slot.winfo_ismapped():
                 w, h = slot.winfo_width(), slot.winfo_height()
                 if w > 1 and h > 1:
-                    # The first panel in a dock stretches to fill whatever
-                    # the others leave, so its extent along the dock's own
-                    # axis (width in the bottom dock, height in the side
-                    # docks) isn't a size anyone chose: keep the old value
-                    # rather than saving "the whole window".
+                    # The first panel in a dock stretches to fill whatever the others leave.
                     first = self._members(shown)[0] is panel
                     ow, oh = panel.size
                     if first and shown == "bottom":
@@ -404,7 +382,7 @@ class DockManager:
                     panel.float_size = f"{m.group(1)}x{m.group(2)}"
                     panel.float_pos = f"+{_coord(m.group(3))}+{_coord(m.group(4))}"
 
-    # -- docking / floating plumbing -------------------------------------------
+    # docking / floating plumbing
 
     def _members(self, side):
         return [p for p in self.ordered() if p._shown == side]
@@ -479,7 +457,7 @@ class DockManager:
         else:
             self._restretch(side)
 
-    # -- dragging ------------------------------------------------------------------
+    # dragging
 
     def _inside(self, widget, x_root, y_root):
         x, y = widget.winfo_rootx(), widget.winfo_rooty()
@@ -568,13 +546,10 @@ class DockManager:
             # Dropped outside the main window: tear it off right there.
             self.float_panel(panel, x=event.x_root - min(d["dx"], 120), y=event.y_root - 30)
 
-    # -- persistence -----------------------------------------------------------------
+    # persistence
 
     def load(self, cfg):
-        """Reads each panel's visibility (ui section) and layout (layout
-        section) out of the config. Anything missing or garbled falls back to
-        the panel's default; the pre-docking ui.explorer_width /
-        ui.console_height are honoured once, as the docked size."""
+        """Reads each panel's visibility (ui section) and layout (layout section) out of the config."""
         ui = cfg.get("ui") if isinstance(cfg.get("ui"), dict) else {}
         layout = cfg.get("layout") if isinstance(cfg.get("layout"), dict) else {}
         legacy = {"explorer": (ui.get("explorer_width"), None), "terminal": (None, ui.get("console_height"))}
@@ -593,10 +568,7 @@ class DockManager:
             panel.float_pos = d["float_pos"] if parse_pos(d.get("float_pos")) else None
 
     def save(self, cfg):
-        """Writes visibility and layout into the config. Each of the three
-        remember-options in Settings > General > Window (layout = which side
-        / floating, size, floating position) is independent; one that is off
-        has its keys deleted rather than left stale."""
+        """Writes visibility and layout into the config."""
         ui = cfg.setdefault("ui", {})
         layout = cfg.get("layout")
         if not isinstance(layout, dict):

@@ -60,9 +60,7 @@ def _reveal_in_system_file_manager(path):
 
     # Linux and other Unix desktops.
     if not is_dir:
-        # The freedesktop FileManager1 service is implemented by Dolphin,
-        # Nautilus, Nemo, Thunar, ... and is the one portable way to select
-        # a file. It answers quickly when present and errors out when not.
+        # The freedesktop FileManager1 service is implemented by Dolphin, Nautilus, Nemo, Thunar, ...
         dbus_send = shutil.which("dbus-send")
         if dbus_send:
             try:
@@ -125,34 +123,22 @@ def _filesystem_roots():
 
 class FileExplorer(ttk.Frame):
     def __init__(self, master, working_dir, on_open_file, on_root_change=None, **kw):
-        # Gives the panel a visible themed edge (see theme.apply_base_
-        # style's "Explorer.TFrame") instead of blending straight into
-        # the editor pane beside it; callers can still override by
-        # passing their own style=.
+        # Gives the panel a visible themed edge instead of blending straight into the editor pane beside it.
         kw.setdefault("style", "Explorer.TFrame")
         super().__init__(master, **kw)
         self.working_dir = working_dir
         self.on_open_file = on_open_file
-        # Called with the new root folder whenever the tree re-roots itself
-        # (context-menu "Open in Explorer" or the ".." button), so the owner
-        # can keep its own idea of the working folder in sync.
+        # Called with the new root folder whenever the tree re-roots itself.
         self.on_root_change = on_root_change
         self._whole_computer = False
         # Path of the item the context menu was last opened on (None when
         # it was opened on empty space).
         self._menu_path = None
         self._item_entries_shown = False
-        # The ".." row at the top of the tree. Deliberately NOT in
-        # _node_paths, so rename/delete/move/drag-drop never treat it as a
-        # real file or folder.
+        # The ".." row at the top of the tree.
         self._up_node = None
         self._last_up_click = 0
-        # How the tree's entries are ordered - see SORT_OPTIONS for the
-        # keys this can take, and _secondary_key/_populate for how a key
-        # plus this direction turn into an actual ordering. Directories
-        # always sort before files regardless of key/direction (see
-        # _populate); this only controls order within each of those two
-        # groups.
+        # How the tree's entries are ordered.
         self._sort_key = "name"
         self._sort_reverse = False
 
@@ -160,11 +146,7 @@ class FileExplorer(ttk.Frame):
         header.pack(fill="x")
         ttk.Button(header, text="Refresh", width=8, style="Toolbar.TButton",
                    command=self.refresh).pack(side="right", padx=2)
-        # Collapse All sits at the left edge, Refresh at the right. (The
-        # "EXPLORER" title lives in the dockable panel's own header - see
-        # dock.DockPanel - so the spacer below just keeps them apart. The
-        # "go to parent folder" control isn't up here, it's the ".." row
-        # at the top of the tree - see _refresh_up_row.)
+        # Collapse All sits at the left edge, Refresh at the right.
         ttk.Button(header, text="Collapse All", style="Toolbar.Thin.TButton",
                    command=self.collapse_all).pack(side="left", padx=2)
         ttk.Frame(header).pack(side="left", fill="x", expand=True, pady=4)
@@ -186,12 +168,7 @@ class FileExplorer(ttk.Frame):
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<<TreeviewOpen>>", self._on_expand)
 
-        # Drag-and-drop reordering within the tree, so a file/folder can be
-        # moved into a different folder by dragging it there, without going
-        # through the "Move to..." dialog. Layered on top of the Treeview's
-        # own bindings (add="+") so normal click-to-select still works;
-        # only once the mouse has actually moved a few pixels with the
-        # button held does this treat it as a drag rather than a click.
+        # Drag-and-drop reordering within the tree.
         self._drag_start_node = None
         self._drag_start_pos = (0, 0)
         self._drag_active = False
@@ -202,9 +179,7 @@ class FileExplorer(ttk.Frame):
         self.tree.tag_configure("drop_target", background=self._drop_target_color())
 
         self.menu = tk.Menu(self, tearoff=0)
-        # "Open" / "Open in Explorer" / the system file manager entry only
-        # exist while the menu is open on an actual item - see
-        # _set_item_entries.
+        # "Open" / "Open in Explorer" / the system file manager entry only exist while the menu is open on an actual item.
         self.menu.add_command(label="New File", command=self._new_file)
         self.menu.add_command(label="New Folder", command=self._new_folder)
         self.menu.add_separator()
@@ -213,13 +188,7 @@ class FileExplorer(ttk.Frame):
         self.menu.add_separator()
         self.menu.add_command(label="Delete", command=self._delete)
         self.menu.add_separator()
-        # Sorting lives in the right-click menu, not the header - the
-        # header is already tight on room for Refresh/Collapse All next
-        # to the "EXPLORER" label, and a fourth button there is the first
-        # thing to get squashed or clipped once the panel is narrowed.
-        # Right-click works at any panel width and doesn't apply to a
-        # particular file/folder anyway, so it fits better as a plain
-        # submenu than as its own button.
+        # Sorting lives in the right-click menu, not the header.
         self._sort_key_var = tk.StringVar(value=self._sort_key)
         self._sort_reverse_var = tk.BooleanVar(value=self._sort_reverse)
         self.sort_menu = tk.Menu(self.menu, tearoff=0)
@@ -235,11 +204,7 @@ class FileExplorer(ttk.Frame):
         self._show_initial_view()
 
     def _drop_target_color(self):
-        """Background used to highlight the folder a drag is currently
-        hovering over. Reuses the Treeview's own "selected" row color
-        (via the ttk style, since that already matches whichever theme -
-        light or dark - the app is currently using) rather than a
-        hardcoded value that might blend in or clash."""
+        """Background used to highlight the folder a drag is currently hovering over."""
         color = ttk.Style(self.tree).lookup("Treeview", "background", ("selected",))
         return color or "#4a9eff"
 
@@ -265,13 +230,7 @@ class FileExplorer(ttk.Frame):
         self._update_tree_width()
 
     def current_font(self):
-        """The tree's font as it stands right now - whatever the active
-        ttk theme's own "Treeview" style default is, if set_font() above
-        has never been called to override it. Used as the starting point
-        for zoom/Settings so a person who's never touched Explorer's font
-        controls keeps seeing exactly the size and family their ttk theme
-        already gave them, rather than this app silently substituting
-        some hardcoded size the first time it starts up."""
+        """The tree's font as it stands right now."""
         font = self._tree_font()
         try:
             family = font.cget("family")
@@ -291,11 +250,7 @@ class FileExplorer(ttk.Frame):
             return 20
 
     def _update_tree_width(self):
-        """See the comment on tree.column("#0", ...) above - sizes the
-        tree column to whichever currently-realized row is widest (its
-        text plus its indent level), floored at the panel's own visible
-        width so short content still fills the panel instead of leaving
-        a sliver of unused space on the right."""
+        """See the comment on tree.column above."""
         font = self._tree_font()
         indent = self._tree_indent()
         allowance = indent + 12
@@ -320,15 +275,7 @@ class FileExplorer(ttk.Frame):
         self._show_initial_view()
 
     def show_whole_computer(self):
-        """Used when no specific folder was opened (a single-file Open):
-        rather than rooting the tree at that file's own parent folder -
-        which isn't really "the project", just wherever the file happened
-        to be - shows the whole local filesystem instead, the same way
-        Explorer starting hidden in that case avoids implying a folder was
-        opened when it wasn't. Starts collapsed: there's no single natural
-        "project root" here the way there is for one opened folder, and
-        several roots (each of which can be enormous, like "/") all
-        auto-expanded at once isn't useful."""
+        """Used when no specific folder was opened: rather than rooting the tree at that file's own parent folder."""
         self._whole_computer = True
         self._rebuild(open_roots=False)
         self._update_tree_width()
@@ -396,9 +343,7 @@ class FileExplorer(ttk.Frame):
             self._up_node = self.tree.insert("", 0, text="..")
 
     def _activate_up_row(self):
-        # A double-click would otherwise register twice: the first click
-        # re-roots the tree, and the second then lands on the new tree's
-        # own \"..\" row, going up a second level.
+        # A double-click would otherwise register twice.
         now = time.monotonic()
         if now - self._last_up_click < 0.4:
             return
@@ -406,10 +351,7 @@ class FileExplorer(ttk.Frame):
         self.go_up()
 
     def _set_root(self, path, reveal=None):
-        """Re-roots the tree at folder `path`, keeping every folder that
-        was expanded still expanded (so going up shows the old root open
-        inside its parent, rather than a collapsed, disorienting tree),
-        then selects and scrolls to `reveal` if given."""
+        """Re-roots the tree at folder `path`, keeping every folder that was expanded still expanded."""
         path = os.path.normpath(path)
         if not os.path.isdir(path):
             return
@@ -475,10 +417,7 @@ class FileExplorer(ttk.Frame):
             self._populate(node, path)
 
     def _secondary_key(self, full, name):
-        """The ordering value for one entry under the current sort key,
-        before directories are pulled to the front (see _populate). Kept
-        separate from that dirs-first grouping so a name/type/size/date
-        choice never has to also decide where folders sit."""
+        """The ordering value for one entry under the current sort key, before directories are pulled to the front (see _populate)."""
         key = self._sort_key
         if key == "size":
             try:
@@ -500,12 +439,7 @@ class FileExplorer(ttk.Frame):
         except OSError:
             return
         entries = [(n, os.path.join(path, n)) for n in names]
-        # Two sorts in sequence rather than one combined key: sorting by
-        # the chosen key (with direction) first, then re-sorting by
-        # dirs-vs-files, relies on Python's sort being stable to keep
-        # folders always first while still flipping with "Descending"
-        # exactly like the file list does, rather than also reversing
-        # which group comes first.
+        # Two sorts in sequence rather than one combined key.
         entries.sort(key=lambda e: self._secondary_key(e[1], e[0]), reverse=self._sort_reverse)
         entries.sort(key=lambda e: not os.path.isdir(e[1]))
         for name, full in entries:
@@ -561,11 +495,7 @@ class FileExplorer(ttk.Frame):
         self.menu.tk_popup(event.x_root + 4, event.y_root + 4)
 
     def _set_item_entries(self, show):
-        """Adds or removes the item-specific entries (Open, Open in
-        Explorer, and the one that shows the item in the operating
-        system's own file manager) at the top of the menu: right-clicking
-        empty space (or the \"..\" row) shows the menu without them rather
-        than with dead, greyed-out ones."""
+        """Adds or removes the item-specific entries at the top of the menu."""
         if show == self._item_entries_shown:
             return
         if show:
@@ -678,10 +608,7 @@ class FileExplorer(ttk.Frame):
             return
         try:
             if is_dir:
-                # os.rmdir only succeeds on an already-empty directory,
-                # which is why deleting a folder with anything inside it
-                # used to fail with "Directory not empty". shutil.rmtree
-                # removes the whole tree instead.
+                # os.rmdir only succeeds on an already-empty directory.
                 shutil.rmtree(path)
             else:
                 os.remove(path)

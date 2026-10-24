@@ -37,7 +37,7 @@ class TabBar(tk.Frame):
         self._bind_scroll(self.canvas)
         self._bind_scroll(self.inner)
 
-    # ---- public API -------------------------------------------------
+    # public API
 
     def set_theme(self, theme):
         self.theme = theme
@@ -52,11 +52,7 @@ class TabBar(tk.Frame):
         self._tabs = list(tabs)
         self._active_id = active_id
         self._end_drag()
-        # Update in place: a cell whose tab is unchanged (same title,
-        # shared/dirty state and active-ness) is kept as it is, and only
-        # cells that actually differ are rebuilt. Destroying and recreating
-        # every cell on each refresh blanked the whole strip for a frame
-        # whenever anything about any tab changed.
+        # Update in place: a cell whose tab is unchanged is kept as it is.
         wanted = {}
         for tab in self._tabs:
             wanted[tab["id"]] = (tab["title"], bool(tab["shared"]), bool(tab["dirty"]),
@@ -103,7 +99,7 @@ class TabBar(tk.Frame):
         except tk.TclError:
             pass
 
-    # ---- internals --------------------------------------------------
+    # internals
 
     def _make_cell(self, tab, active):
         t = self.theme
@@ -149,7 +145,7 @@ class TabBar(tk.Frame):
         self._bind_scroll(cell)
         return cell
 
-    # ---- drag to reorder --------------------------------------------
+    # drag to reorder
 
     _DRAG_THRESHOLD = 5
 

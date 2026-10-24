@@ -17,20 +17,7 @@ def _mix(hex_color, bg_hex, alpha):
 
 
 class PeerCursorLayer:
-    """Floating overlay widgets showing where every other collaborator's
-    cursor and selection currently are, kept positioned on top of the Text
-    widget via bbox() lookups (which already account for scroll/wrap).
-
-    A peer whose cursor is scrolled out of view gets a small marker pinned to
-    the top or bottom edge of the Text widget instead (their name with an
-    up/down arrow); clicking it scrolls to them.
-
-    Positions are character offsets into a shared document, so they have to
-    be kept in step with every edit - ours and everyone else's - or a caret
-    would drift by however much text was inserted or deleted before it. See
-    apply_op. A session can share several documents at once, so each peer
-    has one position per document; only those in the document of the tab on
-    screen (set_doc) are drawn."""
+    """Floating overlay widgets showing where every other collaborator's cursor and selection currently are."""
 
     EDGE_MARGIN = 4
     EDGE_GAP = 4
@@ -79,12 +66,7 @@ class PeerCursorLayer:
             info = self.peers.setdefault(pid, {"pos": {}})
             info["name"] = pr["name"]
             info["color"] = pr["color"]
-            # The roster only carries the last cursor the server heard from
-            # this peer in each document, which can predate edits this side
-            # has already seen (and shifted the position for). Once a
-            # peer's position is known here it is kept current by
-            # update_cursor and apply_op, so the roster only fills in
-            # positions not heard of yet.
+            # The roster only carries the last cursor the server heard from this peer in each document.
             for cursor in pr.get("cursors") or ():
                 if not isinstance(cursor, dict):
                     continue
@@ -108,12 +90,7 @@ class PeerCursorLayer:
         self.refresh()
 
     def apply_op(self, op_components, author=None, doc_id=None):
-        """Moves every peer's caret and selection in document `doc_id` along
-        with an edit to it (an ot.Op's components), so text inserted or
-        deleted before a caret shifts it instead of leaving it pointing at
-        the same offset - which is a different spot in the changed text.
-        `author` is the peer who made the edit, or None for an edit made
-        here: their own caret ends up after what they typed."""
+        """Moves every peer's caret and selection in document `doc_id` along with an edit to it."""
         for pid, info in self.peers.items():
             pos = info["pos"].get(doc_id)
             if pos is None:

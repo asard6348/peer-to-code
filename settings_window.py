@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, font as tkfont
 
@@ -7,23 +11,16 @@ import copy
 from chat_util import chat_settings, sanitize_name
 import file_explorer
 import scrollutil
+import syntax
+import theme
 
-import os
 
 IGNORED_KEYSYMS = {
     "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
     "Caps_Lock", "Num_Lock", "Super_L", "Super_R", "Meta_L", "Meta_R",
 }
 
-# The ten color settings, grouped by what they actually affect and each
-# given a one-line description - rather than one flat, alphabetically-ish
-# list of names like "App background" / "Editor text" that read as
-# self-explanatory but aren't: "fg" colors nearly all text in the app
-# (buttons, dialogs, panels), not just the editor; "sel_bg" colors
-# button hover/focus and hovered list rows as much as it colors text
-# selection; "bg" is specifically the toolbar/connect-screen chrome, not
-# a catch-all "background of everything". Each (key, title, description)
-# tuple here replaces the old flat THEME_FIELDS list.
+# The ten color settings, grouped by what they actually affect and each given a one-line description.
 THEME_FIELD_GROUPS = [
     ("Text & Highlights", [
         ("fg", "Primary text",
@@ -68,7 +65,7 @@ THEME_FIELD_GROUPS = [
 THEME_FIELDS = [(key, title) for _group, fields in THEME_FIELD_GROUPS for key, title, _desc in fields]
 
 # Default code font
-CODE_FONT = "Consolas" if os.name=='nt' else "Hack"
+from config import CODE_FONT
 
 
 def _capture_accel(event):
@@ -85,10 +82,7 @@ def _capture_accel(event):
 
 
 class SettingsWindow(tk.Toplevel):
-    """Shortcuts + Theme + General, all editable and written straight to the
-    JSON config on save. on_apply(set_of_changed_sections) lets the editor
-    rebind keys / re-theme / pick up other changes immediately without a
-    restart."""
+    """Shortcuts + Theme + General, all editable and written straight to the JSON config on save."""
 
     def __init__(self, app, cfg, on_apply=None):
         super().__init__(app)
@@ -98,11 +92,7 @@ class SettingsWindow(tk.Toplevel):
         t = app.theme
         self.title("Settings")
         self.configure(bg=t["panel_bg"])
-        # A visible frame around the whole window, in the theme's border
-        # color - Toplevels get none of the outlines apply_base_style
-        # gives ttk widgets, so without this the window edge (and the
-        # Advanced sub-dialogs, set up the same way below) just fades
-        # into whatever's behind them.
+        # A visible frame around the whole window, in the theme's border color.
         self.configure(highlightthickness=1, highlightbackground=t["border"], highlightcolor=t["border"])
         self.geometry("560x520")
         self.minsize(420, 320)
@@ -155,23 +145,12 @@ class SettingsWindow(tk.Toplevel):
         self._row_widgets = {}
         self._action_scope = {}
         self._suspend_preview = False
-        # Every classic (non-ttk) widget in this window that was given an
-        # explicit theme color at construction time, so a live theme
-        # change (_apply_live_theme, called from _preview) can put the
-        # new colors on all of them - the same live update ttk widgets
-        # already get for free from restyling "TFrame"/"TLabel"/etc.
-        # Populated by _reg() as each widget is built; see _reg's
-        # docstring for the (widget, {option: theme_key}) shape.
+        # Every classic widget in this window that was given an explicit theme color at construction time.
         self._theme_widgets = []
 
         footer = self._reg(tk.Frame(self, bg=t["panel_bg"]), bg="panel_bg")
         footer.pack(side="bottom", fill="x", padx=10, pady=10)
-        # These are plain tk.Button, not ttk.Button, so restyling "TButton"
-        # doesn't reach them - each needs its own _reg() entry (see _reg's
-        # docstring) so a live theme switch repaints them along with
-        # everything else in this window, the same as apply_classic_
-        # widget_defaults' *Button.* option-database defaults cover a
-        # *freshly built* button.
+        # These are plain tk.Button, not ttk.Button, so restyling "TButton" doesn't reach them.
         self._reg(tk.Button(footer, text="Save", command=self._save),
                   bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(
             side="right", padx=4)
@@ -215,26 +194,7 @@ class SettingsWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _make_scrollable_rows(self, parent, t):
-        """A vertically scrollable rows area whose content frame is kept in
-        sync with the canvas's own rendered width (via the <Configure>
-        binding below) - without this, `rows` just shrink-wraps to its own
-        requested width and stays that size forever, so widths inside it
-        can never actually track the window (see individual tabs, which
-        rely on this: they configure column 0 to expand into whatever room
-        this creates, and their labels rewrap to that column's new width
-        rather than getting clipped or leaving dead space).
-
-        Deliberately does NOT wire up mousewheel scrolling itself -
-        scrollutil.bind_wheel() walks the widget tree that exists *right
-        now*, and at this point `rows` is still empty (the caller hasn't
-        built any of the tab's actual content into it yet). Binding here
-        would only ever catch the canvas and the empty rows frame, so
-        wheel/touchpad scrolling would work over the sliver of bare
-        canvas around the edges and go dead over every label, button and
-        combobox filling the rest of the tab - which is exactly the "it
-        moves a little and then stops" bug this avoids. Each caller must
-        call scrollutil.bind_wheel(canvas, rows) itself, once, after
-        every widget for that tab has actually been built."""
+        """A vertically scrollable rows area whose content frame is kept in sync with the canvas's own rendered width."""
         canvas = self._reg(tk.Canvas(parent, bg=t["panel_bg"], highlightthickness=0), bg="panel_bg")
         scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         rows = self._reg(tk.Frame(canvas, bg=t["panel_bg"]), bg="panel_bg")
@@ -254,29 +214,13 @@ class SettingsWindow(tk.Toplevel):
         self.reset_btn.configure(state=state)
 
     def _reg(self, widget, **color_options):
-        """Registers a classic widget's theme-derived constructor options
-        (e.g. bg="panel_bg", fg="muted_fg") so _apply_live_theme can put
-        current colors on it later. `color_options` maps a tk config
-        option name to the THEME_COLOR_KEYS key that should supply its
-        value. Returns `widget` unchanged so calls can stay inline
-        (`self._reg(tk.Label(...), bg="panel_bg").grid(...)`).
-
-        Deliberately not used for widgets whose bg/fg IS the data being
-        shown rather than decoration - the color swatches in the Theme
-        tab and the Advanced Syntax Colors dialog - those already get
-        refreshed with the right (possibly custom) color by
-        _refresh_theme_ui / their own pick() callback."""
+        """Registers a classic widget's theme-derived constructor options so _apply_live_theme can put current colors on it later."""
         if color_options:
             self._theme_widgets.append((widget, color_options))
         return widget
 
     def _apply_live_theme(self):
-        """Pushes self.theme_working's current colors onto every classic
-        widget _reg registered, plus this window's own background -
-        mirrors what ttk.Style reconfiguration already does for free for
-        every ttk-styled widget, so a theme preview (or a preset/system
-        switch) repaints the whole Settings window immediately instead
-        of just the parts ttk happens to own."""
+        """Pushes self.theme_working's current colors onto every classic widget _reg registered."""
         t = self.theme_working
         self.configure(bg=t["panel_bg"], highlightbackground=t["border"], highlightcolor=t["border"])
         for widget, color_options in self._theme_widgets:
@@ -336,7 +280,6 @@ class SettingsWindow(tk.Toplevel):
         the Theme tab's own (possibly unsaved) editor-background color,
         so this stays accurate while previewing an unsaved Theme change,
         not just after Save."""
-        import syntax
         desc = syntax.COLOR_THEMES[key]["description"]
         if key == syntax.AUTO_COLOR_THEME:
             edit_bg = self.theme_working.get("edit_bg", self._orig_theme.get("edit_bg"))
@@ -347,12 +290,10 @@ class SettingsWindow(tk.Toplevel):
     def _refresh_syntax_theme_description(self):
         if not hasattr(self, "syntax_theme_desc_label"):
             return
-        import syntax
         key = self.cfg.get("editor", {}).get("syntax_theme", syntax.DEFAULT_COLOR_THEME)
         self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(key))
 
     def _build_general_tab(self, parent):
-        import syntax
 
         t = self.app.theme
         _canvas, rows = self._make_scrollable_rows(parent, t)
@@ -528,11 +469,7 @@ class SettingsWindow(tk.Toplevel):
                activeforeground="fg").grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=2)
             row += 1
 
-        # Content above is fully built by this point, so bind_wheel's
-        # recursive walk actually reaches every label/combobox/button in
-        # the tab, not just the (at that point still empty) canvas - see
-        # _make_scrollable_rows's docstring for why binding there instead
-        # would leave everything built afterward permanently unscrollable.
+        # Content above is fully built by this point.
         scrollutil.bind_wheel(_canvas, rows)
 
     def _on_explorer_font_size_changed(self):
@@ -605,7 +542,6 @@ class SettingsWindow(tk.Toplevel):
         list - what's in it stays in the config. Like the Advanced syntax
         colors window, changes apply live and the Settings window's own
         Save/Cancel decide whether they stick."""
-        import syntax
 
         t = self.app.theme
         editor_cfg = self.cfg.setdefault("editor", {})
@@ -696,14 +632,7 @@ class SettingsWindow(tk.Toplevel):
         show_mode()
 
     def _open_advanced_syntax_colors(self):
-        """Per-token-category color picker, for anyone the two built-in
-        palettes don't quite suit. Picking any color here immediately
-        switches the palette dropdown above to "Custom" and previews it
-        live, same as the Theme tab's own color swatches do - there's
-        deliberately no separate Save/Cancel in this sub-window; the
-        outer Settings window's own Save/Cancel already covers whatever
-        got changed in here too (see _orig_custom_colors)."""
-        import syntax
+        """Per-token-category color picker, for anyone the two built-in palettes don't quite suit."""
 
         t = self.app.theme
         dlg = tk.Toplevel(self)
@@ -842,10 +771,7 @@ class SettingsWindow(tk.Toplevel):
         row += 1
         label(row, "Reset to Defaults on this page also clears the muted list.", fg="muted_fg", pady=(8, 2))
 
-        # Every widget above exists by now, so bind_wheel's recursive walk
-        # reaches all of them. This call was missing here, which is why
-        # wheel/touchpad scrolling worked on every other tab but went dead
-        # over this one - see _make_scrollable_rows's docstring.
+        # Every widget above exists by now, so bind_wheel's recursive walk reaches all of them.
         scrollutil.bind_wheel(_canvas, rows)
 
     def _on_chat_toggled(self, key):
@@ -962,15 +888,7 @@ class SettingsWindow(tk.Toplevel):
         ).grid(row=row, column=0, columnspan=columnspan, sticky="we", padx=4, pady=pady)
 
     def _refresh_preset_choice_maps(self):
-        """Rebuilds the label<->key maps the preset combobox uses: the
-        three fixed entries first (so they always sort to the top, most
-        useful ones first), then the user's saved presets alphabetically.
-        A custom preset's key and its displayed label are the same
-        string - it's just whatever name the user gave it. Labels come
-        from theme.py itself (BUILTIN_THEME_PRESETS' "label" fields and
-        SYSTEM_PRESET_LABEL) rather than being duplicated here, so
-        renaming a built-in preset only ever means editing theme.py."""
-        import theme
+        """Rebuilds the label<->key maps the preset combobox uses."""
 
         self._preset_key_to_label = {theme.SYSTEM_PRESET: theme.SYSTEM_PRESET_LABEL}
         for key, spec in theme.BUILTIN_THEME_PRESETS.items():
@@ -980,21 +898,18 @@ class SettingsWindow(tk.Toplevel):
         self._preset_label_to_key = {label: key for key, label in self._preset_key_to_label.items()}
 
     def _current_preset_key(self):
-        import theme
         return self._preset_label_to_key.get(self.theme_preset_var.get(), theme.SYSTEM_PRESET)
 
     def _update_preset_combo_values(self):
         self.preset_combo.configure(values=list(self._preset_key_to_label.values()))
 
     def _update_preset_buttons_state(self):
-        import theme
         is_custom = self._current_preset_key() not in theme.RESERVED_PRESET_NAMES
         state = "normal" if is_custom else "disabled"
         self.rename_preset_btn.configure(state=state)
         self.remove_preset_btn.configure(state=state)
 
     def _update_preset_desc_label(self):
-        import theme
 
         key = self._current_preset_key()
         if key == theme.SYSTEM_PRESET:
@@ -1007,7 +922,6 @@ class SettingsWindow(tk.Toplevel):
         self.preset_desc_label.configure(text=text)
 
     def _on_theme_preset_selected(self, _event=None):
-        import theme
 
         key = self._current_preset_key()
         self.theme_working.update(theme.resolve_preset_colors(key, self.cfg.get("theme_presets", {})))
@@ -1018,7 +932,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"theme", "ui"})
 
     def _save_theme_preset(self):
-        import theme
 
         self.theme_working["font_family"] = self.font_family_var.get() or CODE_FONT
         name = simpledialog.askstring(
@@ -1045,7 +958,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"ui"})
 
     def _rename_theme_preset(self):
-        import theme
 
         key = self._current_preset_key()
         presets = self.cfg.setdefault("theme_presets", {})
@@ -1078,7 +990,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"ui"})
 
     def _remove_theme_preset(self):
-        import theme
 
         key = self._current_preset_key()
         presets = self.cfg.setdefault("theme_presets", {})
@@ -1092,51 +1003,28 @@ class SettingsWindow(tk.Toplevel):
         self._refresh_preset_choice_maps()
         self._update_preset_combo_values()
         self.theme_preset_var.set(theme.SYSTEM_PRESET_LABEL)
-        # Route through the normal selection handler rather than just
-        # setting the combobox's text: a StringVar.set() doesn't fire
-        # <<ComboboxSelected>>, so the old code here never actually
-        # re-resolved and applied System's colors - the picker *showed*
-        # System while theme_working (and the live preview) silently kept
-        # whatever the just-removed preset last looked like, until the
-        # user clicked the System entry themselves. Calling the handler
-        # directly is what actually loads and previews System's colors.
+        # Route through the normal selection handler rather than just setting the combobox's text.
         self._on_theme_preset_selected()
 
     def _refresh_syntax_choice_maps(self):
-        """Rebuilds the label<->key maps the syntax palette combobox
-        uses, straight from syntax.COLOR_THEMES - so it automatically
-        picks up whatever sync_saved_palettes() last put there. Mirrors
-        _refresh_preset_choice_maps().
-
-        "custom" is kept in the full label<->key map (so button-state/
-        tile/lookup code that resolves "whatever's selected" still works
-        correctly while it's active) but left out of
-        _syntax_theme_selectable, the list the dropdown itself is built
-        from: it's an internal staging slot the Advanced dialog uses for
-        in-progress edits, not a real preset a person should be able to
-        pick from the list - Save As is what turns those edits into a
-        real, selectable, named preset."""
-        import syntax
+        """Rebuilds the label<->key maps the syntax palette combobox uses, straight from syntax.COLOR_THEMES."""
         self._syntax_theme_choices = [(key, spec["label"]) for key, spec in syntax.COLOR_THEMES.items()]
         self._label_to_syntax_theme = {label: key for key, label in self._syntax_theme_choices}
         self._syntax_theme_selectable = [(k, l) for k, l in self._syntax_theme_choices if k != "custom"]
 
     def _current_syntax_key(self):
-        import syntax
         return self._label_to_syntax_theme.get(self.syntax_theme_var.get(), syntax.DEFAULT_COLOR_THEME)
 
     def _update_syntax_preset_combo_values(self):
         self.syntax_combo.configure(values=[label for _key, label in self._syntax_theme_selectable])
 
     def _update_syntax_preset_buttons_state(self):
-        import syntax
         is_saved = self._current_syntax_key() not in syntax.RESERVED_PALETTE_NAMES
         state = "normal" if is_saved else "disabled"
         self.rename_syntax_preset_btn.configure(state=state)
         self.remove_syntax_preset_btn.configure(state=state)
 
     def _on_syntax_theme_selected(self, _event=None):
-        import syntax
         key = self._current_syntax_key()
         self.cfg.setdefault("editor", {})["syntax_theme"] = key
         self.syntax_theme_desc_label.configure(text=self._syntax_theme_desc_text(key))
@@ -1145,7 +1033,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"editor"})
 
     def _save_syntax_palette_preset(self):
-        import syntax
 
         name = simpledialog.askstring(
             "Save Syntax Palette Preset", "Preset name:", parent=self)
@@ -1160,9 +1047,7 @@ class SettingsWindow(tk.Toplevel):
                 f'"{name}" is a reserved name. Choose a different name.', parent=self)
             return
         presets = self.cfg.setdefault("syntax_palette_presets", {})
-        # Snapshots whatever palette is actually resolved and on screen
-        # right now (works whether that's Auto, a built-in, or another
-        # saved preset) rather than requiring "Custom" to be active first.
+        # Snapshots whatever palette is actually resolved and on screen right now rather than requiring "Custom" to be active first.
         presets[name] = syntax.active_palette_colors()
         syntax.sync_saved_palettes(presets)
         self.cfg.setdefault("editor", {})["syntax_theme"] = name
@@ -1175,7 +1060,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"editor"})
 
     def _rename_syntax_palette_preset(self):
-        import syntax
 
         key = self._current_syntax_key()
         presets = self.cfg.setdefault("syntax_palette_presets", {})
@@ -1209,7 +1093,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"editor"})
 
     def _remove_syntax_palette_preset(self):
-        import syntax
 
         key = self._current_syntax_key()
         presets = self.cfg.setdefault("syntax_palette_presets", {})
@@ -1224,9 +1107,7 @@ class SettingsWindow(tk.Toplevel):
         self._refresh_syntax_choice_maps()
         self._update_syntax_preset_combo_values()
         self.syntax_theme_var.set(syntax.COLOR_THEMES[syntax.DEFAULT_COLOR_THEME]["label"])
-        # Same fix as _remove_theme_preset below: go through the real
-        # selection handler so Auto's colors are actually resolved and
-        # previewed, instead of just relabeling the combobox.
+        # Same fix as _remove_theme_preset below.
         self._on_syntax_theme_selected()
 
     def _build_presets_section(self, rows, t):
@@ -1237,8 +1118,6 @@ class SettingsWindow(tk.Toplevel):
         preview tiles below both (see _refresh_preset_tiles) so picking a
         look doesn't require opening the Advanced section at all. Returns
         the next free grid row."""
-        import syntax
-        import theme
 
         self._section_header(rows, 0, "Presets", pady=(4, 4), columnspan=3)
         row = 1
@@ -1324,32 +1203,11 @@ class SettingsWindow(tk.Toplevel):
         return row
 
     def _refresh_preset_tiles(self):
-        """Redraws the row of clickable preset preview tiles: one per
-        color theme preset (System/Midnight/Daybreak/anything saved),
-        each a small Windows-customization-style swatch of that preset's
-        own app colors plus a peek at the *currently selected* syntax
-        palette on top of it (resolving Auto against that tile's own
-        editor background, same as the live app would). Clicking a tile
-        picks that color theme preset, same as picking it from the combo
-        above it - rebuilt from scratch on every call since it's cheap
-        and only runs on an explicit preset change, never on every
-        keystroke/color-pick. Chrome (the cell/border/name-label around
-        each swatch) is colored from self.theme_working rather than
-        self.app.theme: theme_working updates the instant any color
-        changes, in this same call stack, while self.app.theme only
-        catches up later via the _preview -> on_apply -> apply_theme_live
-        round trip - using it here made the tiles' own frame flash the
-        *previous* theme's colors for a moment on every switch, which is
-        exactly the mismatched, contrasty look this replaces."""
-        import syntax
-        import theme
+        """Redraws the row of clickable preset preview tiles."""
 
         if not hasattr(self, "tiles_frame"):
             return
-        # Reuse the existing tiles whenever the set of presets is unchanged
-        # and repaint them in place: destroying and recreating every tile on
-        # each pick blanked the whole row for a frame. The tiles are only
-        # rebuilt if the preset list itself changed.
+        # Reuse the existing tiles whenever the set of presets is unchanged and repaint them in place.
         tiles = getattr(self, "_preset_tiles", None)
         if tiles is None or set(tiles) != set(self._preset_key_to_label):
             for child in self.tiles_frame.winfo_children():
@@ -1405,14 +1263,7 @@ class SettingsWindow(tk.Toplevel):
         self._on_theme_preset_selected()
 
     def _open_advanced_theme_colors(self):
-        """The ten-plus individual color settings, in a popup window -
-        same shape as _open_advanced_syntax_colors right next to it:
-        picking a color here previews live immediately (same as anywhere
-        else colors get edited), and there's deliberately no separate
-        Save/Cancel in this sub-window since the outer Settings window's
-        own Save/Cancel already covers whatever got changed in here too
-        (self.theme_working is the same working copy the color theme
-        preset picker itself edits)."""
+        """The ten-plus individual color settings, in a popup window."""
         t = self.app.theme
         dlg = tk.Toplevel(self)
         dlg.title("Advanced: Color Theme")
@@ -1438,9 +1289,7 @@ class SettingsWindow(tk.Toplevel):
                 self._build_advanced_color_row(rows, row, t, key, title, desc)
                 row += 1
 
-        # Content is fully built by this point, so every row/label/swatch
-        # just added gets the wheel binding too - see the matching note
-        # on _build_theme_tab's own call below.
+        # Content is fully built by this point, so every row/label/swatch just added gets the wheel binding too.
         scrollutil.bind_wheel(canvas, rows)
 
     def _build_advanced_color_row(self, rows, row, t, key, title, desc):
@@ -1551,9 +1400,6 @@ class SettingsWindow(tk.Toplevel):
         self._preview({"theme"})
 
     def _build_config_tab(self, parent):
-        import os
-        import sys
-        import subprocess
 
         t = self.app.theme
 
@@ -1575,7 +1421,6 @@ class SettingsWindow(tk.Toplevel):
         is_termux = "com.termux" in os.environ.get("PREFIX", "")
 
         def open_folder():
-            import shutil
 
             folder = str(path.parent)
             try:
@@ -1606,14 +1451,11 @@ class SettingsWindow(tk.Toplevel):
         btn_row.pack(fill="x", padx=8, pady=(0, 10))
         self._reg(tk.Button(btn_row, text="Open Containing Folder", command=open_folder),
                   bg="panel_bg", fg="fg", activebackground="sel_bg", activeforeground="fg").pack(side="left")
-        # Deliberately not _reg()'d: a fixed warning red, like Run/Stop/
-        # Disconnect elsewhere, not a themed color that should shift with
-        # the preset.
+        # Deliberately not _reg'd: a fixed warning red, like Run/Stop/ Disconnect elsewhere.
         tk.Button(btn_row, text="Delete Config File", command=self._delete_config_file,
                   bg="#5a3030", fg="white", activebackground="#734040").pack(side="left", padx=8)
 
     def _delete_config_file(self):
-        import os
         path = config.get_config_path()
         if not path.exists():
             messagebox.showinfo("Delete Config File", "There's no config file on disk yet.", parent=self)
@@ -1647,7 +1489,6 @@ class SettingsWindow(tk.Toplevel):
             "terminal_messages": dict(config.DEFAULTS["editor"]["terminal_messages"]),
             "word_wrap": config.DEFAULTS["editor"]["word_wrap"],
         }
-        import theme
         theme.apply_active_preset(self.cfg)  # resolves "system" against the OS, same as a fresh launch
         self.shortcuts_working = dict(self.cfg["shortcuts"])
         self.output_shortcuts_working = dict(self.cfg["output_shortcuts"])
@@ -1691,7 +1532,6 @@ class SettingsWindow(tk.Toplevel):
                 self._action_scope[action_id] = (self.shortcuts_working, "shortcuts")
             elif action_id in self.output_shortcuts_working:
                 self._action_scope[action_id] = (self.output_shortcuts_working, "output_shortcuts")
-        import syntax
         syntax.set_custom_colors(self.cfg["editor"]["custom_syntax_colors"])
         syntax.set_color_theme(self.cfg["editor"]["syntax_theme"])
         self.cfg["chat"] = copy.deepcopy(config.DEFAULTS["chat"])
@@ -1709,21 +1549,12 @@ class SettingsWindow(tk.Toplevel):
             label.configure(text=self._accel_display(working.get(action_id, "")))
 
     def _refresh_theme_ui(self):
-        import syntax
-        import theme
 
         for key, swatch in self.color_vars.items():
             try:
                 swatch.configure(bg=self.theme_working[key])
             except tk.TclError:
-                # The swatch belongs to the Advanced: Color Theme dialog,
-                # which may have been closed (destroyed) since color_vars
-                # was populated - color_vars itself is only overwritten
-                # the next time that dialog is reopened, so a stale entry
-                # here is expected, not a bug. Skipping it (same pattern
-                # as _apply_live_theme above) keeps the rest of this
-                # method - crucially _refresh_preset_tiles() below - from
-                # being aborted by it.
+                # The swatch's popup was closed in the meantime.
                 pass
         self._suspend_preview = True
         self.font_family_var.set(self.theme_working["font_family"])
@@ -1753,7 +1584,6 @@ class SettingsWindow(tk.Toplevel):
         self._suspend_preview = False
 
     def _refresh_general_ui(self):
-        import syntax
         code = self.cfg.get("editor", {}).get("default_new_file_language", "python")
         self.default_language_var.set(syntax.LANGUAGE_LABELS.get(code, "Python"))
         term_cfg = self.cfg.get("editor", {}).get("terminal_messages", {})
@@ -1770,7 +1600,6 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg.get("explorer_sort_reverse", config.DEFAULTS["ui"]["explorer_sort_reverse"]))
 
     def _reset_defaults(self):
-        import syntax
 
         tab = self._current_tab()
         if tab == "Shortcuts":
@@ -1784,7 +1613,6 @@ class SettingsWindow(tk.Toplevel):
             self._refresh_shortcuts_ui()
             self._preview({"shortcuts", "output_shortcuts"})
         elif tab == "Theme":
-            import theme
 
             self.theme_working = dict(config.DEFAULTS["theme"])
             self.theme_working.update(theme.resolve_preset_colors(theme.SYSTEM_PRESET))
@@ -1796,12 +1624,7 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg["explorer_font_family"] = "sans-serif"
             ui_cfg["console_font_size"] = max(base_font_size - 1, 8)
             ui_cfg["console_font_family"] = base_font_family
-            # The syntax palette lives on this tab now too (see the
-            # combined Presets section), so resetting Theme resets it
-            # right alongside the ten app colors it's shown next to -
-            # this intentionally does NOT touch either's saved presets
-            # (theme_presets / syntax_palette_presets), same as picking
-            # System from the dropdown never deletes your other presets.
+            # The syntax palette lives on this tab now too.
             editor_cfg = self.cfg.setdefault("editor", {})
             editor_cfg["syntax_theme"] = config.DEFAULTS["editor"]["syntax_theme"]
             editor_cfg["custom_syntax_colors"] = dict(config.DEFAULTS["editor"]["custom_syntax_colors"])
@@ -1930,7 +1753,6 @@ class SettingsWindow(tk.Toplevel):
             self.cfg.setdefault("editor", {})["syntax_theme"] = self._orig_syntax_theme
             reverted.add("editor")
         if self.cfg.get("editor", {}).get("custom_syntax_colors", {}) != self._orig_custom_colors:
-            import syntax
             restored = {k: dict(v) for k, v in self._orig_custom_colors.items()}
             self.cfg.setdefault("editor", {})["custom_syntax_colors"] = restored
             syntax.set_custom_colors(restored)
@@ -1992,7 +1814,6 @@ class SettingsWindow(tk.Toplevel):
             ui_cfg["theme_preset"] = self._orig_theme_preset
             reverted.add("ui")
         if self.cfg.get("syntax_palette_presets", {}) != self._orig_syntax_palette_presets:
-            import syntax
             restored_presets = {k: {tag: dict(c) for tag, c in v.items()}
                                  for k, v in self._orig_syntax_palette_presets.items()}
             self.cfg["syntax_palette_presets"] = restored_presets

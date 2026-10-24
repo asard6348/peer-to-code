@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import config
+import fileio
 import theme
 import dnd_support
 import scrollutil
@@ -13,32 +14,34 @@ from net.client import Client, ConnectError, ConnectCancelled
 from net import nat
 
 DEFAULT_PORT = 5123
-CODE_FONT = "Consolas" if os.name=='nt' else "Hack"
+from config import CODE_FONT
 
 
 def parse_address(text, default_host="127.0.0.1", default_port=DEFAULT_PORT):
-    """Accepts 'host:port', ':port', 'port', or 'host' and fills in the rest."""
+    """Accept 'host:port', ':port', 'port' or 'host' (IPv4/hostname) and fill in the rest."""
     text = (text or "").strip()
     if not text:
         return default_host, default_port
+    if text.count(":") > 1 or text.startswith("["):
+        raise ValueError("IPv6 addresses are not supported; use an IPv4 address or a hostname")
     if ":" in text:
         host, _, port_s = text.rpartition(":")
-        host = host or default_host
-        try:
-            return host, int(port_s)
-        except ValueError:
-            raise ValueError(f"'{port_s}' is not a valid port")
-    if text.isdigit():
-        return default_host, int(text)
-    return text, default_port
+        host = host.strip() or default_host
+    elif text.isdigit():
+        host, port_s = default_host, text
+    else:
+        return text, default_port
+    try:
+        port = int(port_s)
+    except ValueError:
+        raise ValueError(f"'{port_s}' is not a valid port") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Port {port} is out of range (1-65535)")
+    return host, port
 
 
 def _is_loopback_host(host):
-    """True for 127.0.0.1, ::1, localhost, and the like - addresses that
-    only ever mean "this machine", which is meaningless as a Peer to Peer
-    address (nobody else can be reached at it, and there's no NAT for it
-    to traverse). Same-machine and same-network testing is exactly what
-    the Connect tab's Host/Connect is for."""
+    """True for 127.0.0.1, ::1, localhost, and the like."""
     host = (host or "").strip().lower()
     if host in ("localhost", "0.0.0.0", "::1", ""):
         return True
@@ -52,21 +55,7 @@ TABS = ["Open", "Connect", "Peer to Peer"]
 
 
 class ConnectWindow(ttk.Frame):
-    """Start screen with three tabs:
-      - Open: local-only, no hosting or connecting; pick a folder or a
-        single file, plus a recent-projects list for quick access.
-      - Connect: host a port, or connect to an address (host:port). Fixed
-        host for the whole session.
-      - Peer to Peer: decentralized mesh, no fixed host. Start a new mesh
-        or join one through any existing member's address; if whoever is
-        currently sequencing the session disappears, the mesh elects a
-        replacement and everyone reconnects automatically (see
-        net.client.FailoverController).
-    Calls on_ready(mode, client, server, working_dir, username, extra) once
-    a session is live. `extra` is an optional dict of mode-specific info
-    (currently {"open_file": path} for a single-file Open, or
-    {"p2p_advertise": (host, port)} for p2p mode).
-    """
+    """Start screen with Open (local only), Connect (host or join) and Peer to Peer tabs."""
 
     def __init__(self, master, cfg, on_ready, initial_path=None):
         super().__init__(master)
@@ -79,10 +68,7 @@ class ConnectWindow(ttk.Frame):
         self._cancel_requested = threading.Event()
         self._busy = False
         self._action_buttons = []
-        # Every classic (non-ttk) widget built with an explicit theme
-        # color, so apply_theme_live can repaint all of them at once -
-        # see _reg's docstring. ttk-styled widgets don't need this: a
-        # restyled "TFrame"/"TLabel"/etc. repaints them for free.
+        # Every classic widget built with an explicit theme color.
         self._theme_widgets = []
         self._build_style()
         self._build_ui()
@@ -111,25 +97,13 @@ class ConnectWindow(ttk.Frame):
             self._flash_hint(hint, "Path filled from drag and drop.")
 
     def _reg(self, widget, **color_options):
-        """Registers a classic (non-ttk) widget's theme-derived options so
-        apply_theme_live can put current colors on it later - the same
-        idea as SettingsWindow._reg. `color_options` maps a tk config
-        option name to the THEME_COLOR_KEYS key that supplies its value.
-        Returns `widget` so calls can stay inline."""
+        """Registers a classic widget's theme-derived options so apply_theme_live can put current colors on it later."""
         if color_options:
             self._theme_widgets.append((widget, color_options))
         return widget
 
     def apply_theme_live(self, new_theme):
-        """Repaints this whole screen with `new_theme` without rebuilding
-        it - called by App whenever the theme changes while the connect
-        screen (rather than the editor) happens to be showing: right now
-        that's only a live system dark/light switch (see
-        App._poll_system_theme), since Settings itself only opens from
-        the editor. Mirrors EditorApp.apply_theme_live: restyle the
-        shared ttk styles (instantly repaints every ttk-styled widget
-        here, which is most of the screen), then push the same colors
-        onto the handful of classic tk widgets ttk styling can't reach."""
+        """Repaints this whole screen with `new_theme` without rebuilding it."""
         self.theme = t = new_theme
         self._build_style()
         toplevel = self.winfo_toplevel()
@@ -140,9 +114,7 @@ class ConnectWindow(ttk.Frame):
                 widget.configure(**{opt: t[key] for opt, key in color_options.items()})
             except tk.TclError:
                 pass
-        # lbl/underline's colors depend on which tab is selected, so they
-        # aren't in the generic registry above - refresh them the same
-        # way _select_tab does, just without changing the active tab.
+        # lbl/underline's colors depend on which tab is selected, so they aren't in the generic registry above.
         for name, (lbl, underline) in self._tab_widgets.items():
             selected = (name == self._active_tab)
             lbl.configure(bg=t["bg"], fg=t["fg"] if selected else t["muted_fg"])
@@ -186,10 +158,7 @@ class ConnectWindow(ttk.Frame):
         self._rebind_wheel()
 
     def _build_scrollable_page_area(self, parent):
-        """The area holding each tab's content, wrapped in a scrollable
-        canvas so a tab with a lot of rows (Peer to Peer, mainly) scrolls
-        internally on a short window instead of overflowing past the
-        window edge with no way to reach the rest of it."""
+        """The area holding each tab's content."""
         t = self.theme
         area = ttk.Frame(parent, style="TFrame")
         area.pack(fill="both", expand=True)
@@ -275,11 +244,7 @@ class ConnectWindow(ttk.Frame):
                 fg=t["fg"] if selected else t["muted_fg"],
             )
             underline.configure(bg=t["accent"] if selected else t["bg"])
-        # Everything below runs in this one callback, in an order that never
-        # shows an in-between frame: scroll back to the top *before* the
-        # swap (not in an after_idle afterwards, which painted the new page
-        # at the old scroll offset first), and show the new page before
-        # hiding the old one so the container never collapses to nothing.
+        # Everything below runs in this one callback, in an order that never shows an in-between frame.
         self._page_canvas.yview_moveto(0)
         self._pages[name].pack(fill="both", expand=True)
         for n, page in self._pages.items():
@@ -313,24 +278,7 @@ class ConnectWindow(ttk.Frame):
         return inner
 
     def _bind_dynamic_wrap(self, label, min_width=60):
-        """Keeps `label`'s wraplength in sync with the width it's actually
-        given, so its text reflows as the window is resized (see
-        _select_tab / the Address and Join hints).
-
-        Pinning `width=1` here is load-bearing, not cosmetic: without it,
-        a columnspan-2 label's own natural (unwrapped) width feeds into
-        the very grid column-width calculation that decides its
-        allocated width on the next pass. Nothing else in this row
-        anchors that column to a fixed size (unlike, say, a label next to
-        a fixed-width combobox), so the label's requested width and its
-        allocated width can end up chasing each other back and forth
-        forever - Tk spins applying alternating wraplengths and never
-        finishes laying out the window, so it silently never appears.
-        Fixing `width` to a small constant removes the label from that
-        negotiation entirely: its requested width no longer depends on
-        its own wraplength, only the externally-driven allocated width
-        (from the entry fields' fixed width and the window's own size)
-        feeds into wraplength, so there's nothing left to oscillate."""
+        """Keeps `label`'s wraplength in sync with the width it's actually given, so its text reflows as the window is resized."""
         label.configure(width=1)
         def on_configure(e, l=label):
             new_width = max(min_width, e.width)
@@ -340,14 +288,7 @@ class ConnectWindow(ttk.Frame):
         label.bind("<Configure>", on_configure)
 
     def _dir_row(self, inner, row, var):
-        """Path field with a single Browse button that lets the entry hold
-        either a folder or a single file - picking a file puts the app in
-        single-file mode on the Open tab (see _do_open_project), or hosts/
-        joins with that one file as the shared buffer on Connect/P2P.
-        Whatever fills the Path field this way - Browse, or a drag-and-drop
-        onto the window (see _on_window_drop) - gets a brief inline
-        confirmation underneath so it's clear the field was actually
-        updated, not just that a dialog closed."""
+        """Path field with a single Browse button that lets the entry hold either a folder or a single file."""
         ttk.Label(inner, text="Path", style="Panel.TLabel").grid(row=row, column=0, sticky="w")
         dir_row = ttk.Frame(inner, style="Panel.TFrame")
         dir_row.grid(row=row + 1, column=0, columnspan=2, sticky="we", pady=(2, 2))
@@ -379,10 +320,7 @@ class ConnectWindow(ttk.Frame):
             self._flash_hint(hint, "Path filled from Browse.")
 
     def _prompt_file_or_directory(self):
-        """Small chooser standing in for Browse - Tkinter has no single
-        native dialog that picks either a file or a folder, so this asks
-        which kind first, then shows the matching native dialog. Returns
-        "file", "directory", or None if cancelled."""
+        """Small chooser standing in for Browse."""
         t = self.theme
         dlg = tk.Toplevel(self)
         dlg.title("Browse")
@@ -399,12 +337,7 @@ class ConnectWindow(ttk.Frame):
             result["kind"] = kind
             dlg.destroy()
 
-        # Plain tk.Button, so it only picks up theme colors from the Tk
-        # option database at creation time (see theme.apply_classic_
-        # widget_defaults) - fine here since this dialog is rebuilt fresh
-        # every time it's opened, unlike the Settings window's buttons
-        # which also need a live _reg() registration to repaint while a
-        # theme preset is being switched with the dialog already open.
+        # Plain tk.Button, so it only picks up theme colors from the Tk option database at creation time.
         tk.Button(btn_row, text="File", width=8, command=lambda: pick("file")).pack(side="left", padx=6)
         tk.Button(btn_row, text="Folder", width=8, command=lambda: pick("directory")).pack(side="left", padx=6)
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
@@ -414,10 +347,7 @@ class ConnectWindow(ttk.Frame):
         return result.get("kind")
 
     def _flash_hint(self, label, text):
-        """Shows `text` on `label` briefly, then clears it - the little
-        inline confirmation that a Path field was actually autofilled
-        (by Browse, drag-and-drop, ...) rather than the person having to
-        notice the field's contents changed on their own."""
+        """Shows `text` on `label` briefly, then clears it."""
         label.configure(text=text)
         job = getattr(label, "_clear_job", None)
         if job is not None:
@@ -425,14 +355,7 @@ class ConnectWindow(ttk.Frame):
         label._clear_job = label.after(1800, lambda: label.configure(text=""))
 
     def _add_placeholder(self, entry, text):
-        """ttk.Entry has no native placeholder text, so fake one: show a
-        muted example value whenever the field is empty and unfocused.
-        Deliberately does not go through a textvariable, since linking one
-        would make the placeholder string itself get read back as real
-        input, which is worse than no hint at all. Callers should read
-        the field with _entry_value(), which already strips the
-        placeholder back out to "".
-        """
+        """ttk.Entry has no native placeholder text, so fake one."""
         t = self.theme
         entry._placeholder_text = text
         entry._showing_placeholder = False
@@ -455,14 +378,7 @@ class ConnectWindow(ttk.Frame):
         show_placeholder()
 
     def _entry_value(self, entry, use_placeholder=False):
-        """Current text of an entry set up with _add_placeholder(). With
-        use_placeholder=False (the default), a currently-showing placeholder
-        reports as "" - used wherever leaving the field blank means
-        something distinct (e.g. the Join field blank means "start a new
-        mesh instead"). With use_placeholder=True, a currently-showing
-        placeholder reports its hint text instead - used wherever the
-        hint is actually a sensible default the field should fall back to
-        rather than a value the person must type themselves."""
+        """Current text of an entry set up with _add_placeholder()."""
         if getattr(entry, "_showing_placeholder", False):
             return entry._placeholder_text if use_placeholder else ""
         return entry.get().strip()
@@ -492,9 +408,7 @@ class ConnectWindow(ttk.Frame):
     def _refresh_recent_projects(self):
         t = self.theme
         recents = self.cfg["connection"].get("recent_projects") or []
-        # Nothing changed since the rows were last built (same list, same
-        # theme): keep them. Rebuilding on every switch to the Open tab
-        # briefly emptied the list.
+        # Nothing changed since the rows were last built (same list, same theme): keep them.
         signature = (tuple(recents), t["panel_bg"], t["fg"])
         if self._recent_row_widgets and getattr(self, "_recent_signature", None) == signature:
             return
@@ -528,13 +442,7 @@ class ConnectWindow(ttk.Frame):
                 r.configure(bg=t["panel_bg"]); l.configure(bg=t["panel_bg"])
 
             def on_right_click(e, m=menu):
-                # No explicit grab_release() here - tk_popup() already
-                # sets its own internal grab so it can detect and
-                # dismiss on an outside click; releasing that grab right
-                # away (the usual copy-pasted idiom) undoes it before
-                # the user gets a chance to click anything, leaving the
-                # menu stuck open forever. file_explorer.py's tree
-                # context menu relies on the same built-in behavior.
+                # No explicit grab_release here - tk_popup already sets its own internal grab so it can detect and dismiss on an outside click.
                 m.tk_popup(e.x_root + 4, e.y_root + 4)
 
             for widget in (row, label):
@@ -551,13 +459,7 @@ class ConnectWindow(ttk.Frame):
         self._refresh_recent_projects()
 
     def _copy_recent_project(self, path, label=None, original_text=None):
-        """Puts `path` on the system clipboard rather than filling any
-        particular field directly - the Recent list only shows up on the
-        Open tab, but the whole point of Copy is reusing one of these
-        paths to host on the Connect or Peer to Peer tab instead, so
-        there's no single field to fill it into automatically. From the
-        clipboard it can be pasted into whichever Path field is actually
-        wanted with a normal Ctrl+V, instead of browsing to it again."""
+        """Puts `path` on the system clipboard rather than filling any particular field directly."""
         self.clipboard_clear()
         self.clipboard_append(path)
         if label is not None and original_text is not None:
@@ -587,10 +489,9 @@ class ConnectWindow(ttk.Frame):
 
         if single_file:
             try:
-                with open(single_file, "r", encoding="utf-8") as f:
-                    f.read()
+                fileio.read_text(single_file)
             except (OSError, UnicodeDecodeError) as e:
-                messagebox.showerror("Open File", str(e))
+                messagebox.showerror("Open File", f"Can't open this file as UTF-8 text: {e}")
                 return
 
         self.open_dir_var.set(raw)
@@ -598,9 +499,9 @@ class ConnectWindow(ttk.Frame):
         self.cfg["connection"]["working_dir"] = wdir
         self._set_busy(True, "Opening...")
 
-        server = Server(0)
-        actual_port = server.transport.local_port
         try:
+            server = Server(0)
+            actual_port = server.transport.local_port
             server.start()
         except OSError as e:
             self._set_busy(False, f"Could not open: {e}")
@@ -818,14 +719,7 @@ class ConnectWindow(ttk.Frame):
         return f"{local_ip}:{DEFAULT_PORT}" if local_ip else "no network detected"
 
     def _refresh_p2p_addr_placeholder(self):
-        """Re-detects the local address and updates the Address field's
-        placeholder to match - called whenever the Peer to Peer tab
-        becomes active, so a network that connected or dropped since the
-        field was first built (or since it was last looked at) doesn't
-        leave a stale guess on screen. Only touches the field while it's
-        still showing a placeholder; a value the person actually typed,
-        or the post-STUN address filled in by _set_p2p_addr_display, is
-        never overwritten by this."""
+        """Re-detects the local address and updates the Address field's placeholder to match."""
         entry = self.p2p_addr_entry
         text = self._p2p_addr_placeholder_text()
         entry._placeholder_text = text
@@ -834,10 +728,7 @@ class ConnectWindow(ttk.Frame):
             entry.insert(0, text)
 
     def _set_p2p_addr_display(self, text):
-        """Reflects the address actually in use (post-STUN) back into the
-        Address field, replacing whatever was there - typed value or
-        placeholder alike - so what's on screen always matches what the
-        mesh is really advertising."""
+        """Reflects the address actually in use back into the Address field, replacing whatever was there."""
         entry = self.p2p_addr_entry
         entry._showing_placeholder = False
         entry.configure(foreground=self.theme["fg"])
@@ -853,15 +744,7 @@ class ConnectWindow(ttk.Frame):
         config.save_config(self.cfg)
 
     def _require_network(self):
-        """Bails out with a clear message instead of silently starting (or
-        joining) a Peer to Peer session that has no way to reach anyone.
-        net.nat.guess_local_ip() returns None in exactly that situation -
-        no network interface with a route at all: Wi-Fi off, cable
-        unplugged, airplane mode, etc. Checked fresh at the moment
-        Start/Join is actually clicked rather than trusting whatever the
-        Address field's placeholder happened to show when the tab was
-        built or last looked at, since the network can connect or drop
-        at any point while this tab just sits there."""
+        """Bails out with a clear message instead of silently starting a Peer to Peer session that has no way to reach anyone."""
         try:
             has_network = nat.guess_local_ip() is not None
         except Exception:
@@ -955,10 +838,7 @@ class ConnectWindow(ttk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _ask_on_main_thread(self, title, message):
-        """messagebox calls must happen on the Tk thread, but this is
-        called from a connection worker thread - hands the dialog to
-        self.after() and blocks this thread (not the Tk one) until it has
-        an answer."""
+        """messagebox calls must happen on the Tk thread, but this is called from a connection worker thread."""
         result = {}
         done = threading.Event()
 
@@ -1132,9 +1012,7 @@ class ConnectWindow(ttk.Frame):
 
     def _ready(self, mode, client, server, wdir, name, extra=None, recent_path=None):
         self._current_client = None
-        # Registered only now that the session is actually live (a failed
-        # or cancelled connection never gets here), and before on_ready,
-        # which may tear this screen down.
+        # Registered only now that the session is actually live, and before on_ready, which may tear this screen down.
         if recent_path:
             self._register_recent(recent_path)
         self.on_ready(mode, client, server, wdir, name, extra)

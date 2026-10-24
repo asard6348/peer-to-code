@@ -9,18 +9,17 @@ import share_util
 from . import transport as p
 from .transport import ReliableUDP
 
-# Terminal chat limits. Rate limit is a token bucket: a client may send
-# CHAT_RATE_BURST messages at once and then regains tokens at
-# CHAT_RATE_BURST / CHAT_RATE_PERIOD per second (5 per 5 seconds = 1/s).
+# Chat rate limit: token bucket of CHAT_RATE_BURST, refilled at BURST / PERIOD per second.
 CHAT_HISTORY_MAX = 50
 CHAT_RATE_BURST = 5
 CHAT_RATE_PERIOD = 5.0
 CHAT_MAX_RECIPIENTS = 16
 
-# Upper bound on simultaneously shared documents, so a misbehaving peer
-# can't make every other peer allocate tabs without limit.
 MAX_DOCS = 32
 FILENAME_MAX = 200
+MAX_DOC_CHARS = 50_000_000
+HISTORY_KEEP = 2000         # per-document ops kept for transforming late ops; older bases resync
+MAX_PORT = 65535
 
 COLORS = ["#e06c75", "#61afef", "#98c379", "#e5c07b", "#c678dd", "#56b6c2", "#d19a66", "#be5046"]
 
@@ -35,30 +34,32 @@ class ClientRecord:
         self.p2p_host = p2p_host
         self.p2p_port = p2p_port
         self.is_sequencer = is_sequencer
-        self.chat_tokens = None  # token bucket, filled lazily (see Server._chat_allow)
+        self.chat_tokens = None
         self.chat_stamp = 0.0
-        self.share = None  # the runner's current/last shared run (see Server._handle_share)
+        self.share = None   # this client's current/last shared run
 
 
 class DocState:
-    """One shared document: its text, its own op history and revision
-    counter (ops are numbered per document, never across them) and the
-    name peers show for it."""
+    """One shared document: text, revision, and the op history from `history_base` on."""
 
     def __init__(self, text="", filename=None):
         self.doc = text
         self.history = []
+        self.history_base = 0
         self.revision = 0
         self.filename = filename
+
+    def record(self, op):
+        self.history.append(op)
+        self.revision += 1
+        if len(self.history) > 2 * HISTORY_KEEP:
+            del self.history[:HISTORY_KEEP]
+            self.history_base += HISTORY_KEEP
 
 
 class Server:
     def __init__(self, port, initial_doc="", max_clients=32, sock=None, initial_docs=None):
-        """`initial_docs` ({doc id: (text, filename)}) seeds the session with
-        several documents at once - how a peer promoted to sequencer after a
-        failover carries every shared buffer over under the same ids, so
-        everyone else's tabs still line up. Without it the session starts
-        with the single, empty (or `initial_doc`) document MAIN_DOC."""
+        """`initial_docs` ({doc id: (text, filename)}) keeps ids stable when a peer takes over as sequencer."""
         self.port = port
         self.docs = {}
         if initial_docs:
@@ -74,7 +75,7 @@ class Server:
         self.transport = ReliableUDP(("0.0.0.0", port), sock=sock)
         self.transport.on_message = self._on_message
         self.transport.on_foreign_version = self._on_foreign_version
-        self._refused_versions = {}     # addr -> when we last logged refusing it
+        self._refused_versions = {}
         self.transport.on_peer_timeout = self._on_peer_timeout
         self.log = []
         self.on_log = None
@@ -103,10 +104,7 @@ class Server:
         self.transport.stop()
 
     def _on_foreign_version(self, addr, version, kind, seq, flags):
-        """Someone on another protocol version is trying to join. They can't
-        be served, but they can be told why: an older client shows the
-        reason of a HELLO_REJECT it receives (in its own dialect) as the
-        connection error, instead of waiting for a timeout."""
+        """Tell a joiner on another protocol version why it can't join, in its own dialect."""
         if kind != p.HELLO:
             return
         if flags & p.FLAG_RELIABLE:
@@ -115,6 +113,8 @@ class Server:
                                        {"reason": p.mismatch_message(version, host_is_theirs=False)})
         now = time.monotonic()
         if now - self._refused_versions.get(addr, -1e9) > 30:
+            if len(self._refused_versions) > 256:
+                self._refused_versions.clear()
             self._refused_versions[addr] = now
             self._emit_log(f"Refused {addr[0]}:{addr[1]}: it runs protocol version {version}, "
                            f"this host runs version {p.PROTOCOL_VERSION}")
@@ -139,6 +139,8 @@ class Server:
             ]}
 
     def _on_message(self, kind, payload, addr):
+        if not isinstance(payload, dict):
+            return
         if kind == p.HELLO:
             self._handle_hello(payload, addr)
         elif kind == p.OP:
@@ -163,15 +165,19 @@ class Server:
             if len(self.clients) >= self.max_clients:
                 self.transport.send(addr, p.HELLO_REJECT, {"reason": "Session is full."}, reliable=True)
                 return
-            # Names are what chat targets, the roster lists and cursors
-            # label, so they're sanitized and made unique right here (bob,
-            # bob#2, ...) and everything downstream uses this final name.
+            stale = self.clients_by_addr.pop(addr, None)    # same address rejoining
+            if stale is not None:
+                self.clients.pop(stale, None)
             username = unique_name(sanitize_name(payload.get("username", "anon"), NAME_MAX_LEN),
                                    [c.username for c in self.clients.values()], NAME_MAX_LEN)
             client_id = next(self._id_gen)
             color = COLORS[(client_id - 1) % len(COLORS)]
             p2p_host = payload.get("p2p_host")
             p2p_port = payload.get("p2p_port")
+            if not (isinstance(p2p_host, str) and 0 < len(p2p_host) <= 255):
+                p2p_host = None
+            if not (isinstance(p2p_port, int) and not isinstance(p2p_port, bool) and 0 < p2p_port <= MAX_PORT):
+                p2p_port = None
             is_sequencer = bool(payload.get("is_sequencer"))
             rec = ClientRecord(client_id, addr, username, color,
                                 p2p_host=p2p_host, p2p_port=p2p_port, is_sequencer=is_sequencer)
@@ -183,8 +189,6 @@ class Server:
         self.transport.send(addr, p.WELCOME, {
             "client_id": client_id, "color": color, "username": username,
         }, reliable=True)
-        # Every shared document, each carrying the revision it was
-        # captured at (ops after that revision follow as normal OPs).
         for doc_id, text, revision, filename in snapshot:
             self._send_doc(addr, doc_id, text, revision, filename)
         with self._lock:
@@ -196,17 +200,14 @@ class Server:
         self._emit_log(f"{username} joined from {addr[0]}:{addr[1]}")
 
     def _doc_id_from(self, payload):
-        """The id of an existing document named by `payload["doc"]` (absent
-        means MAIN_DOC), else None. Caller holds the lock."""
+        """Id of the existing document named by payload["doc"] (default MAIN_DOC), else None."""
         doc_id = payload.get("doc", p.MAIN_DOC)
         if isinstance(doc_id, int) and not isinstance(doc_id, bool) and doc_id in self.docs:
             return doc_id
         return None
 
     def _send_doc(self, addr, doc_id, text, revision, filename, **meta):
-        """Sends one document in full: DOC_CHUNKs, each repeating the small
-        header (id, revision, filename, ...) so any chunk is self-describing
-        and the chunks may arrive in any order."""
+        """Send a document as self-describing DOC_CHUNKs that may arrive in any order."""
         chunks = p.chunk_text(text)
         for i, chunk in enumerate(chunks):
             self.transport.send(addr, p.DOC_CHUNK, {
@@ -235,18 +236,18 @@ class Server:
                 swap = {"filename": filename if isinstance(filename, str) else None}
             else:
                 swap = None
-            base_rev = max(0, min(base_rev, state.revision))
+            base_rev = min(base_rev, state.revision)
             try:
-                for hist_op in state.history[base_rev:state.revision]:
+                if base_rev < state.history_base or op.target_len > MAX_DOC_CHARS:
+                    raise ValueError("base revision too old or document too large")
+                for hist_op in state.history[base_rev - state.history_base:]:
                     op, _ = ot.transform(op, hist_op)
                 state.doc = op.apply(state.doc)
             except ValueError:
-                # The op doesn't fit the document it claims to be based on.
-                resync = True
+                resync = True       # op doesn't fit the document it claims to be based on
             else:
-                state.history.append(op)
                 applied_at = state.revision
-                state.revision += 1
+                state.record(op)
                 self._shift_cursors(op, client_id, doc_id)
         if resync:
             self._resend_full_sync(addr, doc_id)
@@ -258,10 +259,7 @@ class Server:
         self._broadcast(p.OP, message, reliable=True)
 
     def _shift_cursors(self, op, author_id, doc_id):
-        """Moves every stored cursor in `doc_id` along with an applied op,
-        so the positions handed to someone joining (the roster) still point
-        at the same text instead of the offsets last reported before the
-        edit."""
+        """Move stored cursors along with an applied op so the roster stays accurate."""
         for rec in self.clients.values():
             cur = rec.cursors.get(doc_id)
             if not isinstance(cur, dict):
@@ -303,19 +301,13 @@ class Server:
         self._broadcast(p.BUFFER_CONTEXT, ctx, reliable=True)
 
     def _handle_doc_open(self, payload, addr):
-        """A client shares a new document: it gets the next free id, and
-        every client (the sender included, which is how it learns the id)
-        receives the text as a fresh document. `ref` is the sender's own
-        token for the request and just rides along so it can recognise the
-        reply. Whether a recipient shows it as a new tab, or attaches it to
-        a tab it already has open with identical content, is up to it."""
-        if not isinstance(payload, dict):
-            return
+        """Share a new document under the next free id; every client, sender included, gets it.
+        `ref` is the sender's token, echoed so it can recognise the reply."""
         text = payload.get("text")
         ref = payload.get("ref")
         if not isinstance(ref, int) or isinstance(ref, bool):
             ref = None
-        if not isinstance(text, str):
+        if not isinstance(text, str) or len(text) > MAX_DOC_CHARS:
             return
         error = None
         with self._lock:
@@ -343,7 +335,7 @@ class Server:
         return rec.username if rec else f"#{client_id}"
 
     def _chat_allow(self, rec):
-        """Token bucket: True if `rec` may send a chat message now."""
+        """Token bucket: may `rec` send a chat message now?"""
         now = self._clock()
         burst = float(self.chat_rate_burst)
         if rec.chat_tokens is None:
@@ -357,9 +349,7 @@ class Server:
         return False
 
     def _resolve_chat_targets(self, tokens, sender_id):
-        """Maps recipient tokens (a user name, case-insensitive, or `#<id>`)
-        to client records. Returns (records, unknown_tokens). Names are
-        unique, so a name can never match two people. Caller holds the lock."""
+        """Map recipient tokens (name, case-insensitive, or #id) to (records, unknown tokens). Lock held."""
         found, unknown = {}, []
         for tok in tokens:
             rec = None
@@ -375,15 +365,7 @@ class Server:
         return list(found.values()), unknown
 
     def _handle_chat(self, payload, addr):
-        """Relays a terminal chat message. Sanitizes it (the same rules the
-        clients apply again on display), rate-limits the sender, stamps it
-        with a server-assigned sequence number and timestamp, and sends it
-        to everyone else (public) or to the named recipients (private). Only
-        public messages enter the bounded join history. The sender never
-        gets its own message back (it echoes locally) but does get
-        {"error": ...} if it was rate limited or nobody could receive it."""
-        if not isinstance(payload, dict):
-            return
+        """Relay a chat message to everyone else or the named recipients; the sender gets only errors."""
         text = sanitize_text(payload.get("text", ""), CHAT_MAX_LEN)
         if not text:
             return
@@ -435,13 +417,8 @@ class Server:
         for target in deliver:
             self.transport.send(target, p.CHAT, message, reliable=True)
 
-    # ---- shared run output (opt-in on the runner's side; see share_util) ----
-    #
-    # The server never decides to share anything: a client only sends these
-    # messages after its user turned sharing on. The server relays them to
-    # everyone else (read-only for them - there is no message that goes back
-    # to a runner), sanitizes and caps them again, and keeps a small buffer
-    # of each runner's latest run so a late joiner can catch up.
+    # Shared run output: opt-in on the runner's side; relayed read-only, re-sanitized and capped,
+    # with each runner's latest run buffered for late joiners.
 
     def _share_msg(self, rec, state, **extra):
         msg = {"from": rec.client_id, "name": rec.username, "run": state["run"]}
@@ -522,8 +499,7 @@ class Server:
             self._relay_share(relay[0], rec, relay[1])
 
     def _send_share_catchup(self, addr):
-        """Late joiner: replay every other runner's current/last run from the
-        buffer (flagged `replay` so viewers don't announce it as new)."""
+        """Replay every other runner's latest run to a late joiner (flagged `replay`)."""
         with self._lock:
             me = self.clients_by_addr.get(addr)
             batches = []
@@ -541,9 +517,12 @@ class Server:
             for kind, msg in msgs:
                 self.transport.send(addr, kind, msg, reliable=True)
 
+    @staticmethod
+    def _int_field(payload, key):
+        v = payload.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_DOC_CHARS else None
+
     def _handle_cursor(self, payload, addr):
-        if not isinstance(payload, dict):
-            return
         with self._lock:
             client_id = self.clients_by_addr.get(addr)
             if client_id is None:
@@ -551,7 +530,11 @@ class Server:
             doc_id = self._doc_id_from(payload)
             if doc_id is None:
                 return
-            payload = {**payload, "doc": doc_id}
+            clean = {"doc": doc_id, "index": self._int_field(payload, "index"), "sel": False}
+            start, end = self._int_field(payload, "start"), self._int_field(payload, "end")
+            if payload.get("sel") and start is not None and end is not None:
+                clean.update(sel=True, start=start, end=end)
+            payload = clean
             rec = self.clients.get(client_id)
             if rec:
                 rec.cursors[doc_id] = payload
@@ -569,10 +552,10 @@ class Server:
             if client_id is None:
                 return
             rec = self.clients.pop(client_id, None)
+        self.transport.drop_peer(addr)
         if rec:
             share = rec.share
             if share and share["end"] is None:
-                # A runner that vanishes mid-run: tell viewers the run is over.
                 self._broadcast(p.RUN_END, {"from": rec.client_id, "name": rec.username, "run": share["run"],
                                             "seq": share["last_seq"] + 1, "code": None, "reason": "left the session"})
             self._emit_log(f"{rec.username} disconnected")

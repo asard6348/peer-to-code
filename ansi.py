@@ -132,14 +132,7 @@ class _AnsiState:
 
 
 class AnsiConsole:
-    """Feeds ANSI-colored subprocess output into a Tk Text widget, creating
-    and caching one tag per distinct style combination it encounters.
-
-    base_tag colors (e.g. "stderr" -> red) are only used for stretches of
-    text with no explicit ANSI color of their own, so plain stderr output
-    still looks the way it always has, while colored tool output (pytest,
-    ruff, rich/click apps, ...) shows its own real colors.
-    """
+    """Feeds ANSI-colored subprocess output into a Tk Text widget."""
 
     def __init__(self, text_widget, base_tag_colors=None):
         self.text = text_widget
@@ -151,20 +144,7 @@ class AnsiConsole:
         self._tag_counter = 0
 
     def rescale_fonts(self, family=None, size=None):
-        """Called whenever the console's own base font changes (zoom, or
-        Settings > Theme > Terminal) - see _tag_for below: essentially
-        every span of text ever written here, not just bold/italic/
-        colored ones, is tagged with its own explicit Font object frozen
-        at whatever size and family were active the moment that text was
-        first written. Just reconfiguring the Text widget's base font
-        left all of that old output on screen at its old size, while
-        the *line geometry* (built from the widget's base font) resized
-        around it - which is what showed up as the cursor and scrollbar
-        changing size while the actual text only seemed to shift. Each
-        cached Font object is mutated in place here instead of replaced,
-        so every tag referencing it - past output included - re-renders
-        at the new size immediately, since a tag's font is a live
-        reference to the Font object, not a snapshot of it."""
+        """Called whenever the console's own base font changes."""
         if not self._font_cache:
             return
         rescaled = {}
